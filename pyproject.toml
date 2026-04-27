@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ut"
+version = "0.1.0"
+description = "Composable recurrent grid reasoning models in JAX"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "flax>=0.11.1",
+  "huggingface-hub>=0.30.0",
+  "jax[cuda13]>=0.10.0",
+  "optax>=0.2.4",
+  "orbax-checkpoint>=0.11.5",
+  "wandb>=0.19.0",
+]
+
+[project.scripts]
+ut-train = "cli:main"
+ut-build-sudoku = "build_sudoku_dataset:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src"]
+sources = ["src"]

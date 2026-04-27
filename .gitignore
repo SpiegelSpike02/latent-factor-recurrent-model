@@ -1,0 +1,39 @@
+# Python generated files
+__pycache__/
+*.py[oc]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Local editor / agent state
+.codex
+.codex/
+.vscode/
+.idea/
+
+# Training artifacts
+checkpoints/
+wandb/
+runs/
+outputs/
+artifacts/
+
+# Local datasets and generated dataset caches
+data/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+.DS_Store
