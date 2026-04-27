@@ -152,7 +152,7 @@ class RuntimeConfig:
 @dataclass(frozen=True)
 class WandbConfig:
     enabled: bool = False
-    project: str = "ut-sudoku"
+    project: str = "recurrent-grid-reasoning"
     entity: str | None = None
     name: str | None = None
     mode: str = "online"

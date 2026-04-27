@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compute-dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--wandb-enabled", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--wandb-project", type=str, default="ut-sudoku")
+    parser.add_argument("--wandb-project", type=str, default="recurrent-grid-reasoning")
     parser.add_argument("--wandb-entity", type=str, default=None)
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")

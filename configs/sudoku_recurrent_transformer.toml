@@ -58,5 +58,6 @@ compute_dtype = "bfloat16"
 
 [wandb]
 enabled = true
-project = "ut-sudoku"
+project = "recurrent-grid-reasoning"
+name = "sudoku-recurrent-transformer"
 mode = "online"

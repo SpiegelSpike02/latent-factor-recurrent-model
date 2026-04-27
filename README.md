@@ -1,9 +1,10 @@
-# Universal Transformer For Grid Reasoning
+# Recurrent Grid Reasoning
 
-This repository now focuses on 2D grid and image-like reasoning tasks such as Sudoku.
+Recurrent Grid Reasoning is a JAX + `flax.nnx` research codebase for
+recurrent reasoning on 2D grid and image-like tasks such as Sudoku, with
+ARC-style extensions in mind.
 
-The current codebase is a JAX + `flax.nnx` recurrent grid-reasoning stack with
-two aligned base models:
+The codebase currently provides two aligned base models:
 
 - `universal_transformer`: a shared recurrent block with an optional damped
   transition using `rho` and `alpha`
@@ -25,7 +26,6 @@ Common features include:
 - cell-type embeddings for Sudoku clue/blank awareness
 - optional effective logits that hard-fix given cells to their clues
 - step-wise blank-cell supervision
-- optional truncated backpropagation through recurrent depth
 - configurable inner compute depth with local gradient horizon
 - differentiable Sudoku validity loss
 - RMSNorm + SwiGLU
@@ -49,25 +49,25 @@ uv sync
 Build an offline Sudoku dataset from local `train.csv` / `test.csv` files:
 
 ```bash
-uv run ut-build-sudoku --source-csv-dir path/to/sudoku_csvs --output-dir data/sudoku-extreme-1k-aug-1000 --subsample-size 1000 --num-aug 1000
+uv run rgr-build-sudoku --source-csv-dir path/to/sudoku_csvs --output-dir data/sudoku-extreme-1k-aug-1000 --subsample-size 1000 --num-aug 1000
 ```
 
 Train from the default Sudoku config:
 
 ```bash
-uv run ut-train --config configs/sudoku.toml
+uv run rgr-train --config configs/sudoku.toml
 ```
 
 Train the recurrent Transformer config:
 
 ```bash
-uv run ut-train --config configs/sudoku_recurrent_transformer.toml
+uv run rgr-train --config configs/sudoku_recurrent_transformer.toml
 ```
 
 CLI flags still override config values:
 
 ```bash
-uv run ut-train --config configs/sudoku.toml --learning-rate 1e-4 --batch-size 16
+uv run rgr-train --config configs/sudoku.toml --learning-rate 1e-4 --batch-size 16
 ```
 
 ## Notes
