@@ -91,6 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-batches", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--validity-loss-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--step-loss-weighting",
+        choices=("uniform", "linear", "final"),
+        default="uniform",
+        help="How to weight losses from recurrent reasoning steps.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ema-decay", type=float, default=0.999)
@@ -176,6 +182,7 @@ def build_config(args: argparse.Namespace, *, vocab_size: int, seq_len: int) -> 
         eval_every=args.eval_every,
         eval_batches=args.eval_batches,
         validity_loss_weight=args.validity_loss_weight,
+        step_loss_weighting=args.step_loss_weighting,
         seed=args.seed,
         checkpoint_dir=args.checkpoint_dir,
         ema=EMAConfig(
@@ -326,8 +333,14 @@ def main() -> None:
 
     model = create_model(config)
     optimizer = create_optimizer(model, config)
-    train_step_fn = build_train_step_runner(config.train.validity_loss_weight)
-    eval_step_fn = build_eval_step_runner(config.train.validity_loss_weight)
+    train_step_fn = build_train_step_runner(
+        config.train.validity_loss_weight,
+        config.train.step_loss_weighting,
+    )
+    eval_step_fn = build_eval_step_runner(
+        config.train.validity_loss_weight,
+        config.train.step_loss_weighting,
+    )
     ema_model = create_ema_model(model, config) if config.train.use_ema else None
     ema_update_fn = build_ema_update_runner(config.train.ema_decay) if config.train.use_ema else None
 
@@ -382,6 +395,7 @@ def main() -> None:
             train_log = {
                 "train/loss": float(metrics["loss"]),
                 "train/blank_ce_loss": float(metrics["blank_ce_loss"]),
+                "train/final_blank_ce_loss": float(metrics["final_blank_ce_loss"]),
                 "train/validity_loss": float(metrics["validity_loss"]),
                 "train/blank_cell_accuracy": float(metrics["blank_cell_accuracy"]),
                 "train/solved_rate": float(metrics["solved_rate"]),
@@ -393,6 +407,7 @@ def main() -> None:
                 f"step={step} "
                 f"loss={float(metrics['loss']):.4f} "
                 f"ce={float(metrics['blank_ce_loss']):.4f} "
+                f"final_ce={float(metrics['final_blank_ce_loss']):.4f} "
                 f"valid={float(metrics['validity_loss']):.4f} "
                 f"blank_acc={float(metrics['blank_cell_accuracy']):.4f} "
                 f"solved={float(metrics['solved_rate']):.4f}"
@@ -411,6 +426,7 @@ def main() -> None:
                 eval_log = {
                     "eval/loss": eval_metrics["loss"],
                     "eval/blank_ce_loss": eval_metrics["blank_ce_loss"],
+                    "eval/final_blank_ce_loss": eval_metrics["final_blank_ce_loss"],
                     "eval/validity_loss": eval_metrics["validity_loss"],
                     "eval/blank_cell_accuracy": eval_metrics["blank_cell_accuracy"],
                     "eval/solved_rate": eval_metrics["solved_rate"],
@@ -440,6 +456,7 @@ def main() -> None:
                 f"[eval{'/ema' if ema_model is not None else ''}] step={step} "
                 f"loss={eval_metrics['loss']:.4f} "
                 f"ce={eval_metrics['blank_ce_loss']:.4f} "
+                f"final_ce={eval_metrics['final_blank_ce_loss']:.4f} "
                 f"valid={eval_metrics['validity_loss']:.4f} "
                 f"blank_acc={eval_metrics['blank_cell_accuracy']:.4f} "
                 f"solved={eval_metrics['solved_rate']:.4f}"

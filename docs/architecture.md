@@ -215,6 +215,9 @@ The main architectural and task-semantics switches are:
 - `[model.compute].reinject_input = true | false` controls whether the original
   input embedding is reintroduced inside each inner step.
 - `validity_loss_weight = 0.0` disables the differentiable Sudoku legality loss
+- `step_loss_weighting = "uniform" | "linear" | "final"` controls how much
+  supervision each recurrent step receives; later-weighted modes reduce the
+  chance that early unfinished reasoning steps dominate the reported loss
 - `[train.ema].enabled = true | false` controls whether eval/checkpoint weights
   use an exponential moving average of the trained parameters. EMA does not
   change the raw training update; it is a stability lens for evaluation.

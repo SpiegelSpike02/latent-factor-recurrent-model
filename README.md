@@ -70,6 +70,10 @@ CLI flags still override config values:
 uv run rgr-train --config configs/sudoku.toml --learning-rate 1e-4 --batch-size 16
 ```
 
+For recurrent runs, `--step-loss-weighting linear` gives later reasoning steps
+more influence while still supervising earlier steps. Use `final` to train only
+against the last step, or `uniform` to restore the original equal weighting.
+
 ## Notes
 
 - Sudoku data is built offline and sampled at runtime.

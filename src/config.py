@@ -126,6 +126,7 @@ class TrainConfig:
     eval_every: int = 100
     eval_batches: int = 20
     validity_loss_weight: float = 0.01
+    step_loss_weighting: str = "uniform"
     seed: int = 0
     checkpoint_dir: str = "checkpoints"
     ema: EMAConfig | None = None

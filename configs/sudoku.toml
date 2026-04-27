@@ -40,12 +40,13 @@ warmup_steps = 200
 grad_clip_norm = 1.0
 
 [train]
-batch_size = 128
+batch_size = 64
 max_steps = 20000
 log_every = 10
 eval_every = 500
 eval_batches = 32
 validity_loss_weight = 0.1
+step_loss_weighting = "linear"
 seed = 0
 checkpoint_dir = "checkpoints"
 

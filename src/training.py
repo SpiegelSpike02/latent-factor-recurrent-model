@@ -13,6 +13,17 @@ from models import GridReasoningModel
 from tasks.sudoku import apply_given_logits_by_step, soft_sudoku_validity_loss
 
 
+def step_loss_weights(num_steps: int, weighting: str) -> jax.Array:
+    if weighting == "uniform":
+        return jnp.full((num_steps,), 1.0 / num_steps, dtype=jnp.float32)
+    if weighting == "linear":
+        weights = jnp.arange(1, num_steps + 1, dtype=jnp.float32)
+        return weights / jnp.sum(weights)
+    if weighting == "final":
+        return jax.nn.one_hot(num_steps - 1, num_steps, dtype=jnp.float32)
+    raise ValueError(f"Unsupported step_loss_weighting: {weighting}")
+
+
 def build_optimizer(config: ExperimentConfig) -> optax.GradientTransformation:
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
@@ -69,6 +80,7 @@ def loss_and_metrics(
     train: bool,
     dropout_key: jax.Array | None,
     validity_loss_weight: float = 0.0,
+    step_loss_weighting: str = "uniform",
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     inputs = batch["inputs"]
     targets = batch["labels"]
@@ -90,11 +102,7 @@ def loss_and_metrics(
     token_loss = optax.softmax_cross_entropy_with_integer_labels(effective_step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
 
-    step_weights = jnp.full(
-        (model.config.num_steps,),
-        1.0 / model.config.num_steps,
-        dtype=jnp.float32,
-    )
+    step_weights = step_loss_weights(model.config.num_steps, step_loss_weighting)
     blank_ce_loss = jnp.sum(step_weights * per_step_loss)
     per_step_validity_loss = soft_sudoku_validity_loss(
         effective_step_logits,
@@ -122,6 +130,7 @@ def loss_and_metrics(
     metrics = {
         "loss": loss,
         "blank_ce_loss": blank_ce_loss,
+        "final_blank_ce_loss": per_step_loss[-1],
         "validity_loss": validity_loss,
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
@@ -136,7 +145,7 @@ def loss_and_metrics(
     return loss, metrics
 
 
-def build_train_step_runner(validity_loss_weight: float):
+def build_train_step_runner(validity_loss_weight: float, step_loss_weighting: str = "uniform"):
     def train_step_with_weight(
         model: GridReasoningModel,
         optimizer: nnx.Optimizer,
@@ -150,6 +159,7 @@ def build_train_step_runner(validity_loss_weight: float):
                 train,
                 dropout_key,
                 validity_loss_weight,
+                step_loss_weighting,
             )
 
         grad_fn = nnx.value_and_grad(weighted_loss_and_metrics, has_aux=True)
@@ -160,12 +170,12 @@ def build_train_step_runner(validity_loss_weight: float):
     return nnx.jit(train_step_with_weight)
 
 
-def build_eval_step_runner(validity_loss_weight: float):
+def build_eval_step_runner(validity_loss_weight: float, step_loss_weighting: str = "uniform"):
     def eval_step_with_weight(
         model: GridReasoningModel,
         batch: dict[str, jax.Array],
     ) -> dict[str, jax.Array]:
-        _, metrics = loss_and_metrics(model, batch, False, None, validity_loss_weight)
+        _, metrics = loss_and_metrics(model, batch, False, None, validity_loss_weight, step_loss_weighting)
         return metrics
 
     return nnx.jit(eval_step_with_weight)
