@@ -10,45 +10,89 @@ from typing import Any
 import jax
 import numpy as np
 
-from config import (
-    AttentionConfig,
-    ClueConfig,
-    ComputeConfig,
+from lfrm.config import (
     DataConfig,
     EMAConfig,
     ExperimentConfig,
+    LFRMConfig,
     ModelConfig,
     OptimizerConfig,
-    RelationConfig,
     RuntimeConfig,
     TrainConfig,
-    TransitionConfig,
     WandbConfig,
 )
-from data import dataset_overview, load_dataset, sample_batch
-from training import (
+from lfrm.datasets import dataset_overview, load_dataset, sample_batch
+from lfrm.training import (
     build_ema_update_runner,
-    create_model,
-    create_ema_model,
-    create_optimizer,
     build_eval_step_runner,
     build_train_step_runner,
+    create_ema_model,
+    create_model,
+    create_optimizer,
     save_checkpoint,
 )
 
 
 CONFIG_SECTIONS = ("data", "model", "optimizer", "train", "runtime", "wandb")
 NESTED_SECTIONS = {
+    "model": {"lfrm"},
+    "train": {"ema"},
+}
+ALLOWED_SECTION_KEYS = {
+    "data": {"dataset_path"},
     "model": {
-        "transition",
-        "attention",
-        "relation",
-        "clues",
-        "compute",
+        "model_type",
+        "seq_len",
+        "grid_height",
+        "grid_width",
+        "d_model",
+        "num_steps",
+        "dropout_rate",
+        "lfrm",
+    },
+    "optimizer": {
+        "learning_rate",
+        "weight_decay",
+        "warmup_steps",
+        "grad_clip_norm",
+        "flatten_optimizer",
     },
     "train": {
+        "batch_size",
+        "max_steps",
+        "log_every",
+        "eval_every",
+        "eval_batches",
+        "step_loss_weighting",
+        "terminal_residual_weight",
+        "energy_loss_weight",
+        "energy_margin",
+        "energy_corruptions",
+        "slot_consistency_weight",
+        "slot_usage_weight",
+        "seed",
+        "checkpoint_dir",
         "ema",
     },
+    "runtime": {"compute_dtype"},
+    "wandb": {"enabled", "project", "entity", "name", "mode"},
+}
+ALLOWED_NESTED_KEYS = {
+    "lfrm": {
+        "belief_dim",
+        "num_slots",
+        "num_branches",
+        "latent_processor_layers",
+        "belief_temperature",
+        "belief_step_size",
+        "belief_floor",
+        "assignment_temperature",
+        "branch_softmin_temperature",
+        "energy_hidden_dim",
+        "use_condition_type_embedding",
+        "freeze_conditioned_state",
+    },
+    "ema": {"enabled", "decay"},
 }
 
 
@@ -64,22 +108,31 @@ def load_toml_config(path: str | None) -> dict[str, object]:
         section_values = loaded.get(section, {})
         if not isinstance(section_values, dict):
             raise ValueError(f"Section [{section}] in {config_path} must be a table")
+        allowed_keys = ALLOWED_SECTION_KEYS[section]
         for key, value in section_values.items():
             normalized_key = key.replace("-", "_")
+            if normalized_key not in allowed_keys:
+                raise ValueError(f"Unsupported [{section}] field in LFRM config: {key}")
             if normalized_key in NESTED_SECTIONS.get(section, set()):
                 if not isinstance(value, dict):
                     raise ValueError(f"Section [{section}.{key}] in {config_path} must be a table")
                 for nested_key, nested_value in value.items():
-                    flat[f"{normalized_key}_{nested_key.replace('-', '_')}"] = nested_value
+                    normalized_nested_key = nested_key.replace("-", "_")
+                    if normalized_nested_key not in ALLOWED_NESTED_KEYS[normalized_key]:
+                        raise ValueError(f"Unsupported [{section}.{key}] field in LFRM config: {nested_key}")
+                    flat[f"{normalized_key}_{normalized_nested_key}"] = nested_value
                 continue
             if section == "wandb":
                 normalized_key = f"wandb_{normalized_key}"
             flat[normalized_key] = value
+
+    if flat.get("model_type", "lfrm") != "lfrm":
+        raise ValueError("Only model_type='lfrm' is supported")
     return flat
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train recurrent grid reasoning models.")
+    parser = argparse.ArgumentParser(description="Train the Latent Factor Recurrent Model.")
     parser.add_argument("--config", type=str, default=None, help="Optional TOML config file.")
     parser.add_argument("--dataset-path", type=str, default=None, help="Offline grid dataset directory.")
     parser.add_argument("--seq-len", type=int, default=81)
@@ -90,45 +143,46 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--eval-batches", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--validity-loss-weight", type=float, default=0.01)
     parser.add_argument(
         "--step-loss-weighting",
         choices=("uniform", "linear", "final"),
-        default="uniform",
+        default="final",
         help="How to weight losses from recurrent reasoning steps.",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--terminal-residual-weight", type=float, default=0.0)
+    parser.add_argument("--energy-loss-weight", type=float, default=0.0)
+    parser.add_argument("--energy-margin", type=float, default=1.0)
+    parser.add_argument("--energy-corruptions", type=int, default=1)
+    parser.add_argument("--slot-consistency-weight", type=float, default=0.0)
+    parser.add_argument("--slot-usage-weight", type=float, default=0.0)
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ema-decay", type=float, default=0.999)
-    parser.add_argument(
-        "--model-type",
-        choices=("universal_transformer", "recurrent_transformer"),
-        default="universal_transformer",
-    )
-    parser.add_argument("--communication-type", choices=("relation", "attention"), default="relation")
+    parser.add_argument("--model-type", choices=("lfrm",), default="lfrm")
     parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--d-ff", type=int, default=1024)
     parser.add_argument("--num-steps", type=int, default=6)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
-    parser.add_argument("--transition-type", choices=("residual", "damped"), default="residual")
-    parser.add_argument("--transition-hidden-dim", type=int, default=128)
-    parser.add_argument("--attention-num-heads", type=int, default=4)
-    parser.add_argument("--relation-include-global", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--clues-use-type-embedding", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--clues-fix-outputs", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--clues-freeze-state", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--compute-inner-steps", type=int, default=1)
-    parser.add_argument("--compute-layers-per-step", type=int, default=1)
-    parser.add_argument("--compute-grad-inner-steps", type=int, default=1)
-    parser.add_argument("--compute-reinject-input", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--lfrm-belief-dim", type=int, default=0)
+    parser.add_argument("--lfrm-num-slots", type=int, default=64)
+    parser.add_argument("--lfrm-num-branches", type=int, default=4)
+    parser.add_argument("--lfrm-latent-processor-layers", type=int, default=1)
+    parser.add_argument("--lfrm-belief-temperature", type=float, default=1.0)
+    parser.add_argument("--lfrm-belief-step-size", type=float, default=0.25)
+    parser.add_argument("--lfrm-belief-floor", type=float, default=1e-5)
+    parser.add_argument("--lfrm-assignment-temperature", type=float, default=1.0)
+    parser.add_argument("--lfrm-branch-softmin-temperature", type=float, default=0.25)
+    parser.add_argument("--lfrm-energy-hidden-dim", type=int, default=128)
+    parser.add_argument("--lfrm-use-condition-type-embedding", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--lfrm-freeze-conditioned-state", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--flatten-optimizer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compute-dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--wandb-enabled", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--wandb-project", type=str, default="recurrent-grid-reasoning")
+    parser.add_argument("--wandb-project", type=str, default="latent-factor-recurrent-model")
     parser.add_argument("--wandb-entity", type=str, default=None)
     parser.add_argument("--wandb-name", type=str, default=None)
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
@@ -139,34 +193,25 @@ def build_config(args: argparse.Namespace, *, vocab_size: int, seq_len: int) -> 
     model = ModelConfig(
         vocab_size=vocab_size,
         model_type=args.model_type,
-        communication_type=args.communication_type,
         seq_len=seq_len,
         grid_height=args.grid_height,
         grid_width=args.grid_width,
         d_model=args.d_model,
-        d_ff=args.d_ff,
         num_steps=args.num_steps,
         dropout_rate=args.dropout_rate,
-        transition=TransitionConfig(
-            type=args.transition_type,
-            hidden_dim=args.transition_hidden_dim,
-        ),
-        attention=AttentionConfig(
-            num_heads=args.attention_num_heads,
-        ),
-        relation=RelationConfig(
-            include_global=args.relation_include_global,
-        ),
-        clues=ClueConfig(
-            use_type_embedding=args.clues_use_type_embedding,
-            fix_outputs=args.clues_fix_outputs,
-            freeze_state=args.clues_freeze_state,
-        ),
-        compute=ComputeConfig(
-            inner_steps=args.compute_inner_steps,
-            layers_per_step=args.compute_layers_per_step,
-            grad_inner_steps=args.compute_grad_inner_steps,
-            reinject_input=args.compute_reinject_input,
+        lfrm=LFRMConfig(
+            belief_dim=args.lfrm_belief_dim,
+            num_slots=args.lfrm_num_slots,
+            num_branches=args.lfrm_num_branches,
+            latent_processor_layers=args.lfrm_latent_processor_layers,
+            belief_temperature=args.lfrm_belief_temperature,
+            belief_step_size=args.lfrm_belief_step_size,
+            belief_floor=args.lfrm_belief_floor,
+            assignment_temperature=args.lfrm_assignment_temperature,
+            branch_softmin_temperature=args.lfrm_branch_softmin_temperature,
+            energy_hidden_dim=args.lfrm_energy_hidden_dim,
+            use_condition_type_embedding=args.lfrm_use_condition_type_embedding,
+            freeze_conditioned_state=args.lfrm_freeze_conditioned_state,
         ),
     )
     optimizer = OptimizerConfig(
@@ -174,6 +219,7 @@ def build_config(args: argparse.Namespace, *, vocab_size: int, seq_len: int) -> 
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
         grad_clip_norm=args.grad_clip_norm,
+        flatten_optimizer=args.flatten_optimizer,
     )
     train = TrainConfig(
         batch_size=args.batch_size,
@@ -181,8 +227,13 @@ def build_config(args: argparse.Namespace, *, vocab_size: int, seq_len: int) -> 
         log_every=args.log_every,
         eval_every=args.eval_every,
         eval_batches=args.eval_batches,
-        validity_loss_weight=args.validity_loss_weight,
         step_loss_weighting=args.step_loss_weighting,
+        terminal_residual_weight=args.terminal_residual_weight,
+        energy_loss_weight=args.energy_loss_weight,
+        energy_margin=args.energy_margin,
+        energy_corruptions=args.energy_corruptions,
+        slot_consistency_weight=args.slot_consistency_weight,
+        slot_usage_weight=args.slot_usage_weight,
         seed=args.seed,
         checkpoint_dir=args.checkpoint_dir,
         ema=EMAConfig(
@@ -190,9 +241,7 @@ def build_config(args: argparse.Namespace, *, vocab_size: int, seq_len: int) -> 
             decay=args.ema_decay,
         ),
     )
-    data = DataConfig(
-        dataset_path=args.dataset_path,
-    )
+    data = DataConfig(dataset_path=args.dataset_path)
     runtime = RuntimeConfig(compute_dtype=args.compute_dtype)
     wandb = WandbConfig(
         enabled=args.wandb_enabled,
@@ -312,6 +361,58 @@ def format_step_summary(name: str, values: list[float]) -> str:
     )
 
 
+OPTIONAL_SCALAR_METRICS = (
+    "unroll_steps",
+    "energy_pos",
+    "energy_neg",
+    "energy_margin_loss",
+    "belief_entropy",
+    "belief_confidence",
+    "target_probability",
+    "branch_min_ce",
+    "branch_mean_ce",
+    "selected_branch_energy",
+    "slot_consistency_loss",
+    "slot_usage_entropy",
+    "slot_usage_loss",
+    "branch_diversity",
+    "terminal_belief_delta",
+    "terminal_belief_mse",
+)
+INTEGER_SCALAR_METRICS = {"unroll_steps"}
+
+
+def format_scalar_metric(name: str, value: Any) -> str:
+    scalar = float(value)
+    is_integer_like = np.isfinite(scalar) and np.isclose(scalar, round(scalar), atol=1e-6)
+    if name in INTEGER_SCALAR_METRICS or name.endswith(("_count", "_iters", "_steps")):
+        if is_integer_like:
+            return str(int(round(scalar)))
+    if scalar != 0.0 and abs(scalar) < 1e-3:
+        return f"{scalar:.2e}"
+    return f"{scalar:.4f}"
+
+
+def optional_scalar_log(prefix: str, metrics: dict[str, Any]) -> dict[str, float]:
+    log: dict[str, float] = {}
+    for name in OPTIONAL_SCALAR_METRICS:
+        if name in metrics:
+            value = metrics[name]
+            if np.ndim(np.asarray(value)) == 0:
+                log[f"{prefix}/{name}"] = float(value)
+    return log
+
+
+def optional_scalar_summary(metrics: dict[str, Any]) -> str:
+    parts = []
+    for name in OPTIONAL_SCALAR_METRICS:
+        if name in metrics:
+            value = metrics[name]
+            if np.ndim(np.asarray(value)) == 0:
+                parts.append(f"{name}={format_scalar_metric(name, value)}")
+    return " ".join(parts)
+
+
 def main() -> None:
     parser = build_parser()
     pre_args, _ = parser.parse_known_args()
@@ -334,12 +435,22 @@ def main() -> None:
     model = create_model(config)
     optimizer = create_optimizer(model, config)
     train_step_fn = build_train_step_runner(
-        config.train.validity_loss_weight,
         config.train.step_loss_weighting,
+        config.train.terminal_residual_weight,
+        config.train.energy_loss_weight,
+        config.train.energy_margin,
+        config.train.energy_corruptions,
+        config.train.slot_consistency_weight,
+        config.train.slot_usage_weight,
     )
     eval_step_fn = build_eval_step_runner(
-        config.train.validity_loss_weight,
         config.train.step_loss_weighting,
+        config.train.terminal_residual_weight,
+        config.train.energy_loss_weight,
+        config.train.energy_margin,
+        config.train.energy_corruptions,
+        config.train.slot_consistency_weight,
+        config.train.slot_usage_weight,
     )
     ema_model = create_ema_model(model, config) if config.train.use_ema else None
     ema_update_fn = build_ema_update_runner(config.train.ema_decay) if config.train.use_ema else None
@@ -382,35 +493,35 @@ def main() -> None:
         if ema_model is not None and ema_update_fn is not None:
             ema_update_fn(ema_model, model)
 
-        next_batch = sample_device_batch(
+        current_batch = sample_device_batch(
             train_rng,
             dataset,
             config=config,
             split="train",
             device=device,
         )
-        current_batch = next_batch
 
         if step % config.train.log_every == 0 or step == 1:
             train_log = {
                 "train/loss": float(metrics["loss"]),
                 "train/blank_ce_loss": float(metrics["blank_ce_loss"]),
                 "train/final_blank_ce_loss": float(metrics["final_blank_ce_loss"]),
-                "train/validity_loss": float(metrics["validity_loss"]),
                 "train/blank_cell_accuracy": float(metrics["blank_cell_accuracy"]),
                 "train/solved_rate": float(metrics["solved_rate"]),
                 "train/learning_rate": schedule_learning_rate(config, step),
             }
+            train_log.update(optional_scalar_log("train", metrics))
             if wandb_run is not None:
                 wandb_run.log(train_log, step=step)
+            optional_summary = optional_scalar_summary(metrics)
             print(
                 f"step={step} "
                 f"loss={float(metrics['loss']):.4f} "
                 f"ce={float(metrics['blank_ce_loss']):.4f} "
                 f"final_ce={float(metrics['final_blank_ce_loss']):.4f} "
-                f"valid={float(metrics['validity_loss']):.4f} "
                 f"blank_acc={float(metrics['blank_cell_accuracy']):.4f} "
                 f"solved={float(metrics['solved_rate']):.4f}"
+                f"{' ' + optional_summary if optional_summary else ''}"
             )
 
         if step % config.train.eval_every == 0 or step == config.train.max_steps:
@@ -427,50 +538,37 @@ def main() -> None:
                     "eval/loss": eval_metrics["loss"],
                     "eval/blank_ce_loss": eval_metrics["blank_ce_loss"],
                     "eval/final_blank_ce_loss": eval_metrics["final_blank_ce_loss"],
-                    "eval/validity_loss": eval_metrics["validity_loss"],
                     "eval/blank_cell_accuracy": eval_metrics["blank_cell_accuracy"],
                     "eval/solved_rate": eval_metrics["solved_rate"],
                 }
+                eval_log.update(optional_scalar_log("eval", eval_metrics))
                 eval_log.update(flatten_step_metrics("eval/loss_by_step", eval_metrics["per_step_loss"]))
-                eval_log.update(
-                    flatten_step_metrics(
-                        "eval/validity_loss_by_step",
-                        eval_metrics["per_step_validity_loss"],
-                    )
-                )
-                if "per_step_rho" in eval_metrics:
-                    eval_log.update(flatten_step_metrics("eval/rho_by_step", eval_metrics["per_step_rho"]))
-                if "per_step_alpha" in eval_metrics:
-                    eval_log.update(flatten_step_metrics("eval/alpha_by_step", eval_metrics["per_step_alpha"]))
                 eval_log.update(
                     flatten_step_metrics(
                         "eval/hidden_delta_by_step",
                         eval_metrics["per_step_hidden_delta"],
                     )
                 )
-                wandb_run.log(
-                    eval_log,
-                    step=step,
-                )
+                wandb_run.log(eval_log, step=step)
+            optional_summary = optional_scalar_summary(eval_metrics)
             print(
                 f"[eval{'/ema' if ema_model is not None else ''}] step={step} "
                 f"loss={eval_metrics['loss']:.4f} "
                 f"ce={eval_metrics['blank_ce_loss']:.4f} "
                 f"final_ce={eval_metrics['final_blank_ce_loss']:.4f} "
-                f"valid={eval_metrics['validity_loss']:.4f} "
                 f"blank_acc={eval_metrics['blank_cell_accuracy']:.4f} "
                 f"solved={eval_metrics['solved_rate']:.4f}"
+                f"{' ' + optional_summary if optional_summary else ''}"
             )
-            step_summaries = [
-                format_step_summary("loss", eval_metrics["per_step_loss"]),
-                format_step_summary("valid", eval_metrics["per_step_validity_loss"]),
-            ]
-            if "per_step_alpha" in eval_metrics:
-                step_summaries.append(format_step_summary("alpha", eval_metrics["per_step_alpha"]))
-            if "per_step_rho" in eval_metrics:
-                step_summaries.append(format_step_summary("rho", eval_metrics["per_step_rho"]))
-            step_summaries.append(format_step_summary("delta", eval_metrics["per_step_hidden_delta"]))
-            print("  " + " ".join(step_summaries))
+            print(
+                "  "
+                + " ".join(
+                    [
+                        format_step_summary("loss", eval_metrics["per_step_loss"]),
+                        format_step_summary("delta", eval_metrics["per_step_hidden_delta"]),
+                    ]
+                )
+            )
             save_checkpoint(str(checkpoint_dir), model, optimizer, step, ema_model=ema_model)
 
     if wandb_run is not None:

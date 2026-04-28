@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from data import build_sudoku_dataset
+from lfrm.datasets import build_sudoku_dataset
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "recurrent-grid-reasoning"
+name = "latent-factor-recurrent-model"
 version = "0.1.0"
-description = "Composable recurrent grid reasoning models in JAX"
+description = "Latent Factor Recurrent Model experiments in JAX"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
@@ -18,9 +18,8 @@ dependencies = [
 ]
 
 [project.scripts]
-rgr-train = "cli:main"
-rgr-build-sudoku = "build_sudoku_dataset:main"
+lfrm-train = "lfrm.cli:main"
+lfrm-build-sudoku = "lfrm.scripts.build_sudoku_dataset:main"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["src"]
-sources = ["src"]
+only-include = ["lfrm"]

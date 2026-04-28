@@ -1,229 +1,83 @@
-# Recurrent Grid Reasoning Architecture
+# Latent Factor Recurrent Model Architecture
 
-This repository now supports two recurrent model families for Sudoku:
+LFRM is the only active model path in this repository. It should be read as a
+generalized Universal Transformer-style recurrent solver: a shared block is
+applied repeatedly, but the recurrent state is no longer just an unstructured
+hidden tensor.
 
-- `universal_transformer`: a shared recurrent block with configurable
-  communication and an optional damped transition.
-- `recurrent_transformer`: a recurrent Transformer with configurable
-  communication, standard pre-norm residual updates, and separate parameters
-  for each recurrent step.
+## State
 
-Both variants share the same data pipeline, step-wise supervision, Sudoku
-validity loss, effective given logits, wandb logging, and checkpointing. This
-keeps ablations focused on the architecture rather than the training harness.
-
-## Data Signal
-
-The dataset provides:
-
-- `inputs`: Sudoku board tokens
-- `labels`: solution tokens
-- `given_mask`: whether each cell is originally given
-
-Training supervises blank cells only:
+LFRM recurses over:
 
 ```text
-loss_mask = NOT given_mask
+S_b^t = (H_b^t, L_b^t, Q_b^t, Z_b^t)
+Q_b^t = softmax(L_b^t / temperature)
 ```
 
-## Recurrent Grid Skeleton
+`b` indexes parallel hypotheses. `H` is the cell hidden canvas, `L` is the
+residual belief-logit canvas, `Q` is the discrete belief canvas, and `Z` is the
+dynamic latent factor array. The latent factors are slot-by-symbol tensors, so
+symbol permutations act by permuting the belief and latent symbol axes together.
 
-Both model families operate over a recurrent grid state:
-
-- fixed recurrent depth
-- step embedding conditions every iteration without being written into the
-  persistent state by itself
-- optional inner compute depth inside each recurrent step
-
-In shorthand:
+Sudoku tokens remain compatible with the dataset format:
 
 ```text
-h_0 = embed(tokens) + row + col + box + cell-type embedding
-for k in 1..T:
-  h_k = recurrent_step(h_{k-1}, step_embed[k], ...)
-logits = output_head(norm(h_T))
+blank = 1
+digits = 2..10
+belief_dim = vocab_size - 2
 ```
 
-The `universal_transformer` family uses one shared recurrent step, while the
-`recurrent_transformer` family uses step-specific blocks.
+Given cells are clamped every recurrent step. This is input conditioning, not a
+Sudoku rule.
 
-Training uses the same classification head at every recurrent step:
+## Update
 
-```text
-logits_k = output_head(norm(h_k))
-loss = sum_k w_k * CE(logits_k, labels)
-```
+Each recurrent step follows a Perceiver IO pattern and then performs belief
+refinement:
 
-The weights are uniform across recurrent depth, so every recurrent step is directly
-encouraged to move toward a valid solution.
+1. A local grid mixer reads the generic 3x3 spatial neighborhood.
+2. Latent factors read from cells through symbol-equivariant cross-attention.
+3. The latent array is processed by a shared latent self-attention block.
+4. Cells read back from latent factors through slots-to-cells cross-attention.
+5. A shared per-symbol scorer emits residual belief-logit updates.
 
-## Inner Compute Depth
+No digit/color embedding is used. The same scorer is applied to every symbol
+channel, so permuting symbols in the input permutes output symbol logits in the
+same way.
 
-Each outer recurrent step can contain a deeper shared compute loop:
+## Branches And Energy
 
-```text
-for k in 1..T:
-  for i in 1..inner_steps:
-    if reinject_input:
-      h = h + input_embedding
-    for j in 1..layers_per_step:
-      h = block_j(h, step_embed[k])
-    if i is before the final grad_inner_steps:
-      h = stop_gradient(h)
-  h_k = h
-```
+LFRM maintains several branches in parallel. Training uses a branch-softmin CE
+over blank cells so a good hypothesis can receive credit without hard-coded
+search or backtracking. A learned energy head scores each branch; inference and
+standard metrics use the lowest-energy branch.
 
-This is intentionally named as compute scheduling rather than as a high/low
-hierarchy. It increases forward reasoning depth while limiting backward depth to
-the final `grad_inner_steps` inside each outer step.
+The energy head sees `(Q, H, Z)` and is trained with a margin objective against
+target and corrupted belief canvases. It is a learned verifier, not a Sudoku
+checker.
 
-## Universal Transformer Block
+## Regularization And Metrics
 
-When `model_type = "universal_transformer"`, the same block is reused at every
-recurrent step. With damped updates enabled, this shared block uses a damped
-candidate-state transition:
+The model reports:
 
-1. Step-Conditioned Communication
-   The step embedding `e_k` is added to normalized sublayer inputs, not directly
-   to `h_k`. This lets the step index modulate computation while preserving
-   `||h_{k+1} - h_k||` as a meaningful convergence signal.
+- `branch_min_ce` and `branch_mean_ce`
+- `selected_branch_energy`
+- `energy_margin_loss`
+- `slot_consistency_loss`
+- `slot_usage_entropy`
+- `branch_diversity`
+- `terminal_belief_delta`, the RMS one-step terminal belief change
+- `terminal_belief_mse`, the squared residual used by terminal-residual loss
+- `belief_entropy` and `belief_confidence`
 
-2. Typed Relation Propagation
-   Messages propagate along:
-   - row relations
-   - column relations
-   - box relations
-   - optional lightweight global relations
-   Relation matrices remove self edges before row-normalization, so propagation
-   carries neighbor constraint information rather than duplicating the residual
-   self path.
-   The four relation streams are fused nonlinearly so that row/column/box
-   constraints can interact instead of only adding linearly.
+Slot consistency encourages latent factors to keep a stable identity across
+recursive steps. Slot usage entropy discourages all cells from collapsing onto a
+small number of slots.
 
-3. Light Read Scaling
-   `u_k = h_k + rho_k * p_k`
+## Removed Baselines
 
-4. Candidate Construction
-   `z_k = u_k + FFN(LN(u_k))`
-
-5. Damped State Update
-   `h_{k+1} = h_k + alpha_k * (z_k - h_k)`
-
-`rho_k` is a continuous read scaling term. It is not a read gate.
-
-`alpha_k` is a damping / step-size coefficient. It is not a write gate.
-It is conditioned on the step embedding, but there is no hand-written decay
-schedule; any convergence pattern must be learned.
-
-## Confidence Signal
-
-Each recurrent step derives a token-wise uncertainty signal from the current
-classifier entropy:
-
-```text
-entropy_k = H(softmax(output_head(norm(h_k))))
-```
-
-This entropy is fed into the `rho_k` / `alpha_k` predictor so that uncertain
-cells can update more aggressively while already-settled cells can damp their
-updates.
-
-The entropy is used as an auxiliary signal only. It does not introduce a new
-halting network or continue gate, and it is stop-gradient so the scale
-predictor cannot exploit it as a shortcut.
-
-## Sudoku-Specific Task Semantics
-
-- The propagation module is residual: it emits an increment rather than
-  overwriting the current state.
-- `[model.clues].freeze_state = true` treats given cells as fixed internal clue states
-  by suppressing their recurrent updates.
-- `[model.clues].fix_outputs = true` treats given cells as fixed output clues by replacing
-  their logits with the input token at loss/eval time.
-- The global relation path starts weak so it complements, rather than overrides,
-  row/column/box propagation.
-
-## Why This Structure
-
-For Sudoku, the important interactions live on a fixed constraint graph. Dense
-all-to-all self-attention is therefore not the right primary propagation
-mechanism. Typed relation propagation makes the information flow follow the real
-row / column / box constraints while keeping the recurrent UT skeleton intact.
-
-The same block interface can later host a different propagation module for ARC,
-for example an object-centric or learned relation propagation layer.
-
-## Recurrent Transformer Baseline
-
-When `model_type = "recurrent_transformer"`, the model uses a sequence of
-step-specific residual blocks. Each step receives both the current recurrent
-state and the initial embedded input state:
-
-```text
-q_k = h_k + W_in([h_k; h_0])
-u_k = q_k + Communication(LN(q_k) + e_k)
-h_{k+1} = u_k + FFN_k(LN(u_k) + e_k)
-```
-
-The recurrent Transformer therefore performs iterative refinement, but unlike
-the Universal Transformer it does not reuse the same block at every step:
-
-```text
-h_{k+1} = F_{theta_k}(h_k, h_0, e_k)
-```
-
-This makes it the conventional unshared-parameter recurrent comparison. It does
-not expose `rho` or `alpha`, because those are damped-update concepts.
-Evaluation still reports per-step loss, validity, and hidden-state delta so both
-model families can be compared directly.
-
-For comparison, the Universal Transformer family uses one shared recurrent
-operator:
-
-```text
-x_k = h_k
-u_k = x_k + Communication(LN(x_k) + e_k)
-h_{k+1} = u_k + FFN(LN(u_k) + e_k)
-```
-
-or, with damped updates enabled, the corresponding `rho` / `alpha` transition.
-
-## Ablation Switches
-
-The main architectural and task-semantics switches are:
-
-- `model_type = "universal_transformer" | "recurrent_transformer"`
-- `communication_type = "relation" | "attention"`
-- `[model.transition].type = "residual" | "damped"` selects the recurrent
-  transition rule. The damped transition is only supported for
-  `model_type = "universal_transformer"`.
-- `[model.transition].hidden_dim` controls the `rho` / `alpha` scale predictor
-  when the damped transition is enabled.
-- `[model.attention].num_heads` controls dense attention heads and only affects
-  `communication_type = "attention"`.
-- `[model.relation].include_global` controls the optional global relation
-  path and only affects `communication_type = "relation"`.
-- `[model.clues].use_type_embedding = true | false`
-- `[model.clues].fix_outputs = true | false`
-- `[model.clues].freeze_state = true | false`
-- `[model.compute].inner_steps` controls repeated compute inside each recurrent
-  step.
-- `[model.compute].layers_per_step` controls the block stack depth reused inside
-  each inner step.
-- `[model.compute].grad_inner_steps` keeps gradients only through the final
-  inner compute steps.
-- `[model.compute].reinject_input = true | false` controls whether the original
-  input embedding is reintroduced inside each inner step.
-- `validity_loss_weight = 0.0` disables the differentiable Sudoku legality loss
-- `step_loss_weighting = "uniform" | "linear" | "final"` controls how much
-  supervision each recurrent step receives; later-weighted modes reduce the
-  chance that early unfinished reasoning steps dominate the reported loss
-- `[train.ema].enabled = true | false` controls whether eval/checkpoint weights
-  use an exponential moving average of the trained parameters. EMA does not
-  change the raw training update; it is a stability lens for evaluation.
-
-Communication and task-semantics switches are independent. For example,
-`clues.freeze_state` can be used with either model family and either
-communication type; it is a Sudoku clue-state handling choice, not a property of
-one model family. Damped updates are specific to the `universal_transformer`
-family.
+The old Universal Transformer and Recurrent Transformer implementations were
+removed after they served their purpose as recurrent-reasoning baselines. The
+current code treats LFRM itself as the shared-block multi-step recurrent
+reasoning framework, with the main research question shifted to the structure of
+the recurrent state space: belief canvas plus dynamic latent factors.

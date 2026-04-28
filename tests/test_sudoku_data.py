@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from data import build_sudoku_dataset, load_dataset, sample_batch
+from lfrm.datasets import build_sudoku_dataset, load_dataset, sample_batch
 
 
 TRAIN_PUZZLE = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
