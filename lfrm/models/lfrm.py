@@ -103,6 +103,8 @@ class LatentFactorRecurrentModel(nnx.Module):
         micro_token_dim = d_model + 5
         self.micro_token_norm = nnx.RMSNorm(micro_token_dim, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.micro_token_hidden = nnx.Linear(micro_token_dim, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+        self.symbol_context_norm = nnx.RMSNorm(2 * d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+        self.symbol_context_hidden = nnx.Linear(2 * d_model, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.input_key = nnx.Linear(d_model, d_model, use_bias=False, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.input_symbol_value = nnx.Linear(d_model, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.latent_input_query = nnx.Linear(d_model, d_model, use_bias=False, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
@@ -136,7 +138,7 @@ class LatentFactorRecurrentModel(nnx.Module):
         self.symbol_delta = nnx.Linear(d_model, 1, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 
         energy_hidden = lfrm.energy_hidden_dim
-        self.energy_cell_feature = nnx.Linear(d_model + 3, energy_hidden, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+        self.energy_cell_feature = nnx.Linear(2 * d_model + 3, energy_hidden, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.energy_cell_score = nnx.Linear(energy_hidden, 1, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.energy_slot_score = nnx.Linear(d_model, 1, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 
@@ -231,7 +233,7 @@ class LatentFactorRecurrentModel(nnx.Module):
             (given.shape[0], branches, self.config.seq_len, self.belief_dim),
         )
 
-    def _cell_symbol_context(self, h: Array, logits: Array, q: Array, given_channels: Array) -> Array:
+    def _cell_symbol_context(self, h: Array, logits: Array, q: Array, given_channels: Array) -> tuple[Array, Array]:
         h_symbols = jnp.broadcast_to(h[:, :, :, None, :], (*q.shape, h.shape[-1]))
         stats = self._belief_stats(q)
         stats_symbols = jnp.broadcast_to(stats[:, :, :, None, :], (*q.shape, stats.shape[-1]))
@@ -240,8 +242,13 @@ class LatentFactorRecurrentModel(nnx.Module):
             axis=-1,
         )
         symbol_input = self.micro_token_norm(maybe_cast(symbol_input, self.dtype))
-        hidden = jax.nn.silu(self.micro_token_hidden(symbol_input).astype(jnp.float32))
-        return hidden
+        base_tokens = jax.nn.silu(self.micro_token_hidden(symbol_input).astype(jnp.float32))
+        symbol_context = jnp.mean(base_tokens, axis=2)
+        context_tokens = jnp.broadcast_to(symbol_context[:, :, None, :, :], base_tokens.shape)
+        token_input = jnp.concatenate([base_tokens, context_tokens], axis=-1)
+        token_input = self.symbol_context_norm(maybe_cast(token_input, self.dtype))
+        tokens = jax.nn.silu(self.symbol_context_hidden(token_input).astype(jnp.float32))
+        return tokens, symbol_context
 
     def _slot_pattern_decorrelation(self, attention: Array) -> Array:
         patterns = jnp.mean(attention, axis=2)
@@ -269,7 +276,8 @@ class LatentFactorRecurrentModel(nnx.Module):
             symbol_values,
         )
         summary = self._merge_heads(summary)
-        assignment = jnp.moveaxis(jnp.mean(jnp.sum(input_attention, axis=-1), axis=2), 2, 3)
+        assignment = jnp.mean(input_attention, axis=2)
+        assignment = assignment.reshape(*assignment.shape[:3], self.config.seq_len * self.belief_dim)
         slot_focus = jnp.mean(jnp.max(input_attention.reshape(*input_attention.shape[:4], -1), axis=-1), axis=2)
         slot_diversity_loss = self._slot_pattern_decorrelation(input_attention)
         return summary, assignment, slot_focus, slot_diversity_loss
@@ -324,7 +332,7 @@ class LatentFactorRecurrentModel(nnx.Module):
         h, logits, q, slots = state
         h_local = self._local_update(h, q)
         given_channels = self._given_channels(initial_q, condition_mask, h.shape[1])
-        micro_tokens = self._cell_symbol_context(h_local, logits, q, given_channels)
+        micro_tokens, symbol_context = self._cell_symbol_context(h_local, logits, q, given_channels)
         slot_summary, assignment, input_slot_usage, slot_diversity_loss = self._cells_to_slots(micro_tokens, slots)
         slots_next = self._update_slots(slots, slot_summary, input_slot_usage)
         slots_next = self._process_latents(slots_next)
@@ -357,13 +365,18 @@ class LatentFactorRecurrentModel(nnx.Module):
             "assignment": assignment,
             "slot_usage": input_slot_usage,
             "slot_diversity_loss": slot_diversity_loss,
+            "symbol_context": symbol_context,
         }
 
-    def _energy(self, q: Array, h: Array, slots: Array) -> Array:
+    def _energy(self, q: Array, h: Array, slots: Array, symbol_context: Array) -> Array:
         h_symbols = jnp.broadcast_to(h[:, :, :, None, :], (*q.shape, h.shape[-1]))
+        context_symbols = jnp.broadcast_to(symbol_context[:, :, None, :, :], h_symbols.shape)
         stats = self._belief_stats(q)
         stats_symbols = jnp.broadcast_to(stats[:, :, :, None, :], (*q.shape, stats.shape[-1]))
-        channel_features = jnp.concatenate([h_symbols.astype(jnp.float32), q[..., None], stats_symbols], axis=-1)
+        channel_features = jnp.concatenate(
+            [h_symbols.astype(jnp.float32), context_symbols.astype(jnp.float32), q[..., None], stats_symbols],
+            axis=-1,
+        )
         channel_features = jax.nn.silu(
             self.energy_cell_feature(maybe_cast(channel_features, self.dtype)).astype(jnp.float32)
         )
@@ -401,8 +414,8 @@ class LatentFactorRecurrentModel(nnx.Module):
             (
                 tokens.shape[0],
                 self.lfrm.num_branches,
-                self.config.seq_len,
                 self.lfrm.num_slots,
+                self.config.seq_len * self.belief_dim,
             ),
             dtype=jnp.float32,
         )
@@ -499,7 +512,9 @@ class LatentFactorRecurrentModel(nnx.Module):
             jnp.arange(self.config.num_steps),
         )
         h_final, logits_final, q_final, slots_final = final_state
-        branch_energy = self._energy(q_final, h_final, slots_final)
+        final_given_channels = self._given_channels(initial_q, condition_mask, h_final.shape[1])
+        _, symbol_context_final = self._cell_symbol_context(h_final, logits_final, q_final, final_given_channels)
+        branch_energy = self._energy(q_final, h_final, slots_final, symbol_context_final)
         selected_index = jnp.argmin(branch_energy, axis=1)
         selected_index_expanded = selected_index[:, None, None, None]
         branch_vocab_logits = self._branch_logits_to_vocab(logits_final)
@@ -550,6 +565,7 @@ class LatentFactorRecurrentModel(nnx.Module):
             "branch_q": q_final,
             "branch_h": h_final,
             "branch_slots": slots_final,
+            "branch_symbol_context": symbol_context_final,
             "branch_energy": branch_energy,
             "selected_branch_energy": selected_branch_energy,
             "slot_consistency_loss": slot_consistency_loss,
@@ -607,7 +623,8 @@ class LatentFactorRecurrentModel(nnx.Module):
         q_pos = jnp.broadcast_to(q_pos[:, None, :, :], diagnostics["branch_q"].shape)
         h = diagnostics["branch_h"]
         slots = diagnostics["branch_slots"]
-        energy_pos = self._energy(q_pos, h, slots)
+        symbol_context = diagnostics["branch_symbol_context"]
+        energy_pos = self._energy(q_pos, h, slots, symbol_context)
 
         corruption_count = max(int(corruptions), 1)
         keys = jax.random.split(rng_key, corruption_count)
@@ -641,7 +658,15 @@ class LatentFactorRecurrentModel(nnx.Module):
             slots[None, :, :, :, :],
             (corruption_count, *slots.shape),
         ).reshape(corruption_count * targets.shape[0], *slots.shape[1:])
-        energy_corrupt = self._energy(flat_q_neg, flat_h, flat_slots).reshape(corruption_count, targets.shape[0], self.lfrm.num_branches)
+        flat_symbol_context = jnp.broadcast_to(
+            symbol_context[None, :, :, :, :],
+            (corruption_count, *symbol_context.shape),
+        ).reshape(corruption_count * targets.shape[0], *symbol_context.shape[1:])
+        energy_corrupt = self._energy(flat_q_neg, flat_h, flat_slots, flat_symbol_context).reshape(
+            corruption_count,
+            targets.shape[0],
+            self.lfrm.num_branches,
+        )
 
         corrupt_margin = jnp.maximum(0.0, margin + energy_pos[None, :, :] - energy_corrupt)
         margin_loss = jnp.mean(corrupt_margin)

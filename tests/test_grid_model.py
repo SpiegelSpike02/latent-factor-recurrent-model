@@ -65,6 +65,7 @@ class LFRMModelTests(unittest.TestCase):
         self.assertEqual(diagnostics["branch_digit_logits"].shape, (1, 3, 9, 9))
         self.assertEqual(diagnostics["branch_q"].shape, (1, 3, 9, 9))
         self.assertEqual(diagnostics["branch_slots"].shape, (1, 3, 5, 12))
+        self.assertEqual(diagnostics["branch_symbol_context"].shape, (1, 3, 9, 12))
         self.assertEqual(diagnostics["branch_energy"].shape, (1, 3))
         self.assertEqual(int(diagnostics["unroll_steps"]), 2)
 
@@ -119,9 +120,10 @@ class LFRMModelTests(unittest.TestCase):
         state, initial_logits, initial_q, condition_mask = model._initial_state(tokens, train=False, dropout_key=None)
         h, logits, q, slots = state
         given_channels = model._given_channels(initial_q, condition_mask, h.shape[1])
-        micro_tokens = model._cell_symbol_context(h, logits, q, given_channels)
+        micro_tokens, symbol_context = model._cell_symbol_context(h, logits, q, given_channels)
         message, routing = model._slots_to_cell_symbols(micro_tokens, slots)
         self.assertEqual(micro_tokens.shape, (1, 2, 9, 9, 12))
+        self.assertEqual(symbol_context.shape, (1, 2, 9, 12))
         self.assertEqual(message.shape, (1, 2, 9, 9, 12))
         self.assertEqual(routing.shape, (1, 2, 9, 9, 4))
 
@@ -131,8 +133,14 @@ class LFRMModelTests(unittest.TestCase):
         permutation = jnp.asarray([2, 0, 1, 3, 4, 5, 6, 7, 8], dtype=jnp.int32)
         _, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
         q = diagnostics["branch_q"]
-        energy = model._energy(q, diagnostics["branch_h"], diagnostics["branch_slots"])
-        permuted_energy = model._energy(q[..., permutation], diagnostics["branch_h"], diagnostics["branch_slots"])
+        symbol_context = diagnostics["branch_symbol_context"]
+        energy = model._energy(q, diagnostics["branch_h"], diagnostics["branch_slots"], symbol_context)
+        permuted_energy = model._energy(
+            q[..., permutation],
+            diagnostics["branch_h"],
+            diagnostics["branch_slots"],
+            symbol_context[:, :, permutation, :],
+        )
         self.assertTrue(bool(jnp.allclose(energy, permuted_energy, atol=1e-5, rtol=1e-5)))
 
     def test_training_losses_are_finite(self) -> None:
