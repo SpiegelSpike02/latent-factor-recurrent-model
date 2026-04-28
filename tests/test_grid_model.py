@@ -46,6 +46,7 @@ class LFRMModelTests(unittest.TestCase):
                     belief_dim=9,
                     num_slots=num_slots,
                     num_branches=num_branches,
+                    num_heads=4,
                     latent_processor_layers=1,
                     energy_hidden_dim=16,
                     freeze_conditioned_state=True,
@@ -63,6 +64,7 @@ class LFRMModelTests(unittest.TestCase):
         self.assertEqual(diagnostics["branch_logits"].shape, (1, 3, 9, 11))
         self.assertEqual(diagnostics["branch_digit_logits"].shape, (1, 3, 9, 9))
         self.assertEqual(diagnostics["branch_q"].shape, (1, 3, 9, 9))
+        self.assertEqual(diagnostics["branch_slots"].shape, (1, 3, 5, 12))
         self.assertEqual(diagnostics["branch_energy"].shape, (1, 3))
         self.assertEqual(int(diagnostics["unroll_steps"]), 2)
 
@@ -99,6 +101,39 @@ class LFRMModelTests(unittest.TestCase):
         permuted_logits, _ = model.forward_all_steps_with_diagnostics(permuted_tokens, train=False)
         restored_digit_logits = permuted_logits[..., 2:][..., permutation]
         self.assertTrue(bool(jnp.allclose(logits[..., 2:], restored_digit_logits, atol=1e-4, rtol=1e-4)))
+
+    def test_initial_hidden_is_symbol_invariant(self) -> None:
+        model = self._make_lfrm_model(num_steps=1, num_branches=2, num_slots=4)
+        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
+        permutation = jnp.asarray([2, 0, 1, 3, 4, 5, 6, 7, 8], dtype=jnp.int32)
+        digit_ids = tokens - 2
+        permuted_digits = permutation[jnp.clip(digit_ids, 0, 8)] + 2
+        permuted_tokens = jnp.where(tokens == 1, tokens, permuted_digits)
+        state, _, _, _ = model._initial_state(tokens, train=False, dropout_key=None)
+        permuted_state, _, _, _ = model._initial_state(permuted_tokens, train=False, dropout_key=None)
+        self.assertTrue(bool(jnp.allclose(state[0], permuted_state[0], atol=1e-6, rtol=1e-6)))
+
+    def test_symbol_conditioned_slot_readout_shape(self) -> None:
+        model = self._make_lfrm_model(num_steps=1, num_branches=2, num_slots=4)
+        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
+        state, initial_logits, initial_q, condition_mask = model._initial_state(tokens, train=False, dropout_key=None)
+        h, logits, q, slots = state
+        given_channels = model._given_channels(initial_q, condition_mask, h.shape[1])
+        micro_tokens = model._cell_symbol_context(h, logits, q, given_channels)
+        message, routing = model._slots_to_cell_symbols(micro_tokens, slots)
+        self.assertEqual(micro_tokens.shape, (1, 2, 9, 9, 12))
+        self.assertEqual(message.shape, (1, 2, 9, 9, 12))
+        self.assertEqual(routing.shape, (1, 2, 9, 9, 4))
+
+    def test_energy_is_symbol_invariant(self) -> None:
+        model = self._make_lfrm_model(num_steps=1, num_branches=2, num_slots=4)
+        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
+        permutation = jnp.asarray([2, 0, 1, 3, 4, 5, 6, 7, 8], dtype=jnp.int32)
+        _, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
+        q = diagnostics["branch_q"]
+        energy = model._energy(q, diagnostics["branch_h"], diagnostics["branch_slots"])
+        permuted_energy = model._energy(q[..., permutation], diagnostics["branch_h"], diagnostics["branch_slots"])
+        self.assertTrue(bool(jnp.allclose(energy, permuted_energy, atol=1e-5, rtol=1e-5)))
 
     def test_training_losses_are_finite(self) -> None:
         model = self._make_lfrm_model(num_steps=2, num_branches=2, num_slots=4)
@@ -213,6 +248,23 @@ class LFRMModelTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "Only model_type='lfrm'"):
             create_model(invalid)
+
+    def test_num_heads_must_divide_d_model(self) -> None:
+        with self.assertRaisesRegex(ValueError, "divisible by num_heads"):
+            LatentFactorRecurrentModel(
+                ModelConfig(
+                    vocab_size=11,
+                    model_type="lfrm",
+                    seq_len=9,
+                    grid_height=3,
+                    grid_width=3,
+                    d_model=10,
+                    num_steps=1,
+                    lfrm=LFRMConfig(belief_dim=9, num_heads=4),
+                ),
+                RuntimeConfig(compute_dtype="float32"),
+                rngs=nnx.Rngs(0),
+            )
 
     def test_config_loader_rejects_legacy_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

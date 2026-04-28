@@ -9,12 +9,17 @@ class LFRMConfig:
     belief_dim: int = 0
     num_slots: int = 64
     num_branches: int = 4
+    num_heads: int = 4
     latent_processor_layers: int = 1
+    symbol_context_mode: str = "cell_symbol_tokens"
+    slot_readout_mode: str = "cell_symbol_attention"
+    energy_symbol_pooling: str = "deepsets"
+    branch_diversity_schedule: str = "early"
+    diversity_apply_steps: tuple[int, int] = (0, 8)
     belief_temperature: float = 1.0
     belief_step_size: float = 0.25
     belief_floor: float = 1e-5
     assignment_temperature: float = 1.0
-    branch_softmin_temperature: float = 0.25
     energy_hidden_dim: int = 128
     use_condition_type_embedding: bool = True
     freeze_conditioned_state: bool = False
@@ -66,6 +71,7 @@ class TrainConfig:
     energy_corruptions: int = 1
     slot_consistency_weight: float = 0.0
     slot_usage_weight: float = 0.0
+    slot_diversity_weight: float = 0.0
     seed: int = 0
     checkpoint_dir: str = "checkpoints"
     ema: EMAConfig | None = None

@@ -6,26 +6,31 @@ model_type = "lfrm"
 seq_len = 81
 grid_height = 9
 grid_width = 9
-d_model = 128
+d_model = 256
 num_steps = 64
 dropout_rate = 0.0
 
 [model.lfrm]
 belief_dim = 9
-num_slots = 64
+num_slots = 128
 num_branches = 4
-latent_processor_layers = 1
+num_heads = 8
+latent_processor_layers = 2
+symbol_context_mode = "cell_symbol_tokens"
+slot_readout_mode = "cell_symbol_attention"
+energy_symbol_pooling = "deepsets"
+branch_diversity_schedule = "early"
+diversity_apply_steps = [0, 8]
 belief_temperature = 1.0
 belief_step_size = 0.25
 belief_floor = 1e-5
 assignment_temperature = 1.0
-branch_softmin_temperature = 0.25
-energy_hidden_dim = 128
+energy_hidden_dim = 256
 use_condition_type_embedding = true
 freeze_conditioned_state = true
 
 [optimizer]
-learning_rate = 2e-4
+learning_rate = 1.5e-4
 weight_decay = 0.01
 warmup_steps = 1000
 grad_clip_norm = 0.5
@@ -42,8 +47,9 @@ terminal_residual_weight = 0.0
 energy_loss_weight = 0.05
 energy_margin = 1.0
 energy_corruptions = 1
-slot_consistency_weight = 0.01
-slot_usage_weight = 0.001
+slot_consistency_weight = 0.0001
+slot_usage_weight = 0.0
+slot_diversity_weight = 0.0001
 seed = 0
 checkpoint_dir = "checkpoints"
 

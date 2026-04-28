@@ -102,8 +102,7 @@ def sample_batch(
     total = inputs.shape[0]
     if total == 0:
         raise ValueError(f"Split '{split}' is empty")
-    replace = batch_size > total
-    indices = rng.choice(total, size=batch_size, replace=replace)
+    indices = rng.integers(total, size=batch_size, endpoint=False)
 
     batch_given_mask = np.asarray(given_mask[indices], dtype=bool)
     return {

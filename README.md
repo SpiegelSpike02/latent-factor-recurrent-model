@@ -4,9 +4,9 @@ Latent Factor Recurrent Model is a JAX + `flax.nnx` research codebase for
 recurrent reasoning on 2D grid tasks. The repository now has one primary model
 path:
 
-- `lfrm`: a Perceiver IO-style latent bottleneck modified into a recurrent
-  belief solver with dynamic latent factors, multi-hypothesis branches, learned
-  energy selection, and symbol-equivariant updates.
+- `lfrm`: a Perceiver IO-style multi-head latent bottleneck modified into a
+  recurrent belief solver with dynamic latent factors, multi-hypothesis
+  branches, learned energy selection, and symbol-equivariant updates.
 
 The older Universal Transformer and Recurrent Transformer implementations have
 been removed. LFRM is the generalized shared-block recurrent reasoning path:

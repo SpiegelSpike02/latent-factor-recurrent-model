@@ -90,6 +90,7 @@ def loss_and_metrics(
     energy_corruptions: int = 1,
     slot_consistency_weight: float = 0.0,
     slot_usage_weight: float = 0.0,
+    slot_diversity_weight: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     inputs = batch["inputs"]
     targets = batch["labels"]
@@ -133,12 +134,7 @@ def loss_and_metrics(
         branch_token_loss = optax.softmax_cross_entropy_with_integer_labels(branch_logits, branch_targets)
         per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1, keepdims=True), 1.0)
         branch_ce = jnp.sum(branch_token_loss * branch_loss_mask, axis=-1) / per_example_normalizer
-        tau = jnp.asarray(model.config.lfrm_config.branch_softmin_temperature, dtype=jnp.float32)
-        tau = jnp.maximum(tau, 1e-3)
-        blank_ce_loss = jnp.mean(
-            -tau * jax.nn.logsumexp(-branch_ce / tau, axis=-1)
-            + tau * jnp.log(jnp.asarray(branch_logits.shape[1], dtype=jnp.float32))
-        )
+        blank_ce_loss = jnp.mean(branch_ce)
         branch_min_ce = jnp.mean(jnp.min(branch_ce, axis=-1))
         branch_mean_ce = jnp.mean(branch_ce)
     terminal_residual = diagnostics.get(
@@ -147,6 +143,7 @@ def loss_and_metrics(
     )
     slot_consistency_loss = diagnostics.get("slot_consistency_loss", jnp.asarray(0.0, dtype=jnp.float32))
     slot_usage_loss = diagnostics.get("slot_usage_loss", jnp.asarray(0.0, dtype=jnp.float32))
+    slot_diversity_loss = diagnostics.get("slot_diversity_loss", jnp.asarray(0.0, dtype=jnp.float32))
     energy_metrics = {}
     if hasattr(model, "energy_training_metrics") and energy_loss_weight != 0.0:
         energy_metrics = model.energy_training_metrics(
@@ -165,6 +162,7 @@ def loss_and_metrics(
         + energy_loss_weight * energy_margin_loss
         + slot_consistency_weight * slot_consistency_loss
         + slot_usage_weight * slot_usage_loss
+        + slot_diversity_weight * slot_diversity_loss
     )
 
     final_logits = effective_step_logits[-1]
@@ -218,7 +216,9 @@ def loss_and_metrics(
         "slot_consistency_loss",
         "slot_usage_entropy",
         "slot_usage_loss",
+        "slot_diversity_loss",
         "branch_diversity",
+        "final_branch_diversity",
     ):
         if key in diagnostics:
             metrics[key] = diagnostics[key]
@@ -235,6 +235,7 @@ def build_train_step_runner(
     energy_corruptions: int = 1,
     slot_consistency_weight: float = 0.0,
     slot_usage_weight: float = 0.0,
+    slot_diversity_weight: float = 0.0,
 ):
     def train_step_with_weight(
         model: LatentFactorRecurrentModel,
@@ -255,6 +256,7 @@ def build_train_step_runner(
                 energy_corruptions,
                 slot_consistency_weight,
                 slot_usage_weight,
+                slot_diversity_weight,
             )
 
         grad_fn = nnx.value_and_grad(weighted_loss_and_metrics, has_aux=True)
@@ -273,6 +275,7 @@ def build_eval_step_runner(
     energy_corruptions: int = 1,
     slot_consistency_weight: float = 0.0,
     slot_usage_weight: float = 0.0,
+    slot_diversity_weight: float = 0.0,
 ):
     def eval_step_with_weight(
         model: LatentFactorRecurrentModel,
@@ -290,6 +293,7 @@ def build_eval_step_runner(
             energy_corruptions,
             slot_consistency_weight,
             slot_usage_weight,
+            slot_diversity_weight,
         )
         return metrics
 

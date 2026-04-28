@@ -70,6 +70,7 @@ ALLOWED_SECTION_KEYS = {
         "energy_corruptions",
         "slot_consistency_weight",
         "slot_usage_weight",
+        "slot_diversity_weight",
         "seed",
         "checkpoint_dir",
         "ema",
@@ -82,12 +83,17 @@ ALLOWED_NESTED_KEYS = {
         "belief_dim",
         "num_slots",
         "num_branches",
+        "num_heads",
         "latent_processor_layers",
+        "symbol_context_mode",
+        "slot_readout_mode",
+        "energy_symbol_pooling",
+        "branch_diversity_schedule",
+        "diversity_apply_steps",
         "belief_temperature",
         "belief_step_size",
         "belief_floor",
         "assignment_temperature",
-        "branch_softmin_temperature",
         "energy_hidden_dim",
         "use_condition_type_embedding",
         "freeze_conditioned_state",
@@ -156,6 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--energy-corruptions", type=int, default=1)
     parser.add_argument("--slot-consistency-weight", type=float, default=0.0)
     parser.add_argument("--slot-usage-weight", type=float, default=0.0)
+    parser.add_argument("--slot-diversity-weight", type=float, default=0.0)
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--model-type", choices=("lfrm",), default="lfrm")
@@ -165,12 +172,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lfrm-belief-dim", type=int, default=0)
     parser.add_argument("--lfrm-num-slots", type=int, default=64)
     parser.add_argument("--lfrm-num-branches", type=int, default=4)
+    parser.add_argument("--lfrm-num-heads", type=int, default=4)
     parser.add_argument("--lfrm-latent-processor-layers", type=int, default=1)
+    parser.add_argument("--lfrm-symbol-context-mode", choices=("cell_symbol_tokens",), default="cell_symbol_tokens")
+    parser.add_argument("--lfrm-slot-readout-mode", choices=("cell_symbol_attention",), default="cell_symbol_attention")
+    parser.add_argument("--lfrm-energy-symbol-pooling", choices=("deepsets",), default="deepsets")
+    parser.add_argument("--lfrm-branch-diversity-schedule", choices=("early", "none"), default="early")
+    parser.add_argument("--lfrm-diversity-apply-steps", type=int, nargs=2, default=(0, 8))
     parser.add_argument("--lfrm-belief-temperature", type=float, default=1.0)
     parser.add_argument("--lfrm-belief-step-size", type=float, default=0.25)
     parser.add_argument("--lfrm-belief-floor", type=float, default=1e-5)
     parser.add_argument("--lfrm-assignment-temperature", type=float, default=1.0)
-    parser.add_argument("--lfrm-branch-softmin-temperature", type=float, default=0.25)
     parser.add_argument("--lfrm-energy-hidden-dim", type=int, default=128)
     parser.add_argument("--lfrm-use-condition-type-embedding", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lfrm-freeze-conditioned-state", action=argparse.BooleanOptionalAction, default=False)
@@ -203,12 +215,17 @@ def build_config(args: argparse.Namespace, *, vocab_size: int, seq_len: int) -> 
             belief_dim=args.lfrm_belief_dim,
             num_slots=args.lfrm_num_slots,
             num_branches=args.lfrm_num_branches,
+            num_heads=args.lfrm_num_heads,
             latent_processor_layers=args.lfrm_latent_processor_layers,
+            symbol_context_mode=args.lfrm_symbol_context_mode,
+            slot_readout_mode=args.lfrm_slot_readout_mode,
+            energy_symbol_pooling=args.lfrm_energy_symbol_pooling,
+            branch_diversity_schedule=args.lfrm_branch_diversity_schedule,
+            diversity_apply_steps=tuple(args.lfrm_diversity_apply_steps),
             belief_temperature=args.lfrm_belief_temperature,
             belief_step_size=args.lfrm_belief_step_size,
             belief_floor=args.lfrm_belief_floor,
             assignment_temperature=args.lfrm_assignment_temperature,
-            branch_softmin_temperature=args.lfrm_branch_softmin_temperature,
             energy_hidden_dim=args.lfrm_energy_hidden_dim,
             use_condition_type_embedding=args.lfrm_use_condition_type_embedding,
             freeze_conditioned_state=args.lfrm_freeze_conditioned_state,
@@ -234,6 +251,7 @@ def build_config(args: argparse.Namespace, *, vocab_size: int, seq_len: int) -> 
         energy_corruptions=args.energy_corruptions,
         slot_consistency_weight=args.slot_consistency_weight,
         slot_usage_weight=args.slot_usage_weight,
+        slot_diversity_weight=args.slot_diversity_weight,
         seed=args.seed,
         checkpoint_dir=args.checkpoint_dir,
         ema=EMAConfig(
@@ -375,7 +393,9 @@ OPTIONAL_SCALAR_METRICS = (
     "slot_consistency_loss",
     "slot_usage_entropy",
     "slot_usage_loss",
+    "slot_diversity_loss",
     "branch_diversity",
+    "final_branch_diversity",
     "terminal_belief_delta",
     "terminal_belief_mse",
 )
@@ -442,6 +462,7 @@ def main() -> None:
         config.train.energy_corruptions,
         config.train.slot_consistency_weight,
         config.train.slot_usage_weight,
+        config.train.slot_diversity_weight,
     )
     eval_step_fn = build_eval_step_runner(
         config.train.step_loss_weighting,
@@ -451,6 +472,7 @@ def main() -> None:
         config.train.energy_corruptions,
         config.train.slot_consistency_weight,
         config.train.slot_usage_weight,
+        config.train.slot_diversity_weight,
     )
     ema_model = create_ema_model(model, config) if config.train.use_ema else None
     ema_update_fn = build_ema_update_runner(config.train.ema_decay) if config.train.use_ema else None
