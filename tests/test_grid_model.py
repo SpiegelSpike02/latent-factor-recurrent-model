@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import inspect
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -22,7 +24,8 @@ from lfrm.config import (
 )
 from lfrm.models import LatentFactorRecurrentModel
 import lfrm.models.lfrm as lfrm_module
-from lfrm.training import create_model, loss_and_metrics
+from lfrm.jax_defaults import apply_jax_defaults
+from lfrm.training import create_model, loss_and_metrics, step_loss_weights
 
 
 class LFRMModelTests(unittest.TestCase):
@@ -174,6 +177,32 @@ class LFRMModelTests(unittest.TestCase):
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
+
+    def test_step_loss_weighting_modes(self) -> None:
+        uniform = step_loss_weights(4, "uniform")
+        linear = step_loss_weights(4, "linear")
+        final = step_loss_weights(4, "final")
+        self.assertTrue(bool(jnp.allclose(uniform, jnp.asarray([0.25, 0.25, 0.25, 0.25]))))
+        self.assertTrue(bool(jnp.allclose(linear, jnp.asarray([0.1, 0.2, 0.3, 0.4]))))
+        self.assertTrue(bool(jnp.allclose(final, jnp.asarray([0.0, 0.0, 0.0, 1.0]))))
+        with self.assertRaisesRegex(ValueError, "Unsupported step_loss_weighting"):
+            step_loss_weights(4, "unknown")
+
+    def test_jax_defaults_set_gpu_startup_flags_without_overriding_user_values(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.80",
+                "XLA_FLAGS": "--some_existing_flag=true",
+            },
+            clear=True,
+        ):
+            apply_jax_defaults()
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "true")
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.80")
+            self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "cuda_malloc_async")
+            self.assertIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
+            self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
 
     def test_gradient_path_finite(self) -> None:
         model = self._make_lfrm_model(num_steps=1, num_branches=2, num_slots=3)

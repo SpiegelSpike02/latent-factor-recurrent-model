@@ -61,6 +61,12 @@ the current LFRM training path returns the selected terminal belief. `uniform`
 and `linear` are still accepted for compatibility with future multi-step
 diagnostic outputs.
 
+The package also applies project-level JAX defaults before JAX initializes:
+Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, GPU preallocation
+is set to 95% with `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`, preallocation is
+explicitly enabled, and `TF_GPU_ALLOCATOR=cuda_malloc_async` selects CUDA async
+allocation. Values already set in the shell are preserved.
+
 ## Notes
 
 - Sudoku data is built offline and sampled at runtime.
