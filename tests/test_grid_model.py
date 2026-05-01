@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from lfrm.cli import load_toml_config
+from lfrm.cli import load_toml_config, resolve_resume_checkpoint
 from lfrm.config import (
     DataConfig,
     ExperimentConfig,
@@ -25,7 +25,7 @@ from lfrm.config import (
 from lfrm.models import LatentFactorRecurrentModel
 import lfrm.models.lfrm as lfrm_module
 from lfrm.jax_defaults import apply_jax_defaults
-from lfrm.training import create_model, loss_and_metrics, step_loss_weights
+from lfrm.training import create_model, create_optimizer, load_checkpoint, loss_and_metrics, save_checkpoint, step_loss_weights
 
 
 class LFRMModelTests(unittest.TestCase):
@@ -332,6 +332,38 @@ class LFRMModelTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "Unsupported \\[model\\] field"):
                 load_toml_config(str(config_path))
+
+    def test_checkpoint_round_trip_restores_step(self) -> None:
+        config = ExperimentConfig(
+            model=ModelConfig(
+                vocab_size=11,
+                model_type="lfrm",
+                seq_len=9,
+                grid_height=3,
+                grid_width=3,
+                d_model=12,
+                num_steps=1,
+                lfrm=LFRMConfig(belief_dim=9, num_slots=3, num_branches=1),
+            ),
+            optimizer=OptimizerConfig(),
+            train=TrainConfig(),
+            data=DataConfig(),
+            runtime=RuntimeConfig(compute_dtype="float32"),
+            wandb=WandbConfig(),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model = create_model(config)
+            optimizer = create_optimizer(model, config)
+            save_checkpoint(tmpdir, model, optimizer, 7)
+
+            restored_model = create_model(config)
+            restored_optimizer = create_optimizer(restored_model, config)
+            step = load_checkpoint(Path(tmpdir) / "step_7", restored_model, restored_optimizer)
+            self.assertEqual(step, 7)
+
+            checkpoint_path, run_dir = resolve_resume_checkpoint(tmpdir)
+            self.assertEqual(checkpoint_path.name, "step_7")
+            self.assertEqual(run_dir, Path(tmpdir).resolve())
 
 
 if __name__ == "__main__":

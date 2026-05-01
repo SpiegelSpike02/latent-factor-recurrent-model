@@ -29,6 +29,7 @@ from lfrm.training import (
     create_ema_model,
     create_model,
     create_optimizer,
+    load_checkpoint,
     save_checkpoint,
 )
 
@@ -191,6 +192,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flatten-optimizer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compute-dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument(
+        "--resume-from",
+        type=str,
+        default=None,
+        help="Resume from a run checkpoint directory or a concrete step_N checkpoint.",
+    )
     parser.add_argument("--wandb-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--wandb-project", type=str, default="latent-factor-recurrent-model")
     parser.add_argument("--wandb-entity", type=str, default=None)
@@ -274,6 +281,52 @@ def build_run_checkpoint_dir(config_path: str | None, checkpoint_root: str) -> P
     return Path(checkpoint_root) / f"{config_stem}-{timestamp}"
 
 
+def checkpoint_step(path: Path) -> int | None:
+    if not path.name.startswith("step_"):
+        return None
+    try:
+        return int(path.name.removeprefix("step_"))
+    except ValueError:
+        return None
+
+
+def resolve_resume_checkpoint(resume_from: str) -> tuple[Path, Path]:
+    resume_path = Path(resume_from).expanduser().resolve()
+    if not resume_path.exists():
+        raise FileNotFoundError(f"Resume path does not exist: {resume_path}")
+    if checkpoint_step(resume_path) is not None:
+        return resume_path, resume_path.parent
+    candidates = [
+        child
+        for child in resume_path.iterdir()
+        if child.is_dir() and checkpoint_step(child) is not None
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"No step_N checkpoints found under resume path: {resume_path}")
+    checkpoint_path = max(candidates, key=lambda path: checkpoint_step(path) or -1)
+    return checkpoint_path, resume_path
+
+
+def wandb_run_id_path(run_dir: Path) -> Path:
+    return run_dir / "wandb_run_id.txt"
+
+
+def read_wandb_run_id(run_dir: Path) -> str | None:
+    explicit_path = wandb_run_id_path(run_dir)
+    if explicit_path.exists():
+        run_id = explicit_path.read_text(encoding="utf-8").strip()
+        return run_id or None
+    wandb_dir = run_dir / "wandb"
+    if not wandb_dir.exists():
+        return None
+    runs = sorted(wandb_dir.glob("run-*-*"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for run_path in runs:
+        run_id = run_path.name.rsplit("-", 1)[-1]
+        if run_id:
+            return run_id
+    return None
+
+
 def schedule_learning_rate(config: ExperimentConfig, step: int) -> float:
     warmup_steps = config.optimizer.warmup_steps
     peak = config.optimizer.learning_rate
@@ -290,7 +343,7 @@ def config_to_dict(config: ExperimentConfig) -> dict[str, Any]:
     return asdict(config)
 
 
-def init_wandb(config: ExperimentConfig, *, run_dir: Path):
+def init_wandb(config: ExperimentConfig, *, run_dir: Path, resume_run_id: str | None = None):
     if not config.wandb.enabled or config.wandb.mode == "disabled":
         return None
     try:
@@ -305,7 +358,10 @@ def init_wandb(config: ExperimentConfig, *, run_dir: Path):
         mode=config.wandb.mode,
         config=config_to_dict(config),
         dir=str(run_dir),
+        id=resume_run_id,
+        resume="allow" if resume_run_id is not None else None,
     )
+    wandb_run_id_path(run_dir).write_text(run.id + "\n", encoding="utf-8")
     wandb.config.update({"checkpoint_dir": str(run_dir)}, allow_val_change=True)
     return run
 
@@ -445,9 +501,17 @@ def main() -> None:
         seq_len=dataset.spec.seq_len,
     )
 
-    checkpoint_dir = build_run_checkpoint_dir(args.config, config.train.checkpoint_dir)
+    resume_checkpoint: Path | None = None
+    resume_step = 0
+    resume_run_id: str | None = None
+    if args.resume_from is not None:
+        resume_checkpoint, checkpoint_dir = resolve_resume_checkpoint(args.resume_from)
+        resume_step = checkpoint_step(resume_checkpoint) or 0
+        resume_run_id = read_wandb_run_id(checkpoint_dir)
+    else:
+        checkpoint_dir = build_run_checkpoint_dir(args.config, config.train.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    wandb_run = init_wandb(config, run_dir=checkpoint_dir)
+    wandb_run = init_wandb(config, run_dir=checkpoint_dir, resume_run_id=resume_run_id)
 
     model = create_model(config)
     optimizer = create_optimizer(model, config)
@@ -473,10 +537,14 @@ def main() -> None:
     )
     ema_model = create_ema_model(model, config) if config.train.use_ema else None
     ema_update_fn = build_ema_update_runner(config.train.ema_decay) if config.train.use_ema else None
+    if resume_checkpoint is not None:
+        restored_step = load_checkpoint(resume_checkpoint, model, optimizer, ema_model=ema_model)
+        if restored_step != resume_step:
+            resume_step = restored_step
 
-    train_rng = np.random.default_rng(config.train.seed)
-    eval_rng = np.random.default_rng(config.train.seed + 1)
-    train_key = jax.random.key(config.train.seed)
+    train_rng = np.random.default_rng(config.train.seed + resume_step)
+    eval_rng = np.random.default_rng(config.train.seed + 1 + resume_step)
+    train_key = jax.random.fold_in(jax.random.key(config.train.seed), resume_step)
 
     device = jax.devices()[0]
     overview = dataset_overview(dataset)
@@ -491,6 +559,8 @@ def main() -> None:
         "grid_height=", config.model.grid_height,
         "grid_width=", config.model.grid_width,
         "checkpoint_dir=", checkpoint_dir,
+        "resume_checkpoint=", resume_checkpoint,
+        "resume_step=", resume_step,
     )
 
     current_batch = sample_device_batch(
@@ -501,7 +571,7 @@ def main() -> None:
         device=device,
     )
 
-    for step in range(1, config.train.max_steps + 1):
+    for step in range(resume_step + 1, config.train.max_steps + 1):
         train_key, step_key = jax.random.split(train_key)
         metrics = train_step_fn(
             model,

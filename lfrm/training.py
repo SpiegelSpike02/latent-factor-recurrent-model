@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
-from orbax.checkpoint import Checkpointer, PyTreeCheckpointHandler
+from orbax.checkpoint import Checkpointer, PyTreeCheckpointHandler, args as ocp_args
 
 from lfrm.config import ExperimentConfig
 from lfrm.models import LatentFactorRecurrentModel
@@ -323,9 +323,41 @@ def save_checkpoint(
     checkpointer = Checkpointer(PyTreeCheckpointHandler())
     target_dir = Path(checkpoint_dir).resolve() / f"step_{step}"
     payload = {
-        "model": nnx.state(ema_model if ema_model is not None else model),
+        "model": nnx.state(model),
         "optimizer": nnx.state(optimizer),
         "step": step,
         "uses_ema_model": ema_model is not None,
     }
+    if ema_model is not None:
+        payload["ema_model"] = nnx.state(ema_model)
     checkpointer.save(target_dir, payload, force=True)
+
+
+def load_checkpoint(
+    checkpoint_path: str | Path,
+    model: LatentFactorRecurrentModel,
+    optimizer: nnx.Optimizer,
+    *,
+    ema_model: LatentFactorRecurrentModel | None = None,
+) -> int:
+    checkpointer = Checkpointer(PyTreeCheckpointHandler())
+    restore_target = {
+        "model": nnx.state(model),
+        "optimizer": nnx.state(optimizer),
+        "step": 0,
+        "uses_ema_model": False,
+    }
+    if ema_model is not None:
+        restore_target["ema_model"] = nnx.state(ema_model)
+    payload = checkpointer.restore(
+        Path(checkpoint_path).resolve(),
+        args=ocp_args.PyTreeRestore(item=restore_target, partial_restore=True),
+    )
+    nnx.update(model, payload["model"])
+    nnx.update(optimizer, payload["optimizer"])
+    if ema_model is not None:
+        if "ema_model" in payload:
+            nnx.update(ema_model, payload["ema_model"])
+        else:
+            nnx.update(ema_model, payload["model"])
+    return int(payload["step"])
