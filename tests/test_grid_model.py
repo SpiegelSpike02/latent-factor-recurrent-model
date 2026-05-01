@@ -178,6 +178,26 @@ class LFRMModelTests(unittest.TestCase):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
 
+    def test_zero_weight_training_skips_expensive_diagnostics(self) -> None:
+        model = self._make_lfrm_model(num_steps=2, num_branches=2, num_slots=4)
+        batch = {
+            "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
+            "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
+            "given_mask": jnp.asarray([[True, False, True, False, False, True, False, True, False]], dtype=bool),
+        }
+        _, metrics = loss_and_metrics(
+            model,
+            batch,
+            True,
+            jax.random.key(1),
+            step_loss_weighting="final",
+            terminal_residual_weight=0.0,
+            energy_loss_weight=0.0,
+        )
+        self.assertNotIn("selected_branch_energy", metrics)
+        self.assertNotIn("terminal_belief_delta", metrics)
+        self.assertNotIn("terminal_belief_mse", metrics)
+
     def test_step_loss_weighting_modes(self) -> None:
         uniform = step_loss_weights(4, "uniform")
         linear = step_loss_weights(4, "linear")

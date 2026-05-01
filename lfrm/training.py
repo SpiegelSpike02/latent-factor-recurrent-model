@@ -104,17 +104,29 @@ def loss_and_metrics(
         model_key, energy_key = jax.random.split(dropout_key)
 
     use_final_forward = step_loss_weighting == "final" and hasattr(model, "forward_final_with_diagnostics")
+    compute_energy_selection = energy_loss_weight != 0.0
+    if isinstance(model, LatentFactorRecurrentModel) and not train:
+        compute_energy_selection = compute_energy_selection or model.lfrm.num_branches > 1
+    compute_terminal_residual = (not train) or terminal_residual_weight != 0.0
+    model_forward_kwargs = {}
+    if isinstance(model, LatentFactorRecurrentModel):
+        model_forward_kwargs = {
+            "compute_energy_selection": compute_energy_selection,
+            "compute_terminal_residual": compute_terminal_residual,
+        }
     if use_final_forward:
         step_logits, diagnostics = model.forward_final_with_diagnostics(
             inputs,
             train=train,
             dropout_key=model_key,
+            **model_forward_kwargs,
         )
     else:
         step_logits, diagnostics = model.forward_all_steps_with_diagnostics(
             inputs,
             train=train,
             dropout_key=model_key,
+            **model_forward_kwargs,
         )
     effective_step_logits = step_logits
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])

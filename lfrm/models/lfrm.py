@@ -407,6 +407,8 @@ class LatentFactorRecurrentModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None,
+        compute_energy_selection: bool = True,
+        compute_terminal_residual: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
         state0, initial_logits, initial_q, condition_mask = self._initial_state(tokens, train=train, dropout_key=dropout_key)
         initial_h = state0[0]
@@ -512,27 +514,27 @@ class LatentFactorRecurrentModel(nnx.Module):
             jnp.arange(self.config.num_steps),
         )
         h_final, logits_final, q_final, slots_final = final_state
-        final_given_channels = self._given_channels(initial_q, condition_mask, h_final.shape[1])
-        _, symbol_context_final = self._cell_symbol_context(h_final, logits_final, q_final, final_given_channels)
-        branch_energy = self._energy(q_final, h_final, slots_final, symbol_context_final)
-        selected_index = jnp.argmin(branch_energy, axis=1)
+        selected_index = jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
+        branch_energy = None
+        symbol_context_final = None
+        if compute_energy_selection:
+            final_given_channels = self._given_channels(initial_q, condition_mask, h_final.shape[1])
+            _, symbol_context_final = self._cell_symbol_context(h_final, logits_final, q_final, final_given_channels)
+            branch_energy = self._energy(q_final, h_final, slots_final, symbol_context_final)
+            selected_index = jnp.argmin(branch_energy, axis=1)
         selected_index_expanded = selected_index[:, None, None, None]
-        branch_vocab_logits = self._branch_logits_to_vocab(logits_final)
-        selected_logits = jnp.take_along_axis(
-            branch_vocab_logits,
-            jnp.broadcast_to(selected_index_expanded, (tokens.shape[0], 1, self.config.seq_len, self.config.vocab_size)),
+        selected_digit_logits = jnp.take_along_axis(
+            logits_final,
+            jnp.broadcast_to(selected_index_expanded, (tokens.shape[0], 1, self.config.seq_len, self.belief_dim)),
             axis=1,
         ).squeeze(1)
+        selected_logits = self._branch_logits_to_vocab(selected_digit_logits)
         selected_q = jnp.take_along_axis(
             q_final,
             jnp.broadcast_to(selected_index_expanded, (tokens.shape[0], 1, self.config.seq_len, self.belief_dim)),
             axis=1,
         ).squeeze(1)
 
-        next_state, _ = update_step(final_state)
-        q_delta = next_state[2] - q_final
-        q_residual_mse = self._blank_mean(jnp.square(q_delta), condition_mask)
-        q_residual_rms = jnp.sqrt(jnp.maximum(q_residual_mse, 0.0))
         entropy = -jnp.sum(selected_q * _safe_log(selected_q, self.lfrm.belief_floor), axis=-1, keepdims=True)
         blank_mask = (~condition_mask).astype(jnp.float32)[..., None]
         blank_normalizer = jnp.maximum(jnp.sum(blank_mask), 1.0)
@@ -549,25 +551,16 @@ class LatentFactorRecurrentModel(nnx.Module):
         slot_consistency_loss = consistency_total / steps_for_consistency
         slot_usage_entropy = usage_entropy_total / jnp.asarray(self.config.num_steps, dtype=jnp.float32)
         slot_diversity_loss = slot_diversity_total / jnp.asarray(self.config.num_steps, dtype=jnp.float32)
-        selected_branch_energy = jnp.mean(
-            jnp.take_along_axis(branch_energy, selected_index[:, None], axis=1).squeeze(1)
-        )
 
         diagnostics = {
             "hidden_delta_mean": jnp.asarray([hidden_delta], dtype=jnp.float32),
             "unroll_steps": jnp.asarray(self.config.num_steps, dtype=jnp.float32),
-            "terminal_belief_delta": q_residual_rms,
-            "terminal_belief_mse": q_residual_mse,
             "belief_entropy": belief_entropy,
             "belief_confidence": belief_confidence,
-            "branch_logits": branch_vocab_logits,
             "branch_digit_logits": logits_final,
             "branch_q": q_final,
             "branch_h": h_final,
             "branch_slots": slots_final,
-            "branch_symbol_context": symbol_context_final,
-            "branch_energy": branch_energy,
-            "selected_branch_energy": selected_branch_energy,
             "slot_consistency_loss": slot_consistency_loss,
             "slot_usage_entropy": slot_usage_entropy,
             "slot_usage_loss": 1.0 - slot_usage_entropy,
@@ -575,6 +568,19 @@ class LatentFactorRecurrentModel(nnx.Module):
             "branch_diversity": branch_diversity,
             "final_branch_diversity": final_branch_diversity,
         }
+        if compute_terminal_residual:
+            next_state, _ = update_step(final_state)
+            q_delta = next_state[2] - q_final
+            q_residual_mse = self._blank_mean(jnp.square(q_delta), condition_mask)
+            diagnostics["terminal_belief_mse"] = q_residual_mse
+            diagnostics["terminal_belief_delta"] = jnp.sqrt(jnp.maximum(q_residual_mse, 0.0))
+        if branch_energy is not None and symbol_context_final is not None:
+            diagnostics["branch_logits"] = self._branch_logits_to_vocab(logits_final)
+            diagnostics["branch_symbol_context"] = symbol_context_final
+            diagnostics["branch_energy"] = branch_energy
+            diagnostics["selected_branch_energy"] = jnp.mean(
+                jnp.take_along_axis(branch_energy, selected_index[:, None], axis=1).squeeze(1)
+            )
         return selected_logits[None, :, :, :], diagnostics
 
     def forward_all_steps_with_diagnostics(
@@ -583,8 +589,16 @@ class LatentFactorRecurrentModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
+        compute_energy_selection: bool = True,
+        compute_terminal_residual: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
-        return self._run_unroll(tokens, train=train, dropout_key=dropout_key)
+        return self._run_unroll(
+            tokens,
+            train=train,
+            dropout_key=dropout_key,
+            compute_energy_selection=compute_energy_selection,
+            compute_terminal_residual=compute_terminal_residual,
+        )
 
     def forward_final_with_diagnostics(
         self,
@@ -592,8 +606,16 @@ class LatentFactorRecurrentModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
+        compute_energy_selection: bool = True,
+        compute_terminal_residual: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
-        return self.forward_all_steps_with_diagnostics(tokens, train=train, dropout_key=dropout_key)
+        return self.forward_all_steps_with_diagnostics(
+            tokens,
+            train=train,
+            dropout_key=dropout_key,
+            compute_energy_selection=compute_energy_selection,
+            compute_terminal_residual=compute_terminal_residual,
+        )
 
     def forward_all_steps(self, tokens: Array, *, train: bool, dropout_key: Array | None = None) -> Array:
         logits, _ = self.forward_all_steps_with_diagnostics(tokens, train=train, dropout_key=dropout_key)
