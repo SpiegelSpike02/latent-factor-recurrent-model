@@ -27,7 +27,6 @@ belief_floor = 1e-5
 assignment_temperature = 1.0
 energy_hidden_dim = 256
 use_condition_type_embedding = true
-freeze_conditioned_state = true
 
 [optimizer]
 learning_rate = 1.5e-4

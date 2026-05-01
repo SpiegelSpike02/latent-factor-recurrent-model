@@ -344,8 +344,6 @@ class LatentFactorRecurrentModel(nnx.Module):
         cell_gate = jax.nn.sigmoid(self.cell_gate(cell_input).astype(jnp.float32))
         cell_candidate = jnp.tanh(self.cell_candidate(cell_input).astype(jnp.float32))
         h_next = h.astype(jnp.float32) + 0.1 * cell_gate * cell_candidate
-        if self.lfrm.freeze_conditioned_state:
-            h_next = jnp.where(condition_mask[:, None, :, None], initial_h, h_next)
 
         h_symbols = jnp.broadcast_to(h_next[:, :, :, None, :], symbol_message.shape)
         stats_symbols = jnp.broadcast_to(cell_stats[:, :, :, None, :], (*q.shape, cell_stats.shape[-1]))

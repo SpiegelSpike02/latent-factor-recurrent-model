@@ -22,7 +22,6 @@ class LFRMConfig:
     assignment_temperature: float = 1.0
     energy_hidden_dim: int = 128
     use_condition_type_embedding: bool = True
-    freeze_conditioned_state: bool = False
 
 
 @dataclass(frozen=True)

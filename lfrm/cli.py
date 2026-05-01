@@ -96,7 +96,6 @@ ALLOWED_NESTED_KEYS = {
         "assignment_temperature",
         "energy_hidden_dim",
         "use_condition_type_embedding",
-        "freeze_conditioned_state",
     },
     "ema": {"enabled", "decay"},
 }
@@ -185,7 +184,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lfrm-assignment-temperature", type=float, default=1.0)
     parser.add_argument("--lfrm-energy-hidden-dim", type=int, default=128)
     parser.add_argument("--lfrm-use-condition-type-embedding", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--lfrm-freeze-conditioned-state", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=100)
@@ -228,7 +226,6 @@ def build_config(args: argparse.Namespace, *, vocab_size: int, seq_len: int) -> 
             assignment_temperature=args.lfrm_assignment_temperature,
             energy_hidden_dim=args.lfrm_energy_hidden_dim,
             use_condition_type_embedding=args.lfrm_use_condition_type_embedding,
-            freeze_conditioned_state=args.lfrm_freeze_conditioned_state,
         ),
     )
     optimizer = OptimizerConfig(
