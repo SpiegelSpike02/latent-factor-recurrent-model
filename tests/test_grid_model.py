@@ -62,13 +62,14 @@ class LFRMModelTests(unittest.TestCase):
         model = self._make_lfrm_model(num_steps=2)
         tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
         logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
-        self.assertEqual(logits.shape, (1, 1, 9, 11))
+        self.assertEqual(logits.shape, (2, 1, 9, 11))
         self.assertEqual(diagnostics["branch_logits"].shape, (1, 3, 9, 11))
         self.assertEqual(diagnostics["branch_digit_logits"].shape, (1, 3, 9, 9))
         self.assertEqual(diagnostics["branch_q"].shape, (1, 3, 9, 9))
         self.assertEqual(diagnostics["branch_slots"].shape, (1, 3, 5, 12))
         self.assertEqual(diagnostics["branch_symbol_context"].shape, (1, 3, 9, 12))
         self.assertEqual(diagnostics["branch_energy"].shape, (1, 3))
+        self.assertEqual(diagnostics["hidden_delta_mean"].shape, (2,))
         self.assertEqual(int(diagnostics["unroll_steps"]), 2)
 
     def test_given_cells_are_clamped(self) -> None:
@@ -176,6 +177,8 @@ class LFRMModelTests(unittest.TestCase):
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
+        self.assertEqual(metrics["per_step_loss"].shape, (2,))
+        self.assertEqual(metrics["per_step_hidden_delta"].shape, (2,))
 
     def test_zero_weight_training_skips_expensive_diagnostics(self) -> None:
         model = self._make_lfrm_model(num_steps=2, num_branches=2, num_slots=4)

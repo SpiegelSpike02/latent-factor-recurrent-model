@@ -476,6 +476,7 @@ class LatentFactorRecurrentModel(nnx.Module):
             )
             branch_diversity_step = blank_branch_diversity(next_state[2])
             branch_diversity_mask = use_branch_diversity.astype(jnp.float32)
+            step_logits = self._branch_logits_to_vocab(next_state[1])
             return (
                 next_state,
                 assignment,
@@ -485,7 +486,7 @@ class LatentFactorRecurrentModel(nnx.Module):
                 branch_diversity_total + branch_diversity_mask * branch_diversity_step,
                 branch_diversity_count + branch_diversity_mask,
                 hidden_delta,
-            ), None
+            ), (step_logits, hidden_delta)
 
         initial_carry = (
             state0,
@@ -506,7 +507,7 @@ class LatentFactorRecurrentModel(nnx.Module):
             branch_diversity_total,
             branch_diversity_count,
             hidden_delta,
-        ), _ = jax.lax.scan(
+        ), (step_branch_logits, step_hidden_delta) = jax.lax.scan(
             scan_step,
             initial_carry,
             jnp.arange(self.config.num_steps),
@@ -527,6 +528,21 @@ class LatentFactorRecurrentModel(nnx.Module):
             axis=1,
         ).squeeze(1)
         selected_logits = self._branch_logits_to_vocab(selected_digit_logits)
+        step_selected_index = selected_index[None, :, None, None, None]
+        step_selected_logits = jnp.take_along_axis(
+            step_branch_logits,
+            jnp.broadcast_to(
+                step_selected_index,
+                (
+                    self.config.num_steps,
+                    tokens.shape[0],
+                    1,
+                    self.config.seq_len,
+                    self.config.vocab_size,
+                ),
+            ),
+            axis=2,
+        ).squeeze(2)
         selected_q = jnp.take_along_axis(
             q_final,
             jnp.broadcast_to(selected_index_expanded, (tokens.shape[0], 1, self.config.seq_len, self.belief_dim)),
@@ -551,7 +567,7 @@ class LatentFactorRecurrentModel(nnx.Module):
         slot_diversity_loss = slot_diversity_total / jnp.asarray(self.config.num_steps, dtype=jnp.float32)
 
         diagnostics = {
-            "hidden_delta_mean": jnp.asarray([hidden_delta], dtype=jnp.float32),
+            "hidden_delta_mean": step_hidden_delta,
             "unroll_steps": jnp.asarray(self.config.num_steps, dtype=jnp.float32),
             "belief_entropy": belief_entropy,
             "belief_confidence": belief_confidence,
@@ -579,7 +595,7 @@ class LatentFactorRecurrentModel(nnx.Module):
             diagnostics["selected_branch_energy"] = jnp.mean(
                 jnp.take_along_axis(branch_energy, selected_index[:, None], axis=1).squeeze(1)
             )
-        return selected_logits[None, :, :, :], diagnostics
+        return step_selected_logits, diagnostics
 
     def forward_all_steps_with_diagnostics(
         self,
