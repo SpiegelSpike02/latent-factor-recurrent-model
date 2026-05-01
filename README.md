@@ -5,8 +5,8 @@ recurrent reasoning on 2D grid tasks. The repository now has one primary model
 path:
 
 - `lfrm`: a Perceiver IO-style multi-head latent bottleneck modified into a
-  recurrent belief solver with dynamic latent factors, multi-hypothesis
-  branches, learned energy selection, and symbol-equivariant updates.
+  recurrent belief solver with dynamic latent factors and symbol-equivariant
+  updates.
 
 The older Universal Transformer and Recurrent Transformer implementations have
 been removed. LFRM is the generalized shared-block recurrent reasoning path:
@@ -56,10 +56,12 @@ CLI flags override config values:
 uv run lfrm-train --config configs/sudoku_lfrm.toml --learning-rate 1e-4 --batch-size 16
 ```
 
-For recurrent supervision, `--step-loss-weighting final` is the default because
-the current LFRM training path returns the selected terminal belief. `uniform`
-and `linear` are still accepted for compatibility with future multi-step
-diagnostic outputs.
+For recurrent supervision, `--step-loss-weighting` can be `final`, `uniform`,
+or `linear`. `uniform` and `linear` apply token-level CE across all recurrent
+steps, which is useful for dense supervision and diagnosing refinement dynamics.
+`--q-loss-weight` trains a task-agnostic per-step quality head from target
+token accuracy, and evaluation reports both the final step and the step selected
+by that head.
 
 The package also applies project-level JAX defaults before JAX initializes:
 Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, GPU preallocation

@@ -84,10 +84,8 @@ def loss_and_metrics(
     train: bool,
     dropout_key: jax.Array | None,
     step_loss_weighting: str = "uniform",
+    q_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
-    energy_loss_weight: float = 0.0,
-    energy_margin: float = 1.0,
-    energy_corruptions: int = 1,
     slot_consistency_weight: float = 0.0,
     slot_usage_weight: float = 0.0,
     slot_diversity_weight: float = 0.0,
@@ -99,19 +97,12 @@ def loss_and_metrics(
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
 
     model_key = dropout_key
-    energy_key = jax.random.key(0)
-    if dropout_key is not None:
-        model_key, energy_key = jax.random.split(dropout_key)
 
     use_final_forward = step_loss_weighting == "final" and hasattr(model, "forward_final_with_diagnostics")
-    compute_energy_selection = energy_loss_weight != 0.0
-    if isinstance(model, LatentFactorRecurrentModel) and not train:
-        compute_energy_selection = compute_energy_selection or model.lfrm.num_branches > 1
     compute_terminal_residual = (not train) or terminal_residual_weight != 0.0
     model_forward_kwargs = {}
     if isinstance(model, LatentFactorRecurrentModel):
         model_forward_kwargs = {
-            "compute_energy_selection": compute_energy_selection,
             "compute_terminal_residual": compute_terminal_residual,
         }
     if use_final_forward:
@@ -133,22 +124,28 @@ def loss_and_metrics(
     step_loss_mask = loss_mask[None, :, :]
     token_loss = optax.softmax_cross_entropy_with_integer_labels(effective_step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
+    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
+    per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
 
     step_weights = step_loss_weights(effective_step_logits.shape[0], step_loss_weighting)
     blank_ce_loss = jnp.sum(step_weights * per_step_loss)
-    branch_min_ce = None
-    branch_mean_ce = None
-    if "branch_logits" in diagnostics:
-        branch_logits = diagnostics.get("branch_digit_logits", diagnostics["branch_logits"])
-        branch_targets_raw = targets - 2 if "branch_digit_logits" in diagnostics else targets
-        branch_targets = jnp.broadcast_to(branch_targets_raw[:, None, :], branch_logits.shape[:-1])
-        branch_loss_mask = loss_mask[:, None, :]
-        branch_token_loss = optax.softmax_cross_entropy_with_integer_labels(branch_logits, branch_targets)
-        per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1, keepdims=True), 1.0)
-        branch_ce = jnp.sum(branch_token_loss * branch_loss_mask, axis=-1) / per_example_normalizer
-        blank_ce_loss = jnp.mean(branch_ce)
-        branch_min_ce = jnp.mean(jnp.min(branch_ce, axis=-1))
-        branch_mean_ce = jnp.mean(branch_ce)
+    step_predictions = jnp.argmax(effective_step_logits, axis=-1)
+    step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask
+    per_step_example_accuracy = jnp.sum(step_correct, axis=-1) / per_example_normalizer[None, :]
+    quality_logits = diagnostics.get("quality_logits")
+    q_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    q_selected_logits = effective_step_logits[-1]
+    q_selected_step = jnp.full((inputs.shape[0],), effective_step_logits.shape[0] - 1, dtype=jnp.int32)
+    if quality_logits is not None:
+        q_targets = jax.lax.stop_gradient(per_step_example_accuracy)
+        q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(quality_logits, q_targets))
+        q_selected_step = jnp.argmax(quality_logits, axis=0)
+        gather_index = q_selected_step[None, :, None, None]
+        q_selected_logits = jnp.take_along_axis(
+            effective_step_logits,
+            jnp.broadcast_to(gather_index, (1, inputs.shape[0], effective_step_logits.shape[2], effective_step_logits.shape[3])),
+            axis=0,
+        ).squeeze(0)
     terminal_residual = diagnostics.get(
         "terminal_belief_mse",
         diagnostics.get("terminal_belief_delta", jnp.asarray(0.0, dtype=jnp.float32)),
@@ -156,22 +153,10 @@ def loss_and_metrics(
     slot_consistency_loss = diagnostics.get("slot_consistency_loss", jnp.asarray(0.0, dtype=jnp.float32))
     slot_usage_loss = diagnostics.get("slot_usage_loss", jnp.asarray(0.0, dtype=jnp.float32))
     slot_diversity_loss = diagnostics.get("slot_diversity_loss", jnp.asarray(0.0, dtype=jnp.float32))
-    energy_metrics = {}
-    if hasattr(model, "energy_training_metrics") and energy_loss_weight != 0.0:
-        energy_metrics = model.energy_training_metrics(
-            inputs,
-            targets,
-            given_mask,
-            energy_key,
-            diagnostics,
-            margin=energy_margin,
-            corruptions=energy_corruptions,
-        )
-    energy_margin_loss = energy_metrics.get("energy_margin_loss", jnp.asarray(0.0, dtype=jnp.float32))
     loss = (
         blank_ce_loss
+        + q_loss_weight * q_loss
         + terminal_residual_weight * terminal_residual
-        + energy_loss_weight * energy_margin_loss
         + slot_consistency_weight * slot_consistency_loss
         + slot_usage_weight * slot_usage_loss
         + slot_diversity_weight * slot_diversity_loss
@@ -193,27 +178,42 @@ def loss_and_metrics(
         True,
     )
     solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
+    q_selected_token_loss = optax.softmax_cross_entropy_with_integer_labels(q_selected_logits, targets)
+    q_selected_ce_loss = jnp.sum(q_selected_token_loss * loss_mask) / normalizer
+    q_selected_predictions = jnp.argmax(q_selected_logits, axis=-1)
+    q_selected_correct = (q_selected_predictions == targets).astype(jnp.float32) * loss_mask
+    q_selected_accuracy = jnp.sum(q_selected_correct) / normalizer
+    q_selected_correct_per_example = jnp.sum(q_selected_correct, axis=-1)
+    q_selected_solved_examples = jnp.where(
+        blanks_per_example > 0,
+        q_selected_correct_per_example == blanks_per_example,
+        True,
+    )
+    q_selected_solved_rate = jnp.mean(q_selected_solved_examples.astype(jnp.float32))
+    oracle_step = jnp.argmin(per_step_example_loss, axis=0)
 
     metrics = {
         "loss": loss,
         "blank_ce_loss": blank_ce_loss,
+        "q_loss": q_loss,
         "final_blank_ce_loss": per_step_loss[-1],
         "target_probability": target_probability,
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
+        "q_selected_blank_ce_loss": q_selected_ce_loss,
+        "q_selected_blank_cell_accuracy": q_selected_accuracy,
+        "q_selected_solved_rate": q_selected_solved_rate,
+        "q_selected_step": jnp.mean(q_selected_step.astype(jnp.float32) + 1.0),
+        "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
         "per_step_loss": per_step_loss,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
     }
+    if quality_logits is not None:
+        metrics["per_step_quality_score"] = jax.nn.sigmoid(jnp.mean(quality_logits, axis=1))
     if "terminal_belief_delta" in diagnostics or terminal_residual_weight != 0.0:
         metrics["terminal_belief_delta"] = diagnostics.get("terminal_belief_delta", terminal_residual)
     if "terminal_belief_mse" in diagnostics or terminal_residual_weight != 0.0:
         metrics["terminal_belief_mse"] = terminal_residual
-    if energy_loss_weight != 0.0:
-        metrics["energy_margin_loss"] = energy_margin_loss
-    if branch_min_ce is not None:
-        metrics["branch_min_ce"] = branch_min_ce
-    if branch_mean_ce is not None:
-        metrics["branch_mean_ce"] = branch_mean_ce
     if "rho_mean" in diagnostics:
         metrics["per_step_rho"] = diagnostics["rho_mean"]
     if "alpha_mean" in diagnostics:
@@ -224,27 +224,26 @@ def loss_and_metrics(
         "terminal_belief_mse",
         "belief_entropy",
         "belief_confidence",
-        "selected_branch_energy",
+        "q_loss",
+        "q_selected_blank_ce_loss",
+        "q_selected_blank_cell_accuracy",
+        "q_selected_solved_rate",
+        "q_selected_step",
+        "oracle_step",
         "slot_consistency_loss",
         "slot_usage_entropy",
         "slot_usage_loss",
         "slot_diversity_loss",
-        "branch_diversity",
-        "final_branch_diversity",
     ):
         if key in diagnostics:
             metrics[key] = diagnostics[key]
-    for key, value in energy_metrics.items():
-        metrics[key] = value
     return loss, metrics
 
 
 def build_train_step_runner(
     step_loss_weighting: str = "uniform",
+    q_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
-    energy_loss_weight: float = 0.0,
-    energy_margin: float = 1.0,
-    energy_corruptions: int = 1,
     slot_consistency_weight: float = 0.0,
     slot_usage_weight: float = 0.0,
     slot_diversity_weight: float = 0.0,
@@ -262,10 +261,8 @@ def build_train_step_runner(
                 train,
                 dropout_key,
                 step_loss_weighting,
+                q_loss_weight,
                 terminal_residual_weight,
-                energy_loss_weight,
-                energy_margin,
-                energy_corruptions,
                 slot_consistency_weight,
                 slot_usage_weight,
                 slot_diversity_weight,
@@ -281,10 +278,8 @@ def build_train_step_runner(
 
 def build_eval_step_runner(
     step_loss_weighting: str = "uniform",
+    q_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
-    energy_loss_weight: float = 0.0,
-    energy_margin: float = 1.0,
-    energy_corruptions: int = 1,
     slot_consistency_weight: float = 0.0,
     slot_usage_weight: float = 0.0,
     slot_diversity_weight: float = 0.0,
@@ -299,10 +294,8 @@ def build_eval_step_runner(
             False,
             None,
             step_loss_weighting,
+            q_loss_weight,
             terminal_residual_weight,
-            energy_loss_weight,
-            energy_margin,
-            energy_corruptions,
             slot_consistency_weight,
             slot_usage_weight,
             slot_diversity_weight,

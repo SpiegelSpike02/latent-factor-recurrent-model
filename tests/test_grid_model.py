@@ -33,7 +33,6 @@ class LFRMModelTests(unittest.TestCase):
         self,
         *,
         num_steps: int = 3,
-        num_branches: int = 3,
         num_slots: int = 5,
     ) -> LatentFactorRecurrentModel:
         return LatentFactorRecurrentModel(
@@ -48,28 +47,24 @@ class LFRMModelTests(unittest.TestCase):
                 lfrm=LFRMConfig(
                     belief_dim=9,
                     num_slots=num_slots,
-                    num_branches=num_branches,
                     num_heads=4,
                     latent_processor_layers=1,
-                    energy_hidden_dim=16,
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
             rngs=nnx.Rngs(12),
         )
 
-    def test_forward_final_only_shape_and_branch_metrics(self) -> None:
+    def test_forward_all_steps_shape_and_diagnostics(self) -> None:
         model = self._make_lfrm_model(num_steps=2)
         tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
         logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
         self.assertEqual(logits.shape, (2, 1, 9, 11))
-        self.assertEqual(diagnostics["branch_logits"].shape, (1, 3, 9, 11))
-        self.assertEqual(diagnostics["branch_digit_logits"].shape, (1, 3, 9, 9))
-        self.assertEqual(diagnostics["branch_q"].shape, (1, 3, 9, 9))
-        self.assertEqual(diagnostics["branch_slots"].shape, (1, 3, 5, 12))
-        self.assertEqual(diagnostics["branch_symbol_context"].shape, (1, 3, 9, 12))
-        self.assertEqual(diagnostics["branch_energy"].shape, (1, 3))
+        self.assertEqual(diagnostics["digit_logits"].shape, (1, 9, 9))
+        self.assertEqual(diagnostics["q"].shape, (1, 9, 9))
+        self.assertEqual(diagnostics["slots"].shape, (1, 5, 12))
         self.assertEqual(diagnostics["hidden_delta_mean"].shape, (2,))
+        self.assertEqual(diagnostics["quality_logits"].shape, (2, 1))
         self.assertEqual(int(diagnostics["unroll_steps"]), 2)
 
     def test_given_cells_are_clamped(self) -> None:
@@ -81,9 +76,9 @@ class LFRMModelTests(unittest.TestCase):
         self.assertEqual(int(predictions[0, 2]), 3)
         self.assertEqual(int(predictions[0, 5]), 4)
         self.assertEqual(int(predictions[0, 7]), 5)
-        given_q = jnp.take(diagnostics["branch_q"][0], jnp.asarray([0, 2, 5, 7]), axis=1)
+        given_q = jnp.take(diagnostics["q"][0], jnp.asarray([0, 2, 5, 7]), axis=0)
         expected_digits = jnp.asarray([0, 1, 2, 3], dtype=jnp.int32)
-        self.assertTrue(bool(jnp.all(jnp.argmax(given_q, axis=-1) == expected_digits[None, :])))
+        self.assertTrue(bool(jnp.all(jnp.argmax(given_q, axis=-1) == expected_digits)))
 
     def test_lfrm_uses_no_sudoku_specific_relations(self) -> None:
         source = inspect.getsource(lfrm_module)
@@ -95,7 +90,7 @@ class LFRMModelTests(unittest.TestCase):
         self.assertFalse(hasattr(self._make_lfrm_model(), "row_unit_matrix"))
 
     def test_symbol_equivariance(self) -> None:
-        model = self._make_lfrm_model(num_steps=2, num_branches=2, num_slots=4)
+        model = self._make_lfrm_model(num_steps=2, num_slots=4)
         tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
         permutation = jnp.asarray([2, 0, 1, 3, 4, 5, 6, 7, 8], dtype=jnp.int32)
         digit_ids = tokens - 2
@@ -107,7 +102,7 @@ class LFRMModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.allclose(logits[..., 2:], restored_digit_logits, atol=1e-4, rtol=1e-4)))
 
     def test_initial_hidden_is_symbol_invariant(self) -> None:
-        model = self._make_lfrm_model(num_steps=1, num_branches=2, num_slots=4)
+        model = self._make_lfrm_model(num_steps=1, num_slots=4)
         tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
         permutation = jnp.asarray([2, 0, 1, 3, 4, 5, 6, 7, 8], dtype=jnp.int32)
         digit_ids = tokens - 2
@@ -118,36 +113,20 @@ class LFRMModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.allclose(state[0], permuted_state[0], atol=1e-6, rtol=1e-6)))
 
     def test_symbol_conditioned_slot_readout_shape(self) -> None:
-        model = self._make_lfrm_model(num_steps=1, num_branches=2, num_slots=4)
+        model = self._make_lfrm_model(num_steps=1, num_slots=4)
         tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
         state, initial_logits, initial_q, condition_mask = model._initial_state(tokens, train=False, dropout_key=None)
         h, logits, q, slots = state
-        given_channels = model._given_channels(initial_q, condition_mask, h.shape[1])
+        given_channels = model._given_channels(initial_q, condition_mask)
         micro_tokens, symbol_context = model._cell_symbol_context(h, logits, q, given_channels)
         message, routing = model._slots_to_cell_symbols(micro_tokens, slots)
-        self.assertEqual(micro_tokens.shape, (1, 2, 9, 9, 12))
-        self.assertEqual(symbol_context.shape, (1, 2, 9, 12))
-        self.assertEqual(message.shape, (1, 2, 9, 9, 12))
-        self.assertEqual(routing.shape, (1, 2, 9, 9, 4))
-
-    def test_energy_is_symbol_invariant(self) -> None:
-        model = self._make_lfrm_model(num_steps=1, num_branches=2, num_slots=4)
-        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
-        permutation = jnp.asarray([2, 0, 1, 3, 4, 5, 6, 7, 8], dtype=jnp.int32)
-        _, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
-        q = diagnostics["branch_q"]
-        symbol_context = diagnostics["branch_symbol_context"]
-        energy = model._energy(q, diagnostics["branch_h"], diagnostics["branch_slots"], symbol_context)
-        permuted_energy = model._energy(
-            q[..., permutation],
-            diagnostics["branch_h"],
-            diagnostics["branch_slots"],
-            symbol_context[:, :, permutation, :],
-        )
-        self.assertTrue(bool(jnp.allclose(energy, permuted_energy, atol=1e-5, rtol=1e-5)))
+        self.assertEqual(micro_tokens.shape, (1, 9, 9, 12))
+        self.assertEqual(symbol_context.shape, (1, 9, 12))
+        self.assertEqual(message.shape, (1, 9, 9, 12))
+        self.assertEqual(routing.shape, (1, 9, 9, 4))
 
     def test_training_losses_are_finite(self) -> None:
-        model = self._make_lfrm_model(num_steps=2, num_branches=2, num_slots=4)
+        model = self._make_lfrm_model(num_steps=2, num_slots=4)
         batch = {
             "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
             "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
@@ -160,16 +139,18 @@ class LFRMModelTests(unittest.TestCase):
             jax.random.key(1),
             step_loss_weighting="final",
             terminal_residual_weight=0.1,
-            energy_loss_weight=0.05,
             slot_consistency_weight=0.01,
             slot_usage_weight=0.001,
         )
         self.assertNotIn("validity_loss", metrics)
         for key in (
             "loss",
-            "branch_min_ce",
-            "branch_mean_ce",
-            "energy_margin_loss",
+            "q_loss",
+            "q_selected_blank_ce_loss",
+            "q_selected_blank_cell_accuracy",
+            "q_selected_solved_rate",
+            "q_selected_step",
+            "oracle_step",
             "slot_consistency_loss",
             "slot_usage_entropy",
             "terminal_belief_delta",
@@ -179,9 +160,10 @@ class LFRMModelTests(unittest.TestCase):
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
         self.assertEqual(metrics["per_step_loss"].shape, (2,))
         self.assertEqual(metrics["per_step_hidden_delta"].shape, (2,))
+        self.assertEqual(metrics["per_step_quality_score"].shape, (2,))
 
     def test_zero_weight_training_skips_expensive_diagnostics(self) -> None:
-        model = self._make_lfrm_model(num_steps=2, num_branches=2, num_slots=4)
+        model = self._make_lfrm_model(num_steps=2, num_slots=4)
         batch = {
             "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
             "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
@@ -194,9 +176,7 @@ class LFRMModelTests(unittest.TestCase):
             jax.random.key(1),
             step_loss_weighting="final",
             terminal_residual_weight=0.0,
-            energy_loss_weight=0.0,
         )
-        self.assertNotIn("selected_branch_energy", metrics)
         self.assertNotIn("terminal_belief_delta", metrics)
         self.assertNotIn("terminal_belief_mse", metrics)
 
@@ -227,7 +207,7 @@ class LFRMModelTests(unittest.TestCase):
             self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
 
     def test_gradient_path_finite(self) -> None:
-        model = self._make_lfrm_model(num_steps=1, num_branches=2, num_slots=3)
+        model = self._make_lfrm_model(num_steps=1, num_slots=3)
         batch = {
             "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
             "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
@@ -242,7 +222,6 @@ class LFRMModelTests(unittest.TestCase):
                 jax.random.key(1),
                 step_loss_weighting="final",
                 terminal_residual_weight=0.1,
-                energy_loss_weight=0.05,
                 slot_consistency_weight=0.01,
                 slot_usage_weight=0.001,
             )[0]
@@ -286,7 +265,6 @@ class LFRMModelTests(unittest.TestCase):
                 lfrm=LFRMConfig(
                     belief_dim=9,
                     num_slots=3,
-                    num_branches=2,
                 ),
             ),
             optimizer=OptimizerConfig(),
@@ -346,7 +324,7 @@ class LFRMModelTests(unittest.TestCase):
                 grid_width=3,
                 d_model=12,
                 num_steps=1,
-                lfrm=LFRMConfig(belief_dim=9, num_slots=3, num_branches=1),
+                lfrm=LFRMConfig(belief_dim=9, num_slots=3),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),

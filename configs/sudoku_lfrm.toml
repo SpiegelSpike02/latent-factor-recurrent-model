@@ -13,19 +13,14 @@ dropout_rate = 0.05
 [model.lfrm]
 belief_dim = 9
 num_slots = 64
-num_branches = 1
 num_heads = 8
 latent_processor_layers = 2
 symbol_context_mode = "cell_symbol_tokens"
 slot_readout_mode = "cell_symbol_attention"
-energy_symbol_pooling = "deepsets"
-branch_diversity_schedule = "none"
-diversity_apply_steps = [0, 0]
 belief_temperature = 1.0
 belief_step_size = 0.25
 belief_floor = 1e-5
 assignment_temperature = 1.0
-energy_hidden_dim = 256
 use_condition_type_embedding = true
 
 [optimizer]
@@ -37,15 +32,13 @@ flatten_optimizer = true
 
 [train]
 batch_size = 64
-max_steps = 20000
+max_steps = 50000
 log_every = 10
 eval_every = 500
 eval_batches = 32
 step_loss_weighting = "uniform"
+q_loss_weight = 0.1
 terminal_residual_weight = 0.0
-energy_loss_weight = 0
-energy_margin = 1.0
-energy_corruptions = 1
 slot_consistency_weight = 0.0
 slot_usage_weight = 0.0
 slot_diversity_weight = 0.0
@@ -62,5 +55,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-lfrm-branch-ablation"
+name = "sudoku-lfrm-core"
 mode = "online"

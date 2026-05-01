@@ -45,8 +45,6 @@ class LatentFactorRecurrentModel(nnx.Module):
             raise ValueError("LFRM expects belief_dim == vocab_size - 2 for grid classification tokens")
         if lfrm.num_slots < 1:
             raise ValueError("LFRM num_slots must be at least 1")
-        if lfrm.num_branches < 1:
-            raise ValueError("LFRM num_branches must be at least 1")
         if lfrm.num_heads < 1:
             raise ValueError("LFRM num_heads must be at least 1")
         if lfrm.latent_processor_layers < 0:
@@ -57,10 +55,6 @@ class LatentFactorRecurrentModel(nnx.Module):
             raise ValueError("LFRM v1 requires symbol_context_mode='cell_symbol_tokens'")
         if lfrm.slot_readout_mode != "cell_symbol_attention":
             raise ValueError("LFRM v1 requires slot_readout_mode='cell_symbol_attention'")
-        if lfrm.energy_symbol_pooling != "deepsets":
-            raise ValueError("LFRM v1 requires energy_symbol_pooling='deepsets'")
-        if lfrm.branch_diversity_schedule not in ("early", "none"):
-            raise ValueError("LFRM branch_diversity_schedule must be 'early' or 'none'")
 
         self.config = config
         self.runtime = runtime
@@ -72,14 +66,12 @@ class LatentFactorRecurrentModel(nnx.Module):
 
         self.row_ids = jnp.repeat(jnp.arange(config.grid_height, dtype=jnp.int32), config.grid_width)
         self.col_ids = jnp.tile(jnp.arange(config.grid_width, dtype=jnp.int32), config.grid_height)
-        self.branch_ids = jnp.arange(lfrm.num_branches, dtype=jnp.int32)
         self.slot_ids = jnp.arange(lfrm.num_slots, dtype=jnp.int32)
 
         d_model = config.d_model
         self.row_embed = nnx.Embed(config.grid_height, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.col_embed = nnx.Embed(config.grid_width, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.condition_type_embed = nnx.Embed(2, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
-        self.branch_embed = nnx.Embed(lfrm.num_branches, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.slot_embed = nnx.Embed(lfrm.num_slots, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
 
@@ -137,10 +129,10 @@ class LatentFactorRecurrentModel(nnx.Module):
         self.symbol_hidden = nnx.Linear(symbol_dim, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.symbol_delta = nnx.Linear(d_model, 1, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 
-        energy_hidden = lfrm.energy_hidden_dim
-        self.energy_cell_feature = nnx.Linear(2 * d_model + 3, energy_hidden, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
-        self.energy_cell_score = nnx.Linear(energy_hidden, 1, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
-        self.energy_slot_score = nnx.Linear(d_model, 1, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+        q_head_dim = 2 * d_model + 2
+        self.q_head_norm = nnx.RMSNorm(q_head_dim, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+        self.q_head_hidden = nnx.Linear(q_head_dim, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+        self.q_head_logit = nnx.Linear(d_model, 1, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 
     def _split_heads(self, x: Array) -> Array:
         return x.reshape(*x.shape[:-1], self.lfrm.num_heads, self.head_dim)
@@ -170,7 +162,7 @@ class LatentFactorRecurrentModel(nnx.Module):
 
     def _clamp_logits(self, logits: Array, initial_logits: Array, condition_mask: Array) -> Array:
         logits = logits - jnp.mean(logits, axis=-1, keepdims=True)
-        return jnp.where(condition_mask[:, None, :, None], initial_logits[:, None, :, :], logits)
+        return jnp.where(condition_mask[..., None], initial_logits, logits)
 
     def _initial_state(
         self,
@@ -188,35 +180,23 @@ class LatentFactorRecurrentModel(nnx.Module):
         if self.lfrm.use_condition_type_embedding:
             base_hidden = base_hidden + condition_type
         base_hidden = self.dropout(base_hidden, deterministic=not train, rngs=dropout_key)
-        branch_hidden = base_hidden[:, None, :, :] + self.branch_embed(self.branch_ids)[None, :, None, :]
-        branch_hidden = branch_hidden.astype(jnp.float32)
-
-        q = jnp.broadcast_to(
-            q0[:, None, :, :],
-            (tokens.shape[0], self.lfrm.num_branches, self.config.seq_len, self.belief_dim),
-        )
-        logits = jnp.broadcast_to(
-            logits0[:, None, :, :],
-            (tokens.shape[0], self.lfrm.num_branches, self.config.seq_len, self.belief_dim),
-        )
-        slots = self.slot_embed(self.slot_ids)[None, None, :, :]
-        slots = slots + self.branch_embed(self.branch_ids)[None, :, None, :]
+        hidden = base_hidden.astype(jnp.float32)
+        slots = self.slot_embed(self.slot_ids)[None, :, :]
         slots = jnp.broadcast_to(
             slots.astype(jnp.float32),
             (
                 tokens.shape[0],
-                self.lfrm.num_branches,
                 self.lfrm.num_slots,
                 self.config.d_model,
             ),
         )
-        return (branch_hidden, logits, q, slots), logits0, q0, condition_mask
+        return (hidden, logits0, q0, slots), logits0, q0, condition_mask
 
     def _local_mix(self, h: Array) -> Array:
-        batch, branches, _, channels = h.shape
-        grid = h.reshape(batch * branches, self.config.grid_height, self.config.grid_width, channels)
+        batch, _, channels = h.shape
+        grid = h.reshape(batch, self.config.grid_height, self.config.grid_width, channels)
         local = self.local_depthwise(maybe_cast(grid, self.dtype)).astype(jnp.float32)
-        return local.reshape(batch, branches, self.config.seq_len, channels)
+        return local.reshape(batch, self.config.seq_len, channels)
 
     def _local_update(self, h: Array, q: Array) -> Array:
         stats = self._belief_stats(q)
@@ -226,64 +206,67 @@ class LatentFactorRecurrentModel(nnx.Module):
         candidate = jnp.tanh(self.local_candidate(local_input).astype(jnp.float32))
         return h.astype(jnp.float32) + 0.1 * gate * candidate
 
-    def _given_channels(self, initial_q: Array, condition_mask: Array, branches: int) -> Array:
+    def _given_channels(self, initial_q: Array, condition_mask: Array) -> Array:
         given = jnp.where(condition_mask[..., None], initial_q, 0.0)
-        return jnp.broadcast_to(
-            given[:, None, :, :],
-            (given.shape[0], branches, self.config.seq_len, self.belief_dim),
-        )
+        return given
 
     def _cell_symbol_context(self, h: Array, logits: Array, q: Array, given_channels: Array) -> tuple[Array, Array]:
-        h_symbols = jnp.broadcast_to(h[:, :, :, None, :], (*q.shape, h.shape[-1]))
+        h_symbols = jnp.broadcast_to(h[:, :, None, :], (*q.shape, h.shape[-1]))
         stats = self._belief_stats(q)
-        stats_symbols = jnp.broadcast_to(stats[:, :, :, None, :], (*q.shape, stats.shape[-1]))
+        stats_symbols = jnp.broadcast_to(stats[:, :, None, :], (*q.shape, stats.shape[-1]))
         symbol_input = jnp.concatenate(
             [h_symbols, q[..., None], logits[..., None], given_channels[..., None], stats_symbols],
             axis=-1,
         )
         symbol_input = self.micro_token_norm(maybe_cast(symbol_input, self.dtype))
         base_tokens = jax.nn.silu(self.micro_token_hidden(symbol_input).astype(jnp.float32))
-        symbol_context = jnp.mean(base_tokens, axis=2)
-        context_tokens = jnp.broadcast_to(symbol_context[:, :, None, :, :], base_tokens.shape)
+        symbol_context = jnp.mean(base_tokens, axis=1)
+        context_tokens = jnp.broadcast_to(symbol_context[:, None, :, :], base_tokens.shape)
         token_input = jnp.concatenate([base_tokens, context_tokens], axis=-1)
         token_input = self.symbol_context_norm(maybe_cast(token_input, self.dtype))
         tokens = jax.nn.silu(self.symbol_context_hidden(token_input).astype(jnp.float32))
         return tokens, symbol_context
 
     def _slot_pattern_decorrelation(self, attention: Array) -> Array:
-        patterns = jnp.mean(attention, axis=2)
-        patterns = patterns.reshape(*patterns.shape[:3], self.config.seq_len * self.belief_dim)
+        patterns = jnp.mean(attention, axis=1)
+        patterns = patterns.reshape(*patterns.shape[:2], self.config.seq_len * self.belief_dim)
         patterns = patterns / jnp.maximum(jnp.linalg.norm(patterns, axis=-1, keepdims=True), self.lfrm.belief_floor)
-        cosine = _contract("brmt,brnt->brmn", patterns, patterns).astype(jnp.float32)
+        cosine = _contract("bmt,bnt->bmn", patterns, patterns).astype(jnp.float32)
         offdiag = 1.0 - jnp.eye(self.lfrm.num_slots, dtype=jnp.float32)
-        return jnp.sum(cosine * offdiag[None, None, :, :]) / jnp.maximum(
-            jnp.asarray(cosine.shape[0] * cosine.shape[1] * self.lfrm.num_slots * (self.lfrm.num_slots - 1), dtype=jnp.float32),
+        return jnp.sum(cosine * offdiag[None, :, :]) / jnp.maximum(
+            jnp.asarray(cosine.shape[0] * self.lfrm.num_slots * (self.lfrm.num_slots - 1), dtype=jnp.float32),
             1.0,
         )
 
     def _cells_to_slots(self, micro_tokens: Array, slots: Array) -> tuple[Array, Array, Array, Array]:
         input_key = self._split_heads(self.input_key(maybe_cast(micro_tokens, self.dtype)))
         latent_query = self._split_heads(self.latent_input_query(maybe_cast(slots, self.dtype)))
-        scores = _contract("brmhd,brnkhd->brhmnk", latent_query, input_key)
+        scores = _contract("bmhd,bnkhd->bhmnk", latent_query, input_key)
         scores = scores.astype(jnp.float32) / math.sqrt(self.head_dim)
         scores = scores / self.lfrm.assignment_temperature
-        flat_scores = scores.reshape(*scores.shape[:4], self.config.seq_len * self.belief_dim)
+        flat_scores = scores.reshape(*scores.shape[:3], self.config.seq_len * self.belief_dim)
         input_attention = jax.nn.softmax(flat_scores, axis=-1).reshape(scores.shape)
         symbol_values = self._split_heads(self.input_symbol_value(maybe_cast(micro_tokens, self.dtype)))
         summary = _contract(
-            "brhmnk,brnkhd->brmhd",
+            "bhmnk,bnkhd->bmhd",
             maybe_cast(input_attention, self.dtype),
             symbol_values,
         )
         summary = self._merge_heads(summary)
-        assignment = jnp.mean(input_attention, axis=2)
-        assignment = assignment.reshape(*assignment.shape[:3], self.config.seq_len * self.belief_dim)
-        slot_focus = jnp.mean(jnp.max(input_attention.reshape(*input_attention.shape[:4], -1), axis=-1), axis=2)
+        assignment = jnp.mean(input_attention, axis=1)
+        assignment = assignment.reshape(*assignment.shape[:2], self.config.seq_len * self.belief_dim)
+        slot_focus = jnp.mean(
+            jnp.max(
+                input_attention.reshape(input_attention.shape[0], input_attention.shape[1], input_attention.shape[2], -1),
+                axis=-1,
+            ),
+            axis=1,
+        )
         slot_diversity_loss = self._slot_pattern_decorrelation(input_attention)
         return summary, assignment, slot_focus, slot_diversity_loss
 
     def _update_slots(self, slots: Array, summary: Array, slot_usage: Array) -> Array:
-        usage = slot_usage[:, :, :, None]
+        usage = slot_usage[:, :, None]
         slot_input = jnp.concatenate([slots.astype(jnp.float32), summary, usage], axis=-1)
         slot_input = self.slot_update_norm(maybe_cast(slot_input, self.dtype))
         gate = jax.nn.sigmoid(self.slot_gate(slot_input).astype(jnp.float32))
@@ -296,10 +279,10 @@ class LatentFactorRecurrentModel(nnx.Module):
             query = self._split_heads(self.latent_query(latent_input))
             key = self._split_heads(self.latent_key(latent_input))
             value = self._split_heads(self.latent_value(latent_input))
-            scores = _contract("brmhd,brnhd->brhmn", query, key)
+            scores = _contract("bmhd,bnhd->bhmn", query, key)
             scores = scores.astype(jnp.float32) / math.sqrt(self.head_dim)
             attention = jax.nn.softmax(scores, axis=-1)
-            message = _contract("brhmn,brnhd->brmhd", maybe_cast(attention, self.dtype), value)
+            message = _contract("bhmn,bnhd->bmhd", maybe_cast(attention, self.dtype), value)
             message = self._merge_heads(message)
             slots = slots.astype(jnp.float32) + 0.1 * self.latent_output(maybe_cast(message, self.dtype)).astype(jnp.float32)
             ff_input = self.latent_ff_norm(maybe_cast(slots, self.dtype))
@@ -310,14 +293,14 @@ class LatentFactorRecurrentModel(nnx.Module):
     def _slots_to_cell_symbols(self, micro_tokens: Array, slots: Array) -> tuple[Array, Array]:
         cell_query = self._split_heads(self.output_query(maybe_cast(micro_tokens, self.dtype)))
         slot_key = self._split_heads(self.latent_output_key(maybe_cast(slots, self.dtype)))
-        scores = _contract("brnkhd,brmhd->brhnkm", cell_query, slot_key)
+        scores = _contract("bnkhd,bmhd->bhnkm", cell_query, slot_key)
         scores = scores.astype(jnp.float32) / math.sqrt(self.head_dim)
         scores = scores / self.lfrm.assignment_temperature
         routing = jax.nn.softmax(scores, axis=-1)
         slot_value = self._split_heads(self.latent_output_value(maybe_cast(slots, self.dtype)))
-        symbol_message = _contract("brhnkm,brmhd->brnkhd", maybe_cast(routing, self.dtype), slot_value)
+        symbol_message = _contract("bhnkm,bmhd->bnkhd", maybe_cast(routing, self.dtype), slot_value)
         symbol_message = self._merge_heads(symbol_message)
-        routing = jnp.mean(routing, axis=2)
+        routing = jnp.mean(routing, axis=1)
         return symbol_message, routing
 
     def _update_state(
@@ -331,7 +314,7 @@ class LatentFactorRecurrentModel(nnx.Module):
     ) -> tuple[State, dict[str, Array]]:
         h, logits, q, slots = state
         h_local = self._local_update(h, q)
-        given_channels = self._given_channels(initial_q, condition_mask, h.shape[1])
+        given_channels = self._given_channels(initial_q, condition_mask)
         micro_tokens, symbol_context = self._cell_symbol_context(h_local, logits, q, given_channels)
         slot_summary, assignment, input_slot_usage, slot_diversity_loss = self._cells_to_slots(micro_tokens, slots)
         slots_next = self._update_slots(slots, slot_summary, input_slot_usage)
@@ -345,8 +328,8 @@ class LatentFactorRecurrentModel(nnx.Module):
         cell_candidate = jnp.tanh(self.cell_candidate(cell_input).astype(jnp.float32))
         h_next = h.astype(jnp.float32) + 0.1 * cell_gate * cell_candidate
 
-        h_symbols = jnp.broadcast_to(h_next[:, :, :, None, :], symbol_message.shape)
-        stats_symbols = jnp.broadcast_to(cell_stats[:, :, :, None, :], (*q.shape, cell_stats.shape[-1]))
+        h_symbols = jnp.broadcast_to(h_next[:, :, None, :], symbol_message.shape)
+        stats_symbols = jnp.broadcast_to(cell_stats[:, :, None, :], (*q.shape, cell_stats.shape[-1]))
         symbol_input = jnp.concatenate(
             [h_symbols, symbol_message, micro_tokens, q[..., None], logits[..., None], stats_symbols],
             axis=-1,
@@ -358,7 +341,7 @@ class LatentFactorRecurrentModel(nnx.Module):
         logits_next = logits + self.lfrm.belief_step_size * delta
         logits_next = self._clamp_logits(logits_next, initial_logits, condition_mask)
         q_next = jax.nn.softmax(logits_next / self.lfrm.belief_temperature, axis=-1)
-        q_next = jnp.where(condition_mask[:, None, :, None], initial_q[:, None, :, :], q_next)
+        q_next = jnp.where(condition_mask[..., None], initial_q, q_next)
         return (h_next, logits_next, q_next, slots_next), {
             "assignment": assignment,
             "slot_usage": input_slot_usage,
@@ -366,38 +349,29 @@ class LatentFactorRecurrentModel(nnx.Module):
             "symbol_context": symbol_context,
         }
 
-    def _energy(self, q: Array, h: Array, slots: Array, symbol_context: Array) -> Array:
-        h_symbols = jnp.broadcast_to(h[:, :, :, None, :], (*q.shape, h.shape[-1]))
-        context_symbols = jnp.broadcast_to(symbol_context[:, :, None, :, :], h_symbols.shape)
-        stats = self._belief_stats(q)
-        stats_symbols = jnp.broadcast_to(stats[:, :, :, None, :], (*q.shape, stats.shape[-1]))
-        channel_features = jnp.concatenate(
-            [h_symbols.astype(jnp.float32), context_symbols.astype(jnp.float32), q[..., None], stats_symbols],
-            axis=-1,
-        )
-        channel_features = jax.nn.silu(
-            self.energy_cell_feature(maybe_cast(channel_features, self.dtype)).astype(jnp.float32)
-        )
-        cell_features = jnp.mean(channel_features, axis=-2)
-        cell_energy = jnp.mean(
-            self.energy_cell_score(maybe_cast(cell_features, self.dtype)).astype(jnp.float32).squeeze(-1),
-            axis=-1,
-        )
-        slot_energy = jnp.mean(
-            self.energy_slot_score(maybe_cast(slots, self.dtype)).astype(jnp.float32).squeeze(-1),
-            axis=2,
-        )
-        return cell_energy + slot_energy
-
-    def _branch_logits_to_vocab(self, logits: Array) -> Array:
+    def _digit_logits_to_vocab(self, logits: Array) -> Array:
         low_logits = jnp.full((*logits.shape[:-1], 2), -30.0, dtype=jnp.float32)
         return jnp.concatenate([low_logits, logits.astype(jnp.float32)], axis=-1)
 
+    def _blank_pool(self, values: Array, condition_mask: Array) -> Array:
+        mask = (~condition_mask).astype(jnp.float32)[..., None]
+        normalizer = jnp.maximum(jnp.sum(mask, axis=1), 1.0)
+        return jnp.sum(values * mask, axis=1) / normalizer
+
     def _blank_mean(self, values: Array, condition_mask: Array) -> Array:
-        mask = (~condition_mask).astype(jnp.float32)[:, None, :, None]
-        trailing_size = math.prod(values.shape[3:]) if len(values.shape) > 3 else 1
-        normalizer = jnp.maximum(jnp.sum(mask) * values.shape[1] * trailing_size, 1.0)
+        mask = (~condition_mask).astype(jnp.float32)[..., None]
+        trailing_size = math.prod(values.shape[2:]) if len(values.shape) > 2 else 1
+        normalizer = jnp.maximum(jnp.sum(mask) * trailing_size, 1.0)
         return jnp.sum(values * mask) / normalizer
+
+    def _quality_logit(self, h: Array, q: Array, slots: Array, condition_mask: Array) -> Array:
+        h_pool = self._blank_pool(h, condition_mask)
+        stats_pool = self._blank_pool(self._belief_stats(q), condition_mask)
+        slot_pool = jnp.mean(slots, axis=1)
+        q_input = jnp.concatenate([h_pool, slot_pool, stats_pool], axis=-1)
+        q_input = self.q_head_norm(maybe_cast(q_input, self.dtype))
+        q_hidden = jax.nn.silu(self.q_head_hidden(q_input).astype(jnp.float32))
+        return self.q_head_logit(maybe_cast(q_hidden, self.dtype)).astype(jnp.float32).squeeze(-1)
 
     def _run_unroll(
         self,
@@ -405,7 +379,6 @@ class LatentFactorRecurrentModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None,
-        compute_energy_selection: bool = True,
         compute_terminal_residual: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
         state0, initial_logits, initial_q, condition_mask = self._initial_state(tokens, train=train, dropout_key=dropout_key)
@@ -413,7 +386,6 @@ class LatentFactorRecurrentModel(nnx.Module):
         empty_assignment = jnp.zeros(
             (
                 tokens.shape[0],
-                self.lfrm.num_branches,
                 self.lfrm.num_slots,
                 self.config.seq_len * self.belief_dim,
             ),
@@ -431,10 +403,6 @@ class LatentFactorRecurrentModel(nnx.Module):
 
         remat_update_step = jax.checkpoint(update_step)
 
-        def blank_branch_diversity(q: Array) -> Array:
-            variance = jnp.var(q, axis=1, keepdims=True)
-            return self._blank_mean(variance, condition_mask)
-
         def scan_step(carry, step_index):
             (
                 state,
@@ -442,8 +410,6 @@ class LatentFactorRecurrentModel(nnx.Module):
                 consistency_total,
                 usage_entropy_total,
                 slot_diversity_total,
-                branch_diversity_total,
-                branch_diversity_count,
                 hidden_delta,
             ) = carry
             h_prev = state[0]
@@ -467,32 +433,20 @@ class LatentFactorRecurrentModel(nnx.Module):
 
             h_delta = jnp.linalg.norm((next_state[0] - h_prev).astype(jnp.float32), axis=-1, keepdims=True)
             hidden_delta = self._blank_mean(h_delta, condition_mask)
-            diversity_start = jnp.asarray(self.lfrm.diversity_apply_steps[0], dtype=step_index.dtype)
-            diversity_end = jnp.asarray(self.lfrm.diversity_apply_steps[1], dtype=step_index.dtype)
-            use_branch_diversity = (
-                (self.lfrm.branch_diversity_schedule == "early")
-                & (step_index >= diversity_start)
-                & (step_index < diversity_end)
-            )
-            branch_diversity_step = blank_branch_diversity(next_state[2])
-            branch_diversity_mask = use_branch_diversity.astype(jnp.float32)
-            step_logits = self._branch_logits_to_vocab(next_state[1])
+            step_logits = self._digit_logits_to_vocab(next_state[1])
+            quality_logit = self._quality_logit(next_state[0], next_state[2], next_state[3], condition_mask)
             return (
                 next_state,
                 assignment,
                 consistency_total + step_kl,
                 usage_entropy_total + usage_entropy,
                 slot_diversity_total + aux["slot_diversity_loss"],
-                branch_diversity_total + branch_diversity_mask * branch_diversity_step,
-                branch_diversity_count + branch_diversity_mask,
                 hidden_delta,
-            ), (step_logits, hidden_delta)
+            ), (step_logits, hidden_delta, quality_logit)
 
         initial_carry = (
             state0,
             empty_assignment,
-            jnp.asarray(0.0, dtype=jnp.float32),
-            jnp.asarray(0.0, dtype=jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
@@ -504,50 +458,14 @@ class LatentFactorRecurrentModel(nnx.Module):
             consistency_total,
             usage_entropy_total,
             slot_diversity_total,
-            branch_diversity_total,
-            branch_diversity_count,
             hidden_delta,
-        ), (step_branch_logits, step_hidden_delta) = jax.lax.scan(
+        ), (step_logits, step_hidden_delta, step_quality_logits) = jax.lax.scan(
             scan_step,
             initial_carry,
             jnp.arange(self.config.num_steps),
         )
         h_final, logits_final, q_final, slots_final = final_state
-        selected_index = jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
-        branch_energy = None
-        symbol_context_final = None
-        if compute_energy_selection:
-            final_given_channels = self._given_channels(initial_q, condition_mask, h_final.shape[1])
-            _, symbol_context_final = self._cell_symbol_context(h_final, logits_final, q_final, final_given_channels)
-            branch_energy = self._energy(q_final, h_final, slots_final, symbol_context_final)
-            selected_index = jnp.argmin(branch_energy, axis=1)
-        selected_index_expanded = selected_index[:, None, None, None]
-        selected_digit_logits = jnp.take_along_axis(
-            logits_final,
-            jnp.broadcast_to(selected_index_expanded, (tokens.shape[0], 1, self.config.seq_len, self.belief_dim)),
-            axis=1,
-        ).squeeze(1)
-        selected_logits = self._branch_logits_to_vocab(selected_digit_logits)
-        step_selected_index = selected_index[None, :, None, None, None]
-        step_selected_logits = jnp.take_along_axis(
-            step_branch_logits,
-            jnp.broadcast_to(
-                step_selected_index,
-                (
-                    self.config.num_steps,
-                    tokens.shape[0],
-                    1,
-                    self.config.seq_len,
-                    self.config.vocab_size,
-                ),
-            ),
-            axis=2,
-        ).squeeze(2)
-        selected_q = jnp.take_along_axis(
-            q_final,
-            jnp.broadcast_to(selected_index_expanded, (tokens.shape[0], 1, self.config.seq_len, self.belief_dim)),
-            axis=1,
-        ).squeeze(1)
+        selected_q = q_final
 
         entropy = -jnp.sum(selected_q * _safe_log(selected_q, self.lfrm.belief_floor), axis=-1, keepdims=True)
         blank_mask = (~condition_mask).astype(jnp.float32)[..., None]
@@ -555,12 +473,6 @@ class LatentFactorRecurrentModel(nnx.Module):
         belief_entropy = jnp.sum(entropy * blank_mask) / blank_normalizer
         confidence = jnp.max(selected_q, axis=-1, keepdims=True)
         belief_confidence = jnp.sum(confidence * blank_mask) / blank_normalizer
-        final_branch_diversity = blank_branch_diversity(q_final)
-        branch_diversity = jnp.where(
-            branch_diversity_count > 0.0,
-            branch_diversity_total / branch_diversity_count,
-            final_branch_diversity,
-        )
         steps_for_consistency = jnp.maximum(jnp.asarray(self.config.num_steps - 1, dtype=jnp.float32), 1.0)
         slot_consistency_loss = consistency_total / steps_for_consistency
         slot_usage_entropy = usage_entropy_total / jnp.asarray(self.config.num_steps, dtype=jnp.float32)
@@ -568,19 +480,18 @@ class LatentFactorRecurrentModel(nnx.Module):
 
         diagnostics = {
             "hidden_delta_mean": step_hidden_delta,
+            "quality_logits": step_quality_logits,
             "unroll_steps": jnp.asarray(self.config.num_steps, dtype=jnp.float32),
             "belief_entropy": belief_entropy,
             "belief_confidence": belief_confidence,
-            "branch_digit_logits": logits_final,
-            "branch_q": q_final,
-            "branch_h": h_final,
-            "branch_slots": slots_final,
+            "digit_logits": logits_final,
+            "q": q_final,
+            "h": h_final,
+            "slots": slots_final,
             "slot_consistency_loss": slot_consistency_loss,
             "slot_usage_entropy": slot_usage_entropy,
             "slot_usage_loss": 1.0 - slot_usage_entropy,
             "slot_diversity_loss": slot_diversity_loss,
-            "branch_diversity": branch_diversity,
-            "final_branch_diversity": final_branch_diversity,
         }
         if compute_terminal_residual:
             next_state, _ = update_step(final_state)
@@ -588,14 +499,7 @@ class LatentFactorRecurrentModel(nnx.Module):
             q_residual_mse = self._blank_mean(jnp.square(q_delta), condition_mask)
             diagnostics["terminal_belief_mse"] = q_residual_mse
             diagnostics["terminal_belief_delta"] = jnp.sqrt(jnp.maximum(q_residual_mse, 0.0))
-        if branch_energy is not None and symbol_context_final is not None:
-            diagnostics["branch_logits"] = self._branch_logits_to_vocab(logits_final)
-            diagnostics["branch_symbol_context"] = symbol_context_final
-            diagnostics["branch_energy"] = branch_energy
-            diagnostics["selected_branch_energy"] = jnp.mean(
-                jnp.take_along_axis(branch_energy, selected_index[:, None], axis=1).squeeze(1)
-            )
-        return step_selected_logits, diagnostics
+        return step_logits, diagnostics
 
     def forward_all_steps_with_diagnostics(
         self,
@@ -603,14 +507,12 @@ class LatentFactorRecurrentModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
-        compute_energy_selection: bool = True,
         compute_terminal_residual: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
         return self._run_unroll(
             tokens,
             train=train,
             dropout_key=dropout_key,
-            compute_energy_selection=compute_energy_selection,
             compute_terminal_residual=compute_terminal_residual,
         )
 
@@ -620,14 +522,12 @@ class LatentFactorRecurrentModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
-        compute_energy_selection: bool = True,
         compute_terminal_residual: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
         return self.forward_all_steps_with_diagnostics(
             tokens,
             train=train,
             dropout_key=dropout_key,
-            compute_energy_selection=compute_energy_selection,
             compute_terminal_residual=compute_terminal_residual,
         )
 
@@ -641,73 +541,3 @@ class LatentFactorRecurrentModel(nnx.Module):
 
     def __call__(self, tokens: Array, *, train: bool, dropout_key: Array | None = None) -> Array:
         return self.forward_final(tokens, train=train, dropout_key=dropout_key)[-1]
-
-    def energy_training_metrics(
-        self,
-        inputs: Array,
-        targets: Array,
-        given_mask: Array,
-        rng_key: Array,
-        diagnostics: dict[str, Array],
-        *,
-        margin: float,
-        corruptions: int,
-    ) -> dict[str, Array]:
-        del inputs
-        target_digits = jnp.clip(targets - 2, 0, self.belief_dim - 1)
-        q_pos = jax.nn.one_hot(target_digits, self.belief_dim, dtype=jnp.float32)
-        q_pos = jnp.broadcast_to(q_pos[:, None, :, :], diagnostics["branch_q"].shape)
-        h = diagnostics["branch_h"]
-        slots = diagnostics["branch_slots"]
-        symbol_context = diagnostics["branch_symbol_context"]
-        energy_pos = self._energy(q_pos, h, slots, symbol_context)
-
-        corruption_count = max(int(corruptions), 1)
-        keys = jax.random.split(rng_key, corruption_count)
-        blank_mask = ~given_mask
-
-        def corrupt_one(key):
-            cell_key, offset_key = jax.random.split(key)
-            log_weights = jnp.where(blank_mask, 0.0, -1e9)
-            cell_indices = jax.random.categorical(cell_key, log_weights, axis=-1)
-            offsets = jax.random.randint(offset_key, target_digits.shape, minval=1, maxval=self.belief_dim)
-            batch_indices = jnp.arange(targets.shape[0])
-            current = target_digits[batch_indices, cell_indices]
-            corrupt_digits = (current + offsets[batch_indices, cell_indices]) % self.belief_dim
-            q_neg = q_pos[:, 0, :, :]
-            q_neg = q_neg.at[batch_indices, cell_indices, :].set(
-                jax.nn.one_hot(corrupt_digits, self.belief_dim, dtype=jnp.float32)
-            )
-            return q_neg
-
-        q_neg = jax.vmap(corrupt_one)(keys)
-        q_neg = jnp.broadcast_to(
-            q_neg[:, :, None, :, :],
-            (corruption_count, targets.shape[0], self.lfrm.num_branches, self.config.seq_len, self.belief_dim),
-        )
-        flat_q_neg = q_neg.reshape(corruption_count * targets.shape[0], self.lfrm.num_branches, self.config.seq_len, self.belief_dim)
-        flat_h = jnp.broadcast_to(
-            h[None, :, :, :, :],
-            (corruption_count, *h.shape),
-        ).reshape(corruption_count * targets.shape[0], *h.shape[1:])
-        flat_slots = jnp.broadcast_to(
-            slots[None, :, :, :, :],
-            (corruption_count, *slots.shape),
-        ).reshape(corruption_count * targets.shape[0], *slots.shape[1:])
-        flat_symbol_context = jnp.broadcast_to(
-            symbol_context[None, :, :, :, :],
-            (corruption_count, *symbol_context.shape),
-        ).reshape(corruption_count * targets.shape[0], *symbol_context.shape[1:])
-        energy_corrupt = self._energy(flat_q_neg, flat_h, flat_slots, flat_symbol_context).reshape(
-            corruption_count,
-            targets.shape[0],
-            self.lfrm.num_branches,
-        )
-
-        corrupt_margin = jnp.maximum(0.0, margin + energy_pos[None, :, :] - energy_corrupt)
-        margin_loss = jnp.mean(corrupt_margin)
-        return {
-            "energy_margin_loss": margin_loss,
-            "energy_pos": jnp.mean(energy_pos),
-            "energy_neg": jnp.mean(energy_corrupt),
-        }
