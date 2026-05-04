@@ -211,6 +211,7 @@ def loss_and_metrics(
         True,
     )
     solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
+    solved_count = jnp.sum(solved_examples.astype(jnp.float32))
     q_selected_token_loss = optax.softmax_cross_entropy_with_integer_labels(q_selected_logits, targets)
     q_selected_ce_loss = jnp.sum(q_selected_token_loss * loss_mask) / normalizer
     q_selected_predictions = jnp.argmax(q_selected_logits, axis=-1)
@@ -311,6 +312,7 @@ def trm_act_loss_and_metrics(
     )
     solved_targets = jax.lax.stop_gradient(solved_examples.astype(jnp.float32))
     solved_rate = jnp.mean(solved_targets)
+    solved_count = jnp.sum(solved_targets)
 
     q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(diagnostics["quality_logits"], solved_targets))
     loss = blank_ce_loss + q_loss_weight * q_loss
@@ -325,12 +327,104 @@ def trm_act_loss_and_metrics(
         "target_probability": target_probability,
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
+        "solved_count": solved_count,
         "q_loss": q_loss,
         "act_step": diagnostics["act_step"],
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
     }
     return loss, (metrics, new_carry)
+
+
+def trm_dense_unroll_loss_and_metrics(
+    model: TinyRecursiveModel,
+    batch: dict[str, jax.Array],
+    train: bool,
+    dropout_key: jax.Array | None,
+    *,
+    dense_loss_weight: float = 0.5,
+    final_loss_weight: float = 0.5,
+    q_loss_weight: float = 0.0,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    inputs = batch["inputs"]
+    targets = batch["labels"]
+    given_mask = batch["given_mask"]
+    loss_mask = (~given_mask).astype(jnp.float32)
+    normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
+    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
+
+    step_logits, diagnostics = model.forward_all_steps_with_diagnostics(
+        inputs,
+        puzzle_identifiers=batch["puzzle_identifiers"],
+        train=train,
+        dropout_key=dropout_key,
+        compute_terminal_residual=False,
+    )
+    step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
+    step_loss_mask = loss_mask[None, :, :]
+    token_loss = optax.softmax_cross_entropy_with_integer_labels(step_logits, step_targets)
+    per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
+    dense_ce_loss = jnp.mean(per_step_loss)
+    final_blank_ce_loss = per_step_loss[-1]
+
+    step_predictions = jnp.argmax(step_logits, axis=-1)
+    step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask
+    step_correct_per_example = jnp.sum(step_correct, axis=-1)
+    blanks_per_example = jnp.sum(loss_mask, axis=-1)
+    per_step_example_solved = jnp.where(
+        blanks_per_example[None, :] > 0,
+        step_correct_per_example == blanks_per_example[None, :],
+        True,
+    )
+
+    final_logits = step_logits[-1]
+    predictions = jnp.argmax(final_logits, axis=-1)
+    final_probs = jax.nn.softmax(final_logits, axis=-1)
+    target_probability = jnp.take_along_axis(final_probs, targets[..., None], axis=-1).squeeze(-1)
+    target_probability = jnp.sum(target_probability * loss_mask) / normalizer
+    correct = (predictions == targets).astype(jnp.float32) * loss_mask
+    blank_cell_accuracy = jnp.sum(correct) / normalizer
+    correct_per_example = jnp.sum(correct, axis=-1)
+    solved_examples = jnp.where(
+        blanks_per_example > 0,
+        correct_per_example == blanks_per_example,
+        True,
+    )
+    solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
+    solved_count = jnp.sum(solved_examples.astype(jnp.float32))
+
+    quality_logits = diagnostics.get("quality_logits")
+    q_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    if quality_logits is not None and q_loss_weight != 0.0:
+        q_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
+        q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(quality_logits, q_targets))
+
+    loss = (
+        dense_loss_weight * dense_ce_loss
+        + final_loss_weight * final_blank_ce_loss
+        + q_loss_weight * q_loss
+    )
+    oracle_step = jnp.argmin(
+        jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :],
+        axis=0,
+    )
+    metrics = {
+        "loss": loss,
+        "blank_ce_loss": dense_ce_loss,
+        "final_blank_ce_loss": final_blank_ce_loss,
+        "target_probability": target_probability,
+        "blank_cell_accuracy": blank_cell_accuracy,
+        "solved_rate": solved_rate,
+        "solved_count": solved_count,
+        "q_loss": q_loss,
+        "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
+        "per_step_loss": per_step_loss,
+        "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
+        "unroll_steps": jnp.asarray(step_logits.shape[0], dtype=jnp.float32),
+    }
+    if quality_logits is not None:
+        metrics["per_step_quality_score"] = jax.nn.sigmoid(jnp.mean(quality_logits, axis=1))
+    return loss, metrics
 
 
 def trm_eval_loss_and_metrics(
@@ -388,6 +482,7 @@ def trm_eval_loss_and_metrics(
         selected_step[None, :],
         axis=0,
     ).squeeze(0)
+    selected_solved_count = jnp.sum(selected_solved_targets)
     q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(quality_logits, jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))))
     loss = blank_ce_loss + q_loss_weight * q_loss
 
@@ -410,6 +505,7 @@ def trm_eval_loss_and_metrics(
         final_correct_per_example == blanks_per_example,
         True,
     )
+    final_solved_count = jnp.sum(final_solved_examples.astype(jnp.float32))
     oracle_step = jnp.argmin(per_step_example_loss, axis=0)
     metrics = {
         "loss": loss,
@@ -421,11 +517,14 @@ def trm_eval_loss_and_metrics(
         "target_probability": target_probability,
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
+        "solved_count": selected_solved_count,
         "q_selected_blank_ce_loss": blank_ce_loss,
         "q_selected_blank_cell_accuracy": blank_cell_accuracy,
         "q_selected_solved_rate": solved_rate,
+        "q_selected_solved_count": selected_solved_count,
         "q_selected_step": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
         "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
+        "final_solved_count": final_solved_count,
         "per_step_loss": per_step_loss,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
         "per_step_quality_score": jax.nn.sigmoid(jnp.mean(quality_logits, axis=1)),
@@ -497,6 +596,41 @@ def build_trm_act_train_step_runner(q_loss_weight: float = 0.5):
         )
         optimizer.update(model, grads)
         return metrics, new_carry
+
+    return nnx.jit(train_step)
+
+
+def build_trm_dense_unroll_train_step_runner(
+    *,
+    dense_loss_weight: float = 0.5,
+    final_loss_weight: float = 0.5,
+    q_loss_weight: float = 0.0,
+):
+    def train_step(
+        model: TinyRecursiveModel,
+        optimizer: nnx.Optimizer,
+        batch: dict[str, jax.Array],
+        dropout_key: jax.Array,
+    ) -> dict[str, jax.Array]:
+        def objective(model, batch, train, dropout_key):
+            return trm_dense_unroll_loss_and_metrics(
+                model,
+                batch,
+                train,
+                dropout_key,
+                dense_loss_weight=dense_loss_weight,
+                final_loss_weight=final_loss_weight,
+                q_loss_weight=q_loss_weight,
+            )
+
+        (_, metrics), grads = nnx.value_and_grad(objective, has_aux=True)(
+            model,
+            batch,
+            True,
+            dropout_key,
+        )
+        optimizer.update(model, grads)
+        return metrics
 
     return nnx.jit(train_step)
 

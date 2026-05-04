@@ -30,6 +30,7 @@ from lfrm.training import (
     build_eval_step_runner,
     build_train_step_runner,
     build_trm_act_train_step_runner,
+    build_trm_dense_unroll_train_step_runner,
     build_trm_eval_step_runner,
     create_ema_model,
     create_model,
@@ -76,6 +77,9 @@ ALLOWED_SECTION_KEYS = {
         "eval_every",
         "eval_batches",
         "step_loss_weighting",
+        "trm_train_mode",
+        "dense_loss_weight",
+        "final_loss_weight",
         "q_loss_weight",
         "terminal_residual_weight",
         "slot_consistency_weight",
@@ -180,6 +184,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="uniform",
         help="How to weight losses from recurrent reasoning steps.",
     )
+    parser.add_argument(
+        "--trm-train-mode",
+        choices=("act", "dense_unroll"),
+        default="act",
+        help="TRM training path: ACT single-step carry or full-unroll dense CE.",
+    )
+    parser.add_argument("--dense-loss-weight", type=float, default=0.5)
+    parser.add_argument("--final-loss-weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--q-loss-weight", type=float, default=0.0)
     parser.add_argument("--terminal-residual-weight", type=float, default=0.0)
@@ -304,6 +316,9 @@ def build_config(
         eval_every=args.eval_every,
         eval_batches=args.eval_batches,
         step_loss_weighting=args.step_loss_weighting,
+        trm_train_mode=args.trm_train_mode,
+        dense_loss_weight=args.dense_loss_weight,
+        final_loss_weight=args.final_loss_weight,
         q_loss_weight=args.q_loss_weight,
         terminal_residual_weight=args.terminal_residual_weight,
         slot_consistency_weight=args.slot_consistency_weight,
@@ -551,14 +566,21 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, rng: np.
                 for key, value in metrics.items()
             }
         for key, value in metrics.items():
-            reduced[key] += np.asarray(jax.device_get(value), dtype=np.float64) * weight
+            value_array = np.asarray(jax.device_get(value), dtype=np.float64)
+            if key.endswith("_count"):
+                reduced[key] += value_array
+            else:
+                reduced[key] += value_array * weight
         total_weight += weight
         if batch_index == 1 or batch_index == len(batches) or batch_index % 10 == 0:
             print(f"[eval] batch {batch_index}/{len(batches)}", flush=True)
     if reduced is None:
         raise ValueError("No eval batches were produced")
     scale = 1.0 / total_weight
-    averaged = {key: value * scale for key, value in reduced.items()}
+    averaged = {
+        key: value if key.endswith("_count") else value * scale
+        for key, value in reduced.items()
+    }
     return {
         key: float(value) if np.ndim(value) == 0 else value.astype(float).tolist()
         for key, value in averaged.items()
@@ -593,11 +615,16 @@ CORE_SCALAR_METRICS = (
     "q_selected_blank_ce_loss",
     "q_selected_blank_cell_accuracy",
     "q_selected_solved_rate",
+    "q_selected_solved_count",
     "q_selected_step",
     "oracle_step",
     "act_step",
     "halted_rate",
     "reset_rate",
+    "solved_count",
+    "final_blank_cell_accuracy",
+    "final_solved_rate",
+    "final_solved_count",
 )
 SLOT_DIAGNOSTIC_METRICS = (
     "slot_consistency_loss",
@@ -675,6 +702,14 @@ def main() -> None:
         raise ValueError("batch_size must be at least 1")
     if config.train.eval_batch_size < 0:
         raise ValueError("eval_batch_size must be non-negative")
+    if config.model.model_type != "trm" and config.train.trm_train_mode != "act":
+        raise ValueError("trm_train_mode is only supported for model_type='trm'")
+    if config.train.dense_loss_weight < 0.0 or config.train.final_loss_weight < 0.0:
+        raise ValueError("dense_loss_weight and final_loss_weight must be non-negative")
+    if config.train.trm_train_mode == "dense_unroll" and (
+        config.train.dense_loss_weight + config.train.final_loss_weight <= 0.0
+    ):
+        raise ValueError("dense_unroll requires a positive dense or final loss weight")
 
     resume_checkpoint: Path | None = None
     resume_step = 0
@@ -691,7 +726,14 @@ def main() -> None:
     model = create_model(config)
     optimizer = create_optimizer(model, config)
     if config.model.model_type == "trm":
-        train_step_fn = build_trm_act_train_step_runner(config.train.q_loss_weight)
+        if config.train.trm_train_mode == "dense_unroll":
+            train_step_fn = build_trm_dense_unroll_train_step_runner(
+                dense_loss_weight=config.train.dense_loss_weight,
+                final_loss_weight=config.train.final_loss_weight,
+                q_loss_weight=config.train.q_loss_weight,
+            )
+        else:
+            train_step_fn = build_trm_act_train_step_runner(config.train.q_loss_weight)
         eval_step_fn = build_trm_eval_step_runner(config.train.q_loss_weight)
     else:
         train_step_fn = build_train_step_runner(
@@ -738,6 +780,7 @@ def main() -> None:
         "eval_examples=", overview["eval_examples"],
         "batch_size=", config.train.batch_size,
         "eval_batch_size=", config.train.eval_batch_size or config.train.batch_size,
+        "trm_train_mode=", config.train.trm_train_mode,
         "seq_len=", config.model.seq_len,
         "grid_height=", config.model.grid_height,
         "grid_width=", config.model.grid_width,
@@ -758,13 +801,14 @@ def main() -> None:
     prefetcher = BatchPrefetcher(sample_train_batch, depth=2)
 
     current_batch = prefetcher.next()
-    train_carry = model.initial_carry(current_batch) if config.model.model_type == "trm" else None
+    use_trm_act = config.model.model_type == "trm" and config.train.trm_train_mode == "act"
+    train_carry = model.initial_carry(current_batch) if use_trm_act else None
 
     try:
         for step in range(resume_step + 1, config.train.max_steps + 1):
             is_eval_step = step % config.train.eval_every == 0 or step == config.train.max_steps
             train_key, step_key = jax.random.split(train_key)
-            if config.model.model_type == "trm":
+            if use_trm_act:
                 metrics, train_carry = train_step_fn(
                     model,
                     optimizer,
@@ -794,6 +838,13 @@ def main() -> None:
                     "train/learning_rate": schedule_learning_rate(config, step),
                 }
                 train_log.update(optional_scalar_log("train", metrics, scalar_metrics))
+                if "per_step_loss" in metrics:
+                    train_log.update(
+                        flatten_step_metrics(
+                            "train/loss_by_step",
+                            list(jax.device_get(metrics["per_step_loss"])),
+                        )
+                    )
                 if wandb_run is not None:
                     wandb_run.log(train_log, step=step, commit=not is_eval_step)
                 optional_summary = optional_scalar_summary(metrics, scalar_metrics)
@@ -808,58 +859,68 @@ def main() -> None:
                 )
 
             if is_eval_step:
-                eval_model = ema_model if ema_model is not None else model
-                eval_metrics = evaluate(
-                    eval_step_fn,
-                    eval_model,
-                    dataset,
-                    config=config,
-                    rng=eval_rng,
-                )
-                if wandb_run is not None:
-                    eval_log = {
-                        "eval/loss": eval_metrics["loss"],
-                        "eval/blank_ce_loss": eval_metrics["blank_ce_loss"],
-                        "eval/final_blank_ce_loss": eval_metrics["final_blank_ce_loss"],
-                        "eval/blank_cell_accuracy": eval_metrics["blank_cell_accuracy"],
-                        "eval/solved_rate": eval_metrics["solved_rate"],
-                    }
-                    eval_log.update(optional_scalar_log("eval", eval_metrics, scalar_metrics))
-                    eval_log.update(flatten_step_metrics("eval/loss_by_step", eval_metrics["per_step_loss"]))
-                    eval_log.update(
-                        flatten_step_metrics(
-                            "eval/hidden_delta_by_step",
-                            eval_metrics["per_step_hidden_delta"],
-                        )
+                def run_eval_and_log(eval_model, prefix: str, label: str, *, commit: bool) -> dict[str, Any]:
+                    eval_metrics = evaluate(
+                        eval_step_fn,
+                        eval_model,
+                        dataset,
+                        config=config,
+                        rng=eval_rng,
                     )
-                    if "per_step_quality_score" in eval_metrics:
+                    if wandb_run is not None:
+                        eval_log = {
+                            f"{prefix}/loss": eval_metrics["loss"],
+                            f"{prefix}/blank_ce_loss": eval_metrics["blank_ce_loss"],
+                            f"{prefix}/final_blank_ce_loss": eval_metrics["final_blank_ce_loss"],
+                            f"{prefix}/final_blank_cell_accuracy": eval_metrics["final_blank_cell_accuracy"],
+                            f"{prefix}/final_solved_rate": eval_metrics["final_solved_rate"],
+                            f"{prefix}/blank_cell_accuracy": eval_metrics["blank_cell_accuracy"],
+                            f"{prefix}/solved_rate": eval_metrics["solved_rate"],
+                        }
+                        eval_log.update(optional_scalar_log(prefix, eval_metrics, scalar_metrics))
+                        eval_log.update(flatten_step_metrics(f"{prefix}/loss_by_step", eval_metrics["per_step_loss"]))
                         eval_log.update(
                             flatten_step_metrics(
-                                "eval/quality_by_step",
-                                eval_metrics["per_step_quality_score"],
+                                f"{prefix}/hidden_delta_by_step",
+                                eval_metrics["per_step_hidden_delta"],
                             )
                         )
-                    wandb_run.log(eval_log, step=step)
-                optional_summary = optional_scalar_summary(eval_metrics, scalar_metrics)
-                print(
-                    f"[eval{'/ema' if ema_model is not None else ''}] step={step} "
-                    f"loss={eval_metrics['loss']:.4f} "
-                    f"ce={eval_metrics['blank_ce_loss']:.4f} "
-                    f"final_ce={eval_metrics['final_blank_ce_loss']:.4f} "
-                    f"blank_acc={eval_metrics['blank_cell_accuracy']:.4f} "
-                    f"solved={eval_metrics['solved_rate']:.4f}"
-                    f"{' ' + optional_summary if optional_summary else ''}"
-                )
-                print(
-                    "  "
-                    + " ".join(
-                        [
-                            format_step_summary("loss", eval_metrics["per_step_loss"]),
-                            format_step_summary("delta", eval_metrics["per_step_hidden_delta"]),
-                            format_step_summary("q", eval_metrics.get("per_step_quality_score", [])),
-                        ]
+                        if "per_step_quality_score" in eval_metrics:
+                            eval_log.update(
+                                flatten_step_metrics(
+                                    f"{prefix}/quality_by_step",
+                                    eval_metrics["per_step_quality_score"],
+                                )
+                            )
+                        wandb_run.log(eval_log, step=step, commit=commit)
+                    optional_summary = optional_scalar_summary(eval_metrics, scalar_metrics)
+                    print(
+                        f"[{label}] step={step} "
+                        f"loss={eval_metrics['loss']:.4f} "
+                        f"ce={eval_metrics['blank_ce_loss']:.4f} "
+                        f"final_ce={eval_metrics['final_blank_ce_loss']:.4f} "
+                        f"blank_acc={eval_metrics['blank_cell_accuracy']:.4f} "
+                        f"final_acc={eval_metrics['final_blank_cell_accuracy']:.4f} "
+                        f"solved={eval_metrics['solved_rate']:.4f}"
+                        f"{' ' + optional_summary if optional_summary else ''}"
                     )
-                )
+                    print(
+                        "  "
+                        + " ".join(
+                            [
+                                format_step_summary("loss", eval_metrics["per_step_loss"]),
+                                format_step_summary("delta", eval_metrics["per_step_hidden_delta"]),
+                                format_step_summary("q", eval_metrics.get("per_step_quality_score", [])),
+                            ]
+                        )
+                    )
+                    return eval_metrics
+
+                if ema_model is not None:
+                    run_eval_and_log(model, "eval/raw", "eval/raw", commit=False)
+                    run_eval_and_log(ema_model, "eval/ema", "eval/ema", commit=True)
+                else:
+                    run_eval_and_log(model, "eval", "eval", commit=True)
                 save_checkpoint(str(checkpoint_dir), model, optimizer, step, ema_model=ema_model)
     finally:
         with suppress(Exception):

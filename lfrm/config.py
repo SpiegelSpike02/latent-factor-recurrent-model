@@ -86,6 +86,9 @@ class TrainConfig:
     eval_every: int = 100
     eval_batches: int = 20
     step_loss_weighting: str = "uniform"
+    trm_train_mode: str = "act"
+    dense_loss_weight: float = 0.5
+    final_loss_weight: float = 0.5
     q_loss_weight: float = 0.0
     terminal_residual_weight: float = 0.0
     slot_consistency_weight: float = 0.0
