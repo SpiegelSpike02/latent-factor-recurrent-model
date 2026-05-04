@@ -177,8 +177,8 @@ class TinyRecursiveModel(nnx.Module):
             raise ValueError("TRM puzzle_emb_len must be non-negative")
         if config.num_puzzle_identifiers < 1:
             raise ValueError("TRM num_puzzle_identifiers must be at least 1")
-        if trm.pos_encodings not in ("none", "learned", "rope"):
-            raise ValueError("TRM pos_encodings must be one of: none, learned, rope")
+        if trm.pos_encodings not in ("none", "learned", "rope", "grid"):
+            raise ValueError("TRM pos_encodings must be one of: none, learned, rope, grid")
         if trm.pos_encodings == "rope" and config.d_model % trm.num_heads != 0:
             raise ValueError("TRM d_model must be divisible by trm.num_heads for RoPE")
         if trm.pos_encodings == "rope" and (config.d_model // trm.num_heads) % 2 != 0:
@@ -232,6 +232,38 @@ class TinyRecursiveModel(nnx.Module):
                 embedding_init=embed_init,
                 rngs=rngs,
             )
+        if trm.pos_encodings == "grid":
+            box_height, box_width = self._box_shape(config.grid_height, config.grid_width)
+            rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
+            cols = jnp.arange(config.seq_len, dtype=jnp.int32) % config.grid_width
+            boxes = (rows // box_height) * (config.grid_width // box_width) + (cols // box_width)
+            self.row_ids = nnx.data(rows)
+            self.col_ids = nnx.data(cols)
+            self.box_ids = nnx.data(boxes)
+            self.row_embed = nnx.Embed(
+                config.grid_height,
+                config.d_model,
+                dtype=dtype,
+                param_dtype=jnp.float32,
+                embedding_init=embed_init,
+                rngs=rngs,
+            )
+            self.col_embed = nnx.Embed(
+                config.grid_width,
+                config.d_model,
+                dtype=dtype,
+                param_dtype=jnp.float32,
+                embedding_init=embed_init,
+                rngs=rngs,
+            )
+            self.box_embed = nnx.Embed(
+                (config.grid_height // box_height) * (config.grid_width // box_width),
+                config.d_model,
+                dtype=dtype,
+                param_dtype=jnp.float32,
+                embedding_init=embed_init,
+                rngs=rngs,
+            )
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
         self.blocks = nnx.List([TRMBlock(config, self.total_seq_len, dtype, rngs=rngs) for _ in range(trm.l_layers)])
         self.lm_head = nnx.Linear(
@@ -266,6 +298,14 @@ class TinyRecursiveModel(nnx.Module):
             self.rope_cos = None
             self.rope_sin = None
 
+    @staticmethod
+    def _box_shape(grid_height: int, grid_width: int) -> tuple[int, int]:
+        box_height = int(math.sqrt(grid_height))
+        box_width = int(math.sqrt(grid_width))
+        if box_height < 1 or box_width < 1 or grid_height % box_height != 0 or grid_width % box_width != 0:
+            raise ValueError("TRM grid position encoding requires factorable grid dimensions")
+        return box_height, box_width
+
     def _condition_mask(self, tokens: Array) -> Array:
         return tokens != 1
 
@@ -296,6 +336,18 @@ class TinyRecursiveModel(nnx.Module):
             embedding = jnp.concatenate([prefix.astype(embedding.dtype), embedding], axis=1)
         if self.trm.pos_encodings == "learned":
             embedding = (embedding + self.position_embed(self.position_ids)[None, :, :]) * math.sqrt(0.5)
+        elif self.trm.pos_encodings == "grid":
+            grid_position = (
+                self.row_embed(self.row_ids)
+                + self.col_embed(self.col_ids)
+                + self.box_embed(self.box_ids)
+            ) * math.sqrt(1.0 / 3.0)
+            if self.prefix_len > 0:
+                prefix_position = jnp.zeros((self.prefix_len, self.config.d_model), dtype=grid_position.dtype)
+                position = jnp.concatenate([prefix_position, grid_position], axis=0)
+            else:
+                position = grid_position
+            embedding = (embedding + position[None, :, :]) * math.sqrt(0.5)
         embedding = self.embed_scale * embedding
         return self.dropout(embedding, deterministic=not train, rngs=dropout_key).astype(self.dtype)
 

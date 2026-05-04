@@ -70,6 +70,7 @@ ALLOWED_SECTION_KEYS = {
     },
     "train": {
         "batch_size",
+        "eval_batch_size",
         "max_steps",
         "log_every",
         "eval_every",
@@ -114,6 +115,8 @@ ALLOWED_NESTED_KEYS = {
         "pos_encodings",
         "rms_norm_eps",
         "rope_theta",
+        "halt_exploration_prob",
+        "no_act_continue",
     },
 }
 
@@ -161,6 +164,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid-height", type=int, default=9)
     parser.add_argument("--grid-width", type=int, default=9)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=0,
+        help="Eval batch size. Uses --batch-size when set to 0.",
+    )
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--eval-batches", type=int, default=20)
@@ -202,9 +211,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-puzzle-emb-ndim", type=int, default=0)
     parser.add_argument("--trm-puzzle-emb-len", type=int, default=16)
-    parser.add_argument("--trm-pos-encodings", choices=("none", "learned", "rope"), default="none")
+    parser.add_argument("--trm-pos-encodings", choices=("none", "learned", "rope", "grid"), default="none")
     parser.add_argument("--trm-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--trm-rope-theta", type=float, default=10000.0)
+    parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
+    parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
     parser.add_argument("--beta1", type=float, default=0.9)
@@ -271,6 +282,8 @@ def build_config(
             pos_encodings=args.trm_pos_encodings,
             rms_norm_eps=args.trm_rms_norm_eps,
             rope_theta=args.trm_rope_theta,
+            halt_exploration_prob=args.trm_halt_exploration_prob,
+            no_act_continue=args.trm_no_act_continue,
         ),
     )
     optimizer = OptimizerConfig(
@@ -285,6 +298,7 @@ def build_config(
     )
     train = TrainConfig(
         batch_size=args.batch_size,
+        eval_batch_size=args.eval_batch_size,
         max_steps=args.max_steps,
         log_every=args.log_every,
         eval_every=args.eval_every,
@@ -490,9 +504,9 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, rng: np.
     total = dataset.eval_inputs.shape[0]
     if total == 0:
         raise ValueError("Eval split is empty")
-    batch_size = config.train.batch_size
+    batch_size = config.train.eval_batch_size or config.train.batch_size
     if batch_size <= 0:
-        raise ValueError("batch_size must be at least 1")
+        raise ValueError("eval_batch_size must be at least 1 when set")
     total_weight = 0.0
     if config.train.eval_batches <= 0:
         batches = [
@@ -507,7 +521,13 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, rng: np.
             for start in range(0, sample_count, batch_size)
         ]
 
-    for mode, start, stop in batches:
+    print(
+        f"[eval] running {len(batches)} batches "
+        f"x batch_size={batch_size} "
+        f"({sum(stop - start for _mode, start, stop in batches)} examples)",
+        flush=True,
+    )
+    for batch_index, (mode, start, stop) in enumerate(batches, start=1):
         if mode == "slice":
             batch = eval_device_batch(
                 dataset,
@@ -533,6 +553,8 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, rng: np.
         for key, value in metrics.items():
             reduced[key] += np.asarray(jax.device_get(value), dtype=np.float64) * weight
         total_weight += weight
+        if batch_index == 1 or batch_index == len(batches) or batch_index % 10 == 0:
+            print(f"[eval] batch {batch_index}/{len(batches)}", flush=True)
     if reduced is None:
         raise ValueError("No eval batches were produced")
     scale = 1.0 / total_weight
@@ -651,6 +673,8 @@ def main() -> None:
     )
     if config.train.batch_size < 1:
         raise ValueError("batch_size must be at least 1")
+    if config.train.eval_batch_size < 0:
+        raise ValueError("eval_batch_size must be non-negative")
 
     resume_checkpoint: Path | None = None
     resume_step = 0
@@ -713,6 +737,7 @@ def main() -> None:
         "train_examples=", overview["train_examples"],
         "eval_examples=", overview["eval_examples"],
         "batch_size=", config.train.batch_size,
+        "eval_batch_size=", config.train.eval_batch_size or config.train.batch_size,
         "seq_len=", config.model.seq_len,
         "grid_height=", config.model.grid_height,
         "grid_width=", config.model.grid_width,
@@ -737,6 +762,7 @@ def main() -> None:
 
     try:
         for step in range(resume_step + 1, config.train.max_steps + 1):
+            is_eval_step = step % config.train.eval_every == 0 or step == config.train.max_steps
             train_key, step_key = jax.random.split(train_key)
             if config.model.model_type == "trm":
                 metrics, train_carry = train_step_fn(
@@ -769,7 +795,7 @@ def main() -> None:
                 }
                 train_log.update(optional_scalar_log("train", metrics, scalar_metrics))
                 if wandb_run is not None:
-                    wandb_run.log(train_log, step=step)
+                    wandb_run.log(train_log, step=step, commit=not is_eval_step)
                 optional_summary = optional_scalar_summary(metrics, scalar_metrics)
                 print(
                     f"step={step} "
@@ -781,7 +807,7 @@ def main() -> None:
                     f"{' ' + optional_summary if optional_summary else ''}"
                 )
 
-            if step % config.train.eval_every == 0 or step == config.train.max_steps:
+            if is_eval_step:
                 eval_model = ema_model if ema_model is not None else model
                 eval_metrics = evaluate(
                     eval_step_fn,

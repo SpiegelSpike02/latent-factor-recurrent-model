@@ -80,6 +80,7 @@ class EMAConfig:
 @dataclass(frozen=True)
 class TrainConfig:
     batch_size: int = 16
+    eval_batch_size: int = 0
     max_steps: int = 500
     log_every: int = 10
     eval_every: int = 100

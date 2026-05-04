@@ -26,17 +26,6 @@ def step_loss_weights(num_steps: int, weighting: str) -> jax.Array:
     raise ValueError(f"Unsupported step_loss_weighting: {weighting}")
 
 
-def _stablemax_cross_entropy_with_integer_labels(logits: jax.Array, labels: jax.Array) -> jax.Array:
-    logits_f32 = logits.astype(jnp.float32)
-    positive = jnp.where(logits_f32 >= 0.0, logits_f32 + 1.0, 1.0)
-    negative_denominator = jnp.where(logits_f32 < 0.0, 1.0 - logits_f32 + 1e-30, 1.0)
-    negative = 1.0 / negative_denominator
-    scores = jnp.where(logits_f32 < 0.0, negative, positive)
-    log_probs = jnp.log(scores / jnp.sum(scores, axis=-1, keepdims=True))
-    label_log_probs = jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
-    return (-label_log_probs).astype(jnp.float32)
-
-
 def build_optimizer(config: ExperimentConfig) -> optax.GradientTransformation:
     optimizer_steps = max(1, config.train.max_steps)
     warmup_steps = max(1, config.optimizer.warmup_steps)
@@ -306,7 +295,7 @@ def trm_act_loss_and_metrics(
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
 
-    token_loss = _stablemax_cross_entropy_with_integer_labels(logits, targets)
+    token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
     per_example_loss = jnp.sum(token_loss * loss_mask, axis=-1) / per_example_normalizer
     blank_ce_loss = jnp.mean(per_example_loss)
 
@@ -365,7 +354,7 @@ def trm_eval_loss_and_metrics(
     )
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = loss_mask[None, :, :]
-    token_loss = _stablemax_cross_entropy_with_integer_labels(step_logits, step_targets)
+    token_loss = optax.softmax_cross_entropy_with_integer_labels(step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
     per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
 
@@ -392,7 +381,7 @@ def trm_eval_loss_and_metrics(
         jnp.broadcast_to(gather_index, (1, inputs.shape[0], step_logits.shape[2], step_logits.shape[3])),
         axis=0,
     ).squeeze(0)
-    selected_token_loss = _stablemax_cross_entropy_with_integer_labels(selected_logits, targets)
+    selected_token_loss = optax.softmax_cross_entropy_with_integer_labels(selected_logits, targets)
     blank_ce_loss = jnp.sum(selected_token_loss * loss_mask) / normalizer
     selected_solved_targets = jnp.take_along_axis(
         per_step_example_solved.astype(jnp.float32),
@@ -410,7 +399,7 @@ def trm_eval_loss_and_metrics(
     blank_cell_accuracy = jnp.sum(correct) / normalizer
     solved_rate = jnp.mean(selected_solved_targets)
     final_logits = step_logits[-1]
-    final_token_loss = _stablemax_cross_entropy_with_integer_labels(final_logits, targets)
+    final_token_loss = optax.softmax_cross_entropy_with_integer_labels(final_logits, targets)
     final_blank_ce_loss = jnp.sum(final_token_loss * loss_mask) / normalizer
     final_predictions = jnp.argmax(final_logits, axis=-1)
     final_correct = (final_predictions == targets).astype(jnp.float32) * loss_mask
