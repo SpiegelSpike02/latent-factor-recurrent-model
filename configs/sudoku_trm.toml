@@ -35,8 +35,8 @@ grad_clip_norm = 0.0
 flatten_optimizer = true
 
 [train]
-# Server run: one full TRM batch per optimizer update.
-batch_size = 768
+# Dense unroll backprops through all recurrent steps, so it needs a much smaller batch than ACT training.
+batch_size = 64
 eval_batch_size = 256
 max_steps = 50000
 log_every = 10
@@ -59,5 +59,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-trm-gridpos-dense-unroll"
+name = "sudoku-trm-gridpos-dense-unroll-b64"
 mode = "online"
