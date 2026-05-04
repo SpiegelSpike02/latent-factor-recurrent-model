@@ -1,0 +1,58 @@
+[data]
+dataset_path = "data/sudoku-extreme-1k-aug-1000"
+
+[model]
+model_type = "trm"
+seq_len = 81
+grid_height = 9
+grid_width = 9
+d_model = 512
+num_steps = 16
+dropout_rate = 0.0
+
+[model.trm]
+h_cycles = 3
+l_cycles = 6
+l_layers = 2
+num_heads = 8
+mlp_ratio = 4
+mlp_t = false
+puzzle_emb_ndim = 512
+puzzle_emb_len = 16
+pos_encodings = "rope"
+rms_norm_eps = 1e-5
+rope_theta = 10000.0
+
+[optimizer]
+learning_rate = 1e-4
+lr_min_ratio = 1.0
+beta1 = 0.9
+beta2 = 0.95
+weight_decay = 1.0
+warmup_steps = 2000
+grad_clip_norm = 0.0
+flatten_optimizer = true
+
+[train]
+# Server run: one full TRM batch per optimizer update.
+batch_size = 768
+max_steps = 50000
+log_every = 10
+eval_every = 5000
+eval_batches = 32
+q_loss_weight = 0.5
+seed = 0
+checkpoint_dir = "checkpoints"
+
+[train.ema]
+enabled = true
+decay = 0.999
+
+[runtime]
+compute_dtype = "bfloat16"
+
+[wandb]
+enabled = true
+project = "latent-factor-recurrent-model"
+name = "sudoku-trm-official-attn-rope"
+mode = "online"

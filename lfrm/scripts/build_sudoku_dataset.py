@@ -14,6 +14,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-difficulty", type=int, default=None)
     parser.add_argument("--num-aug", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=10_000,
+        help="Print progress and flush mmap files every N written examples; use 0 to disable.",
+    )
     return parser
 
 
@@ -27,6 +33,7 @@ def main() -> None:
         min_difficulty=args.min_difficulty,
         num_aug=args.num_aug,
         seed=args.seed,
+        progress_every=args.progress_every,
     )
 
 

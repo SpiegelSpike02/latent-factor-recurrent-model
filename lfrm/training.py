@@ -9,7 +9,10 @@ from flax import nnx
 from orbax.checkpoint import Checkpointer, PyTreeCheckpointHandler, args as ocp_args
 
 from lfrm.config import ExperimentConfig
-from lfrm.models import LatentFactorRecurrentModel
+from lfrm.models import LatentFactorRecurrentModel, TinyRecursiveModel
+
+
+GridReasoningModel = LatentFactorRecurrentModel | TinyRecursiveModel
 
 
 def step_loss_weights(num_steps: int, weighting: str) -> jax.Array:
@@ -23,51 +26,81 @@ def step_loss_weights(num_steps: int, weighting: str) -> jax.Array:
     raise ValueError(f"Unsupported step_loss_weighting: {weighting}")
 
 
+def _stablemax_cross_entropy_with_integer_labels(logits: jax.Array, labels: jax.Array) -> jax.Array:
+    logits_f32 = logits.astype(jnp.float32)
+    positive = jnp.where(logits_f32 >= 0.0, logits_f32 + 1.0, 1.0)
+    negative_denominator = jnp.where(logits_f32 < 0.0, 1.0 - logits_f32 + 1e-30, 1.0)
+    negative = 1.0 / negative_denominator
+    scores = jnp.where(logits_f32 < 0.0, negative, positive)
+    log_probs = jnp.log(scores / jnp.sum(scores, axis=-1, keepdims=True))
+    label_log_probs = jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
+    return (-label_log_probs).astype(jnp.float32)
+
+
 def build_optimizer(config: ExperimentConfig) -> optax.GradientTransformation:
+    optimizer_steps = max(1, config.train.max_steps)
+    warmup_steps = max(1, config.optimizer.warmup_steps)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=config.optimizer.learning_rate,
-        warmup_steps=config.optimizer.warmup_steps,
-        decay_steps=max(config.train.max_steps, config.optimizer.warmup_steps + 1),
-        end_value=config.optimizer.learning_rate * 0.1,
+        warmup_steps=warmup_steps,
+        decay_steps=max(optimizer_steps, warmup_steps + 1),
+        end_value=config.optimizer.learning_rate * config.optimizer.lr_min_ratio,
     )
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(config.optimizer.grad_clip_norm),
+    optimizer_schedule = lambda count: schedule(count + jnp.asarray(1, dtype=count.dtype))
+    transforms = []
+    if config.optimizer.grad_clip_norm > 0.0:
+        transforms.append(optax.clip_by_global_norm(config.optimizer.grad_clip_norm))
+    transforms.append(
         optax.adamw(
-            learning_rate=schedule,
+            learning_rate=optimizer_schedule,
+            b1=config.optimizer.beta1,
+            b2=config.optimizer.beta2,
             weight_decay=config.optimizer.weight_decay,
-        ),
+        )
     )
+    optimizer = optax.chain(*transforms)
     if config.optimizer.flatten_optimizer:
-        return optax.flatten(optimizer)
+        optimizer = optax.flatten(optimizer)
     return optimizer
 
 
-def create_model(config: ExperimentConfig) -> LatentFactorRecurrentModel:
-    if config.model.model_type != "lfrm":
-        raise ValueError("Only model_type='lfrm' is supported")
-    return LatentFactorRecurrentModel(
-        config.model,
-        config.runtime,
-        rngs=nnx.Rngs(config.train.seed),
-    )
+def create_model(config: ExperimentConfig) -> GridReasoningModel:
+    if config.model.model_type == "lfrm":
+        return LatentFactorRecurrentModel(
+            config.model,
+            config.runtime,
+            rngs=nnx.Rngs(config.train.seed),
+        )
+    if config.model.model_type == "trm":
+        return TinyRecursiveModel(
+            config.model,
+            config.runtime,
+            rngs=nnx.Rngs(config.train.seed),
+        )
+    raise ValueError("Only model_type='lfrm' or model_type='trm' is supported")
 
 
-def create_optimizer(model: LatentFactorRecurrentModel, config: ExperimentConfig) -> nnx.Optimizer:
+def create_optimizer(model: GridReasoningModel, config: ExperimentConfig) -> nnx.Optimizer:
     return nnx.Optimizer(model, build_optimizer(config), wrt=nnx.Param)
 
 
-def create_ema_model(model: LatentFactorRecurrentModel, config: ExperimentConfig) -> LatentFactorRecurrentModel:
+def create_ema_model(model: GridReasoningModel, config: ExperimentConfig) -> GridReasoningModel:
     """Create an eval-only shadow model initialized from the current params."""
     ema_model = create_model(config)
-    nnx.update(ema_model, nnx.state(model, nnx.Param))
+    nnx.update(ema_model, nnx.state(model))
     return ema_model
 
 
-def build_ema_update_runner(decay: float):
-    def update_ema_model(ema_model: LatentFactorRecurrentModel, model: LatentFactorRecurrentModel) -> None:
-        ema_params = nnx.state(ema_model, nnx.Param)
-        model_params = nnx.state(model, nnx.Param)
+def ema_param_filter(config: ExperimentConfig):
+    return nnx.Param
+
+
+def build_ema_update_runner(decay: float, wrt=nnx.Param):
+    def update_ema_model(ema_model: GridReasoningModel, model: GridReasoningModel) -> None:
+        ema_params = nnx.state(ema_model, wrt)
+        model_params = nnx.state(model, wrt)
+        nnx.update(ema_model, nnx.state(model))
         updated_params = jax.tree.map(
             lambda ema, current: decay * ema + (1.0 - decay) * current,
             ema_params,
@@ -79,7 +112,7 @@ def build_ema_update_runner(decay: float):
 
 
 def loss_and_metrics(
-    model: LatentFactorRecurrentModel,
+    model: GridReasoningModel,
     batch: dict[str, jax.Array],
     train: bool,
     dropout_key: jax.Array | None,
@@ -101,10 +134,12 @@ def loss_and_metrics(
     use_final_forward = step_loss_weighting == "final" and hasattr(model, "forward_final_with_diagnostics")
     compute_terminal_residual = (not train) or terminal_residual_weight != 0.0
     model_forward_kwargs = {}
-    if isinstance(model, LatentFactorRecurrentModel):
+    if isinstance(model, (LatentFactorRecurrentModel, TinyRecursiveModel)):
         model_forward_kwargs = {
             "compute_terminal_residual": compute_terminal_residual,
         }
+    if isinstance(model, TinyRecursiveModel):
+        model_forward_kwargs["puzzle_identifiers"] = batch["puzzle_identifiers"]
     if use_final_forward:
         step_logits, diagnostics = model.forward_final_with_diagnostics(
             inputs,
@@ -132,12 +167,22 @@ def loss_and_metrics(
     step_predictions = jnp.argmax(effective_step_logits, axis=-1)
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask
     per_step_example_accuracy = jnp.sum(step_correct, axis=-1) / per_example_normalizer[None, :]
+    blanks_per_example = jnp.sum(loss_mask, axis=-1)
+    step_correct_per_example = jnp.sum(step_correct, axis=-1)
+    per_step_example_solved = jnp.where(
+        blanks_per_example[None, :] > 0,
+        step_correct_per_example == blanks_per_example[None, :],
+        True,
+    )
     quality_logits = diagnostics.get("quality_logits")
     q_loss = jnp.asarray(0.0, dtype=jnp.float32)
     q_selected_logits = effective_step_logits[-1]
     q_selected_step = jnp.full((inputs.shape[0],), effective_step_logits.shape[0] - 1, dtype=jnp.int32)
     if quality_logits is not None:
-        q_targets = jax.lax.stop_gradient(per_step_example_accuracy)
+        if "quality_target_solved" in diagnostics:
+            q_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
+        else:
+            q_targets = jax.lax.stop_gradient(per_step_example_accuracy)
         q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(quality_logits, q_targets))
         q_selected_step = jnp.argmax(quality_logits, axis=0)
         gather_index = q_selected_step[None, :, None, None]
@@ -170,7 +215,6 @@ def loss_and_metrics(
     correct = (predictions == targets).astype(jnp.float32) * loss_mask
     blank_cell_accuracy = jnp.sum(correct) / normalizer
 
-    blanks_per_example = jnp.sum(loss_mask, axis=-1)
     correct_per_example = jnp.sum(correct, axis=-1)
     solved_examples = jnp.where(
         blanks_per_example > 0,
@@ -240,6 +284,167 @@ def loss_and_metrics(
     return loss, metrics
 
 
+def trm_act_loss_and_metrics(
+    model: TinyRecursiveModel,
+    carry: dict[str, jax.Array],
+    batch: dict[str, jax.Array],
+    train: bool,
+    dropout_key: jax.Array | None,
+    q_loss_weight: float = 0.5,
+    puzzle_embeddings: jax.Array | None = None,
+) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
+    new_carry, logits, diagnostics = model.forward_act_step(
+        carry,
+        batch,
+        train=train,
+        dropout_key=dropout_key,
+        puzzle_embeddings=puzzle_embeddings,
+    )
+    targets = new_carry["current_labels"]
+    given_mask = new_carry["current_given_mask"]
+    loss_mask = (~given_mask).astype(jnp.float32)
+    normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
+    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
+
+    token_loss = _stablemax_cross_entropy_with_integer_labels(logits, targets)
+    per_example_loss = jnp.sum(token_loss * loss_mask, axis=-1) / per_example_normalizer
+    blank_ce_loss = jnp.mean(per_example_loss)
+
+    predictions = jnp.argmax(logits, axis=-1)
+    correct = (predictions == targets).astype(jnp.float32) * loss_mask
+    blank_cell_accuracy = jnp.sum(correct) / normalizer
+    correct_per_example = jnp.sum(correct, axis=-1)
+    blanks_per_example = jnp.sum(loss_mask, axis=-1)
+    solved_examples = jnp.where(
+        blanks_per_example > 0,
+        correct_per_example == blanks_per_example,
+        True,
+    )
+    solved_targets = jax.lax.stop_gradient(solved_examples.astype(jnp.float32))
+    solved_rate = jnp.mean(solved_targets)
+
+    q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(diagnostics["quality_logits"], solved_targets))
+    loss = blank_ce_loss + q_loss_weight * q_loss
+
+    probs = jax.nn.softmax(logits, axis=-1)
+    target_probability = jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
+    target_probability = jnp.sum(target_probability * loss_mask) / normalizer
+    metrics = {
+        "loss": loss,
+        "blank_ce_loss": blank_ce_loss,
+        "final_blank_ce_loss": blank_ce_loss,
+        "target_probability": target_probability,
+        "blank_cell_accuracy": blank_cell_accuracy,
+        "solved_rate": solved_rate,
+        "q_loss": q_loss,
+        "act_step": diagnostics["act_step"],
+        "halted_rate": diagnostics["halted_rate"],
+        "reset_rate": diagnostics["reset_rate"],
+    }
+    return loss, (metrics, new_carry)
+
+
+def trm_eval_loss_and_metrics(
+    model: TinyRecursiveModel,
+    batch: dict[str, jax.Array],
+    q_loss_weight: float = 0.5,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    inputs = batch["inputs"]
+    targets = batch["labels"]
+    given_mask = batch["given_mask"]
+    loss_mask = (~given_mask).astype(jnp.float32)
+    normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
+    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
+
+    step_logits, diagnostics = model.forward_all_steps_with_diagnostics(
+        inputs,
+        puzzle_identifiers=batch["puzzle_identifiers"],
+        train=False,
+        dropout_key=None,
+        compute_terminal_residual=False,
+    )
+    step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
+    step_loss_mask = loss_mask[None, :, :]
+    token_loss = _stablemax_cross_entropy_with_integer_labels(step_logits, step_targets)
+    per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
+    per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
+
+    step_predictions = jnp.argmax(step_logits, axis=-1)
+    step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask
+    step_correct_per_example = jnp.sum(step_correct, axis=-1)
+    blanks_per_example = jnp.sum(loss_mask, axis=-1)
+    per_step_example_solved = jnp.where(
+        blanks_per_example[None, :] > 0,
+        step_correct_per_example == blanks_per_example[None, :],
+        True,
+    )
+    quality_logits = diagnostics["quality_logits"]
+    q_continue_logits = diagnostics.get("q_continue_logits")
+    if model.trm.no_act_continue or q_continue_logits is None:
+        step_halted = quality_logits > 0.0
+    else:
+        step_halted = quality_logits > q_continue_logits
+    step_halted = step_halted.at[-1, :].set(True)
+    selected_step = jnp.argmax(step_halted.astype(jnp.int32), axis=0)
+    gather_index = selected_step[None, :, None, None]
+    selected_logits = jnp.take_along_axis(
+        step_logits,
+        jnp.broadcast_to(gather_index, (1, inputs.shape[0], step_logits.shape[2], step_logits.shape[3])),
+        axis=0,
+    ).squeeze(0)
+    selected_token_loss = _stablemax_cross_entropy_with_integer_labels(selected_logits, targets)
+    blank_ce_loss = jnp.sum(selected_token_loss * loss_mask) / normalizer
+    selected_solved_targets = jnp.take_along_axis(
+        per_step_example_solved.astype(jnp.float32),
+        selected_step[None, :],
+        axis=0,
+    ).squeeze(0)
+    q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(quality_logits, jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))))
+    loss = blank_ce_loss + q_loss_weight * q_loss
+
+    predictions = jnp.argmax(selected_logits, axis=-1)
+    selected_probs = jax.nn.softmax(selected_logits, axis=-1)
+    target_probability = jnp.take_along_axis(selected_probs, targets[..., None], axis=-1).squeeze(-1)
+    target_probability = jnp.sum(target_probability * loss_mask) / normalizer
+    correct = (predictions == targets).astype(jnp.float32) * loss_mask
+    blank_cell_accuracy = jnp.sum(correct) / normalizer
+    solved_rate = jnp.mean(selected_solved_targets)
+    final_logits = step_logits[-1]
+    final_token_loss = _stablemax_cross_entropy_with_integer_labels(final_logits, targets)
+    final_blank_ce_loss = jnp.sum(final_token_loss * loss_mask) / normalizer
+    final_predictions = jnp.argmax(final_logits, axis=-1)
+    final_correct = (final_predictions == targets).astype(jnp.float32) * loss_mask
+    final_blank_cell_accuracy = jnp.sum(final_correct) / normalizer
+    final_correct_per_example = jnp.sum(final_correct, axis=-1)
+    final_solved_examples = jnp.where(
+        blanks_per_example > 0,
+        final_correct_per_example == blanks_per_example,
+        True,
+    )
+    oracle_step = jnp.argmin(per_step_example_loss, axis=0)
+    metrics = {
+        "loss": loss,
+        "blank_ce_loss": blank_ce_loss,
+        "q_loss": q_loss,
+        "final_blank_ce_loss": final_blank_ce_loss,
+        "final_blank_cell_accuracy": final_blank_cell_accuracy,
+        "final_solved_rate": jnp.mean(final_solved_examples.astype(jnp.float32)),
+        "target_probability": target_probability,
+        "blank_cell_accuracy": blank_cell_accuracy,
+        "solved_rate": solved_rate,
+        "q_selected_blank_ce_loss": blank_ce_loss,
+        "q_selected_blank_cell_accuracy": blank_cell_accuracy,
+        "q_selected_solved_rate": solved_rate,
+        "q_selected_step": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
+        "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
+        "per_step_loss": per_step_loss,
+        "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
+        "per_step_quality_score": jax.nn.sigmoid(jnp.mean(quality_logits, axis=1)),
+        "unroll_steps": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
+    }
+    return loss, metrics
+
+
 def build_train_step_runner(
     step_loss_weighting: str = "uniform",
     q_loss_weight: float = 0.0,
@@ -249,7 +454,7 @@ def build_train_step_runner(
     slot_diversity_weight: float = 0.0,
 ):
     def train_step_with_weight(
-        model: LatentFactorRecurrentModel,
+        model: GridReasoningModel,
         optimizer: nnx.Optimizer,
         batch: dict[str, jax.Array],
         dropout_key: jax.Array,
@@ -276,6 +481,37 @@ def build_train_step_runner(
     return nnx.jit(train_step_with_weight)
 
 
+def build_trm_act_train_step_runner(q_loss_weight: float = 0.5):
+    def train_step(
+        model: TinyRecursiveModel,
+        optimizer: nnx.Optimizer,
+        carry: dict[str, jax.Array],
+        batch: dict[str, jax.Array],
+        dropout_key: jax.Array,
+    ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+        def objective(model, carry, batch, train, dropout_key):
+            return trm_act_loss_and_metrics(
+                model,
+                carry,
+                batch,
+                train,
+                dropout_key,
+                q_loss_weight,
+            )
+
+        (_, (metrics, new_carry)), grads = nnx.value_and_grad(objective, has_aux=True)(
+            model,
+            carry,
+            batch,
+            True,
+            dropout_key,
+        )
+        optimizer.update(model, grads)
+        return metrics, new_carry
+
+    return nnx.jit(train_step)
+
+
 def build_eval_step_runner(
     step_loss_weighting: str = "uniform",
     q_loss_weight: float = 0.0,
@@ -285,7 +521,7 @@ def build_eval_step_runner(
     slot_diversity_weight: float = 0.0,
 ):
     def eval_step_with_weight(
-        model: LatentFactorRecurrentModel,
+        model: GridReasoningModel,
         batch: dict[str, jax.Array],
     ) -> dict[str, jax.Array]:
         _, metrics = loss_and_metrics(
@@ -305,13 +541,28 @@ def build_eval_step_runner(
     return nnx.jit(eval_step_with_weight)
 
 
+def build_trm_eval_step_runner(q_loss_weight: float = 0.5):
+    def eval_step(
+        model: TinyRecursiveModel,
+        batch: dict[str, jax.Array],
+    ) -> dict[str, jax.Array]:
+        _, metrics = trm_eval_loss_and_metrics(
+            model,
+            batch,
+            q_loss_weight,
+        )
+        return metrics
+
+    return nnx.jit(eval_step)
+
+
 def save_checkpoint(
     checkpoint_dir: str,
-    model: LatentFactorRecurrentModel,
+    model: GridReasoningModel,
     optimizer: nnx.Optimizer,
     step: int,
     *,
-    ema_model: LatentFactorRecurrentModel | None = None,
+    ema_model: GridReasoningModel | None = None,
 ) -> None:
     checkpointer = Checkpointer(PyTreeCheckpointHandler())
     target_dir = Path(checkpoint_dir).resolve() / f"step_{step}"
@@ -328,10 +579,10 @@ def save_checkpoint(
 
 def load_checkpoint(
     checkpoint_path: str | Path,
-    model: LatentFactorRecurrentModel,
+    model: GridReasoningModel,
     optimizer: nnx.Optimizer,
     *,
-    ema_model: LatentFactorRecurrentModel | None = None,
+    ema_model: GridReasoningModel | None = None,
 ) -> int:
     checkpointer = Checkpointer(PyTreeCheckpointHandler())
     restore_target = {

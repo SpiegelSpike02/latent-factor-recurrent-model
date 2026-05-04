@@ -19,13 +19,22 @@ from lfrm.config import (
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
+    TRMConfig,
     TrainConfig,
     WandbConfig,
 )
-from lfrm.models import LatentFactorRecurrentModel
+from lfrm.models import LatentFactorRecurrentModel, TinyRecursiveModel
 import lfrm.models.lfrm as lfrm_module
 from lfrm.jax_defaults import apply_jax_defaults
-from lfrm.training import create_model, create_optimizer, load_checkpoint, loss_and_metrics, save_checkpoint, step_loss_weights
+from lfrm.training import (
+    build_trm_act_train_step_runner,
+    create_model,
+    create_optimizer,
+    load_checkpoint,
+    loss_and_metrics,
+    save_checkpoint,
+    step_loss_weights,
+)
 
 
 class LFRMModelTests(unittest.TestCase):
@@ -131,6 +140,7 @@ class LFRMModelTests(unittest.TestCase):
             "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
             "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
             "given_mask": jnp.asarray([[True, False, True, False, False, True, False, True, False]], dtype=bool),
+            "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
         _, metrics = loss_and_metrics(
             model,
@@ -274,6 +284,24 @@ class LFRMModelTests(unittest.TestCase):
             wandb=WandbConfig(),
         )
         self.assertIsInstance(create_model(config), LatentFactorRecurrentModel)
+        trm_config = ExperimentConfig(
+            model=ModelConfig(
+                vocab_size=11,
+                model_type="trm",
+                seq_len=9,
+                grid_height=3,
+                grid_width=3,
+                d_model=12,
+                num_steps=1,
+                trm=TRMConfig(),
+            ),
+            optimizer=OptimizerConfig(),
+            train=TrainConfig(),
+            data=DataConfig(),
+            runtime=RuntimeConfig(compute_dtype="float32"),
+            wandb=WandbConfig(),
+        )
+        self.assertIsInstance(create_model(trm_config), TinyRecursiveModel)
         invalid = ExperimentConfig(
             model=ModelConfig(vocab_size=11, model_type="legacy_shared_block"),
             optimizer=OptimizerConfig(),
@@ -282,8 +310,179 @@ class LFRMModelTests(unittest.TestCase):
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
         )
-        with self.assertRaisesRegex(ValueError, "Only model_type='lfrm'"):
+        with self.assertRaisesRegex(ValueError, "Only model_type='lfrm' or model_type='trm'"):
             create_model(invalid)
+
+    def test_trm_forward_and_losses_are_finite(self) -> None:
+        model = TinyRecursiveModel(
+            ModelConfig(
+                vocab_size=11,
+                model_type="trm",
+                seq_len=9,
+                grid_height=3,
+                grid_width=3,
+                d_model=12,
+                num_steps=2,
+                trm=TRMConfig(h_cycles=1, l_cycles=1, l_layers=1, num_heads=3, mlp_ratio=2),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(21),
+        )
+        batch = {
+            "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
+            "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
+            "given_mask": jnp.asarray([[True, False, True, False, False, True, False, True, False]], dtype=bool),
+            "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
+        }
+        logits, diagnostics = model.forward_all_steps_with_diagnostics(
+            batch["inputs"],
+            puzzle_identifiers=batch["puzzle_identifiers"],
+            train=False,
+        )
+        self.assertEqual(logits.shape, (2, 1, 9, 11))
+        self.assertEqual(diagnostics["quality_logits"].shape, (2, 1))
+        _, metrics = loss_and_metrics(model, batch, True, jax.random.key(2), q_loss_weight=0.1)
+        for key in ("loss", "q_loss", "q_selected_blank_ce_loss", "blank_cell_accuracy"):
+            self.assertIn(key, metrics)
+            self.assertTrue(bool(jnp.isfinite(metrics[key])))
+
+    def test_trm_breaks_blank_symbol_symmetry(self) -> None:
+        model = TinyRecursiveModel(
+            ModelConfig(
+                vocab_size=11,
+                model_type="trm",
+                seq_len=9,
+                grid_height=3,
+                grid_width=3,
+                d_model=12,
+                num_steps=2,
+                trm=TRMConfig(h_cycles=1, l_cycles=1, l_layers=1, num_heads=3, mlp_ratio=2),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(21),
+        )
+        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
+        logits, diagnostics = model.forward_all_steps_with_diagnostics(
+            tokens,
+            puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
+            train=False,
+        )
+        blank_digit_logits = logits[-1, 0, 1, 2:]
+        self.assertGreater(float(jnp.std(blank_digit_logits)), 1e-6)
+        self.assertIn("quality_logits", diagnostics)
+
+    def test_trm_puzzle_embedding_uses_unified_optimizer_update(self) -> None:
+        config = ExperimentConfig(
+            model=ModelConfig(
+                vocab_size=11,
+                model_type="trm",
+                num_puzzle_identifiers=1,
+                seq_len=9,
+                grid_height=3,
+                grid_width=3,
+                d_model=12,
+                num_steps=2,
+                trm=TRMConfig(h_cycles=1, l_cycles=1, l_layers=1, num_heads=3, mlp_ratio=2, puzzle_emb_len=2),
+            ),
+            optimizer=OptimizerConfig(
+                learning_rate=1e-4,
+                lr_min_ratio=1.0,
+                weight_decay=1.0,
+                warmup_steps=1,
+            ),
+            train=TrainConfig(batch_size=2, max_steps=2, q_loss_weight=0.5),
+            data=DataConfig(),
+            runtime=RuntimeConfig(compute_dtype="float32"),
+            wandb=WandbConfig(),
+        )
+        model = create_model(config)
+        optimizer = create_optimizer(model, config)
+        train_step = build_trm_act_train_step_runner(config.train.q_loss_weight)
+        batch = {
+            "inputs": jnp.asarray(
+                [[2, 1, 3, 1, 1, 4, 1, 5, 1], [3, 1, 2, 1, 1, 5, 1, 4, 1]],
+                dtype=jnp.int32,
+            ),
+            "labels": jnp.asarray(
+                [[2, 3, 3, 4, 5, 4, 6, 5, 7], [3, 4, 2, 5, 6, 5, 7, 4, 8]],
+                dtype=jnp.int32,
+            ),
+            "given_mask": jnp.asarray(
+                [
+                    [True, False, True, False, False, True, False, True, False],
+                    [True, False, True, False, False, True, False, True, False],
+                ],
+                dtype=bool,
+            ),
+            "puzzle_identifiers": jnp.asarray([0, 0], dtype=jnp.int32),
+        }
+        before = model.puzzle_emb.weights[...]
+        metrics, _carry = train_step(
+            model,
+            optimizer,
+            model.initial_carry(batch),
+            batch,
+            jax.random.key(0),
+        )
+        after = model.puzzle_emb.weights[...]
+
+        self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
+        self.assertGreater(float(jnp.sum(jnp.abs(after - before))), 0.0)
+
+    def test_trm_puzzle_embedding_shape(self) -> None:
+        model = TinyRecursiveModel(
+            ModelConfig(
+                vocab_size=11,
+                model_type="trm",
+                num_puzzle_identifiers=5,
+                seq_len=9,
+                grid_height=3,
+                grid_width=3,
+                d_model=12,
+                num_steps=2,
+                trm=TRMConfig(
+                    h_cycles=1,
+                    l_cycles=1,
+                    l_layers=1,
+                    num_heads=3,
+                    mlp_ratio=2,
+                    puzzle_emb_ndim=12,
+                    puzzle_emb_len=2,
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(22),
+        )
+        params = nnx.state(model, nnx.Param)
+        self.assertEqual(model.prefix_len, 2)
+        self.assertEqual(model.puzzle_emb.weights[...].shape, (5, 12))
+        self.assertNotIn("h_init", str(params))
+        self.assertNotIn("l_init", str(params))
+
+    def test_q_selected_metrics_use_quality_head_step(self) -> None:
+        class QualitySelectedModel:
+            def forward_all_steps_with_diagnostics(self, inputs, train: bool, dropout_key=None):
+                del inputs, train, dropout_key
+                logits = jnp.full((2, 1, 4, 11), -10.0)
+                logits = logits.at[0, 0, 0, 2].set(10.0)
+                logits = logits.at[0, 0, 1, 1].set(10.0)
+                logits = logits.at[1, 0, 0, 2].set(10.0)
+                logits = logits.at[1, 0, 1, 3].set(10.0)
+                diagnostics = {
+                    "hidden_delta_mean": jnp.asarray([0.0, 0.0], dtype=jnp.float32),
+                    "quality_logits": jnp.asarray([[0.0], [4.0]], dtype=jnp.float32),
+                }
+                return logits, diagnostics
+
+        batch = {
+            "inputs": jnp.zeros((1, 4), dtype=jnp.int32),
+            "labels": jnp.asarray([[2, 3, 0, 0]], dtype=jnp.int32),
+            "given_mask": jnp.asarray([[False, False, True, True]], dtype=bool),
+        }
+        _, metrics = loss_and_metrics(QualitySelectedModel(), batch, False, None)
+        self.assertAlmostEqual(float(metrics["blank_cell_accuracy"]), 1.0, places=6)
+        self.assertAlmostEqual(float(metrics["q_selected_blank_cell_accuracy"]), 1.0, places=6)
+        self.assertAlmostEqual(float(metrics["q_selected_step"]), 2.0, places=6)
 
     def test_num_heads_must_divide_d_model(self) -> None:
         with self.assertRaisesRegex(ValueError, "divisible by num_heads"):

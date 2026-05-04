@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +20,7 @@ from lfrm.config import (
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
+    TRMConfig,
     TrainConfig,
     WandbConfig,
 )
@@ -26,9 +29,12 @@ from lfrm.training import (
     build_ema_update_runner,
     build_eval_step_runner,
     build_train_step_runner,
+    build_trm_act_train_step_runner,
+    build_trm_eval_step_runner,
     create_ema_model,
     create_model,
     create_optimizer,
+    ema_param_filter,
     load_checkpoint,
     save_checkpoint,
 )
@@ -36,7 +42,7 @@ from lfrm.training import (
 
 CONFIG_SECTIONS = ("data", "model", "optimizer", "train", "runtime", "wandb")
 NESTED_SECTIONS = {
-    "model": {"lfrm"},
+    "model": {"lfrm", "trm"},
     "train": {"ema"},
 }
 ALLOWED_SECTION_KEYS = {
@@ -50,9 +56,13 @@ ALLOWED_SECTION_KEYS = {
         "num_steps",
         "dropout_rate",
         "lfrm",
+        "trm",
     },
     "optimizer": {
         "learning_rate",
+        "lr_min_ratio",
+        "beta1",
+        "beta2",
         "weight_decay",
         "warmup_steps",
         "grad_clip_norm",
@@ -92,6 +102,19 @@ ALLOWED_NESTED_KEYS = {
         "use_condition_type_embedding",
     },
     "ema": {"enabled", "decay"},
+    "trm": {
+        "h_cycles",
+        "l_cycles",
+        "l_layers",
+        "num_heads",
+        "mlp_ratio",
+        "mlp_t",
+        "puzzle_emb_ndim",
+        "puzzle_emb_len",
+        "pos_encodings",
+        "rms_norm_eps",
+        "rope_theta",
+    },
 }
 
 
@@ -111,27 +134,27 @@ def load_toml_config(path: str | None) -> dict[str, object]:
         for key, value in section_values.items():
             normalized_key = key.replace("-", "_")
             if normalized_key not in allowed_keys:
-                raise ValueError(f"Unsupported [{section}] field in LFRM config: {key}")
+                raise ValueError(f"Unsupported [{section}] field in grid reasoning config: {key}")
             if normalized_key in NESTED_SECTIONS.get(section, set()):
                 if not isinstance(value, dict):
                     raise ValueError(f"Section [{section}.{key}] in {config_path} must be a table")
                 for nested_key, nested_value in value.items():
                     normalized_nested_key = nested_key.replace("-", "_")
                     if normalized_nested_key not in ALLOWED_NESTED_KEYS[normalized_key]:
-                        raise ValueError(f"Unsupported [{section}.{key}] field in LFRM config: {nested_key}")
+                        raise ValueError(f"Unsupported [{section}.{key}] field in grid reasoning config: {nested_key}")
                     flat[f"{normalized_key}_{normalized_nested_key}"] = nested_value
                 continue
             if section == "wandb":
                 normalized_key = f"wandb_{normalized_key}"
             flat[normalized_key] = value
 
-    if flat.get("model_type", "lfrm") != "lfrm":
-        raise ValueError("Only model_type='lfrm' is supported")
+    if flat.get("model_type", "lfrm") not in ("lfrm", "trm"):
+        raise ValueError("Only model_type='lfrm' or model_type='trm' is supported")
     return flat
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train the Latent Factor Recurrent Model.")
+    parser = argparse.ArgumentParser(description="Train recurrent grid reasoning models.")
     parser.add_argument("--config", type=str, default=None, help="Optional TOML config file.")
     parser.add_argument("--dataset-path", type=str, default=None, help="Offline grid dataset directory.")
     parser.add_argument("--seq-len", type=int, default=81)
@@ -145,7 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--step-loss-weighting",
         choices=("uniform", "linear", "final"),
-        default="final",
+        default="uniform",
         help="How to weight losses from recurrent reasoning steps.",
     )
     parser.add_argument("--seed", type=int, default=0)
@@ -156,7 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slot-diversity-weight", type=float, default=0.0)
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ema-decay", type=float, default=0.999)
-    parser.add_argument("--model-type", choices=("lfrm",), default="lfrm")
+    parser.add_argument("--model-type", choices=("lfrm", "trm"), default="lfrm")
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--num-steps", type=int, default=6)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
@@ -171,7 +194,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lfrm-belief-floor", type=float, default=1e-5)
     parser.add_argument("--lfrm-assignment-temperature", type=float, default=1.0)
     parser.add_argument("--lfrm-use-condition-type-embedding", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--trm-h-cycles", type=int, default=3)
+    parser.add_argument("--trm-l-cycles", type=int, default=6)
+    parser.add_argument("--trm-l-layers", type=int, default=2)
+    parser.add_argument("--trm-num-heads", type=int, default=8)
+    parser.add_argument("--trm-mlp-ratio", type=int, default=4)
+    parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--trm-puzzle-emb-ndim", type=int, default=0)
+    parser.add_argument("--trm-puzzle-emb-len", type=int, default=16)
+    parser.add_argument("--trm-pos-encodings", choices=("none", "learned", "rope"), default="none")
+    parser.add_argument("--trm-rms-norm-eps", type=float, default=1e-5)
+    parser.add_argument("--trm-rope-theta", type=float, default=10000.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--lr-min-ratio", type=float, default=0.1)
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
@@ -192,9 +229,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_config(args: argparse.Namespace, *, vocab_size: int, seq_len: int) -> ExperimentConfig:
+def build_config(
+    args: argparse.Namespace,
+    *,
+    vocab_size: int,
+    num_puzzle_identifiers: int,
+    seq_len: int,
+) -> ExperimentConfig:
     model = ModelConfig(
         vocab_size=vocab_size,
+        num_puzzle_identifiers=num_puzzle_identifiers,
         model_type=args.model_type,
         seq_len=seq_len,
         grid_height=args.grid_height,
@@ -215,9 +259,25 @@ def build_config(args: argparse.Namespace, *, vocab_size: int, seq_len: int) -> 
             assignment_temperature=args.lfrm_assignment_temperature,
             use_condition_type_embedding=args.lfrm_use_condition_type_embedding,
         ),
+        trm=TRMConfig(
+            h_cycles=args.trm_h_cycles,
+            l_cycles=args.trm_l_cycles,
+            l_layers=args.trm_l_layers,
+            num_heads=args.trm_num_heads,
+            mlp_ratio=args.trm_mlp_ratio,
+            mlp_t=args.trm_mlp_t,
+            puzzle_emb_ndim=args.trm_puzzle_emb_ndim,
+            puzzle_emb_len=args.trm_puzzle_emb_len,
+            pos_encodings=args.trm_pos_encodings,
+            rms_norm_eps=args.trm_rms_norm_eps,
+            rope_theta=args.trm_rope_theta,
+        ),
     )
     optimizer = OptimizerConfig(
         learning_rate=args.learning_rate,
+        lr_min_ratio=args.lr_min_ratio,
+        beta1=args.beta1,
+        beta2=args.beta2,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
         grad_clip_norm=args.grad_clip_norm,
@@ -307,13 +367,15 @@ def read_wandb_run_id(run_dir: Path) -> str | None:
 
 
 def schedule_learning_rate(config: ExperimentConfig, step: int) -> float:
-    warmup_steps = config.optimizer.warmup_steps
+    optimizer_step = max(1, step)
+    optimizer_steps = max(1, config.train.max_steps)
+    warmup_steps = max(1, config.optimizer.warmup_steps)
     peak = config.optimizer.learning_rate
-    end = peak * 0.1
-    decay_steps = max(config.train.max_steps, warmup_steps + 1)
-    if step <= warmup_steps:
-        return peak * step / max(warmup_steps, 1)
-    progress = min(max((step - warmup_steps) / max(decay_steps - warmup_steps, 1), 0.0), 1.0)
+    end = peak * config.optimizer.lr_min_ratio
+    decay_steps = max(optimizer_steps, warmup_steps + 1)
+    if optimizer_step <= warmup_steps:
+        return peak * optimizer_step / max(warmup_steps, 1)
+    progress = min(max((optimizer_step - warmup_steps) / max(decay_steps - warmup_steps, 1), 0.0), 1.0)
     cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
     return float(end + (peak - end) * cosine)
 
@@ -363,28 +425,117 @@ def sample_device_batch(
     return jax.device_put(batch, device=device)
 
 
+class BatchPrefetcher:
+    def __init__(self, sample_fn, *, depth: int = 2) -> None:
+        if depth < 1:
+            raise ValueError("Prefetch depth must be at least 1")
+        self.sample_fn = sample_fn
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.futures: list[Future] = []
+        for _ in range(depth):
+            self.futures.append(self.executor.submit(self.sample_fn))
+
+    def next(self):
+        future = self.futures.pop(0)
+        batch = future.result()
+        self.futures.append(self.executor.submit(self.sample_fn))
+        return batch
+
+    def close(self) -> None:
+        for future in self.futures:
+            future.cancel()
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
+
+def eval_device_batch(
+    dataset,
+    *,
+    config: ExperimentConfig,
+    start: int,
+    stop: int,
+    device: jax.Device,
+) -> dict[str, jax.Array]:
+    if dataset.spec.seq_len != config.model.seq_len:
+        raise ValueError(f"Requested seq_len={config.model.seq_len}, but dataset seq_len={dataset.spec.seq_len}")
+    batch = {
+        "inputs": np.asarray(dataset.eval_inputs[start:stop], dtype=np.int32),
+        "labels": np.asarray(dataset.eval_labels[start:stop], dtype=np.int32),
+        "given_mask": np.asarray(dataset.eval_given_mask[start:stop], dtype=bool),
+        "puzzle_identifiers": np.asarray(dataset.eval_puzzle_identifiers[start:stop], dtype=np.int32),
+    }
+    return jax.device_put(batch, device=device)
+
+
+def eval_device_index_batch(
+    dataset,
+    *,
+    config: ExperimentConfig,
+    indices: np.ndarray,
+    device: jax.Device,
+) -> dict[str, jax.Array]:
+    if dataset.spec.seq_len != config.model.seq_len:
+        raise ValueError(f"Requested seq_len={config.model.seq_len}, but dataset seq_len={dataset.spec.seq_len}")
+    batch = {
+        "inputs": np.asarray(dataset.eval_inputs[indices], dtype=np.int32),
+        "labels": np.asarray(dataset.eval_labels[indices], dtype=np.int32),
+        "given_mask": np.asarray(dataset.eval_given_mask[indices], dtype=bool),
+        "puzzle_identifiers": np.asarray(dataset.eval_puzzle_identifiers[indices], dtype=np.int32),
+    }
+    return jax.device_put(batch, device=device)
+
+
 def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, rng: np.random.Generator) -> dict[str, Any]:
     device = jax.devices()[0]
     reduced: dict[str, Any] | None = None
-    for _ in range(config.train.eval_batches):
-        batch = sample_device_batch(
-            rng,
-            dataset,
-            config=config,
-            split="eval",
-            device=device,
-        )
+    total = dataset.eval_inputs.shape[0]
+    if total == 0:
+        raise ValueError("Eval split is empty")
+    batch_size = config.train.batch_size
+    if batch_size <= 0:
+        raise ValueError("batch_size must be at least 1")
+    total_weight = 0.0
+    if config.train.eval_batches <= 0:
+        batches = [
+            ("slice", start, min(start + batch_size, total))
+            for start in range(0, total, batch_size)
+        ]
+    else:
+        sample_count = min(total, config.train.eval_batches * batch_size)
+        indices = rng.choice(total, size=sample_count, replace=False)
+        batches = [
+            ("indices", start, min(start + batch_size, sample_count))
+            for start in range(0, sample_count, batch_size)
+        ]
+
+    for mode, start, stop in batches:
+        if mode == "slice":
+            batch = eval_device_batch(
+                dataset,
+                config=config,
+                start=start,
+                stop=stop,
+                device=device,
+            )
+        else:
+            batch = eval_device_index_batch(
+                dataset,
+                config=config,
+                indices=indices[start:stop],
+                device=device,
+            )
         metrics = eval_step_fn(model, batch)
+        weight = float(stop - start)
         if reduced is None:
             reduced = {
                 key: np.zeros(np.asarray(value).shape, dtype=np.float64)
                 for key, value in metrics.items()
             }
         for key, value in metrics.items():
-            reduced[key] += np.asarray(jax.device_get(value), dtype=np.float64)
+            reduced[key] += np.asarray(jax.device_get(value), dtype=np.float64) * weight
+        total_weight += weight
     if reduced is None:
-        raise ValueError("eval_batches must be at least 1")
-    scale = 1.0 / config.train.eval_batches
+        raise ValueError("No eval batches were produced")
+    scale = 1.0 / total_weight
     averaged = {key: value * scale for key, value in reduced.items()}
     return {
         key: float(value) if np.ndim(value) == 0 else value.astype(float).tolist()
@@ -422,6 +573,9 @@ CORE_SCALAR_METRICS = (
     "q_selected_solved_rate",
     "q_selected_step",
     "oracle_step",
+    "act_step",
+    "halted_rate",
+    "reset_rate",
 )
 SLOT_DIAGNOSTIC_METRICS = (
     "slot_consistency_loss",
@@ -492,8 +646,11 @@ def main() -> None:
     config = build_config(
         args,
         vocab_size=dataset.spec.vocab_size,
+        num_puzzle_identifiers=dataset.spec.num_puzzle_identifiers,
         seq_len=dataset.spec.seq_len,
     )
+    if config.train.batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
 
     resume_checkpoint: Path | None = None
     resume_step = 0
@@ -509,24 +666,32 @@ def main() -> None:
 
     model = create_model(config)
     optimizer = create_optimizer(model, config)
-    train_step_fn = build_train_step_runner(
-        config.train.step_loss_weighting,
-        config.train.q_loss_weight,
-        config.train.terminal_residual_weight,
-        config.train.slot_consistency_weight,
-        config.train.slot_usage_weight,
-        config.train.slot_diversity_weight,
-    )
-    eval_step_fn = build_eval_step_runner(
-        config.train.step_loss_weighting,
-        config.train.q_loss_weight,
-        config.train.terminal_residual_weight,
-        config.train.slot_consistency_weight,
-        config.train.slot_usage_weight,
-        config.train.slot_diversity_weight,
-    )
+    if config.model.model_type == "trm":
+        train_step_fn = build_trm_act_train_step_runner(config.train.q_loss_weight)
+        eval_step_fn = build_trm_eval_step_runner(config.train.q_loss_weight)
+    else:
+        train_step_fn = build_train_step_runner(
+            config.train.step_loss_weighting,
+            config.train.q_loss_weight,
+            config.train.terminal_residual_weight,
+            config.train.slot_consistency_weight,
+            config.train.slot_usage_weight,
+            config.train.slot_diversity_weight,
+        )
+        eval_step_fn = build_eval_step_runner(
+            config.train.step_loss_weighting,
+            config.train.q_loss_weight,
+            config.train.terminal_residual_weight,
+            config.train.slot_consistency_weight,
+            config.train.slot_usage_weight,
+            config.train.slot_diversity_weight,
+        )
     ema_model = create_ema_model(model, config) if config.train.use_ema else None
-    ema_update_fn = build_ema_update_runner(config.train.ema_decay) if config.train.use_ema else None
+    ema_update_fn = (
+        build_ema_update_runner(config.train.ema_decay, ema_param_filter(config))
+        if config.train.use_ema
+        else None
+    )
     if resume_checkpoint is not None:
         restored_step = load_checkpoint(resume_checkpoint, model, optimizer, ema_model=ema_model)
         if restored_step != resume_step:
@@ -544,8 +709,10 @@ def main() -> None:
         "dataset_kind=", overview["kind"],
         "task_type=", overview["task_type"],
         "vocab_size=", overview["vocab_size"],
+        "num_puzzle_identifiers=", overview["num_puzzle_identifiers"],
         "train_examples=", overview["train_examples"],
         "eval_examples=", overview["eval_examples"],
+        "batch_size=", config.train.batch_size,
         "seq_len=", config.model.seq_len,
         "grid_height=", config.model.grid_height,
         "grid_width=", config.model.grid_width,
@@ -554,26 +721,8 @@ def main() -> None:
         "resume_step=", resume_step,
     )
 
-    current_batch = sample_device_batch(
-        train_rng,
-        dataset,
-        config=config,
-        split="train",
-        device=device,
-    )
-
-    for step in range(resume_step + 1, config.train.max_steps + 1):
-        train_key, step_key = jax.random.split(train_key)
-        metrics = train_step_fn(
-            model,
-            optimizer,
-            current_batch,
-            step_key,
-        )
-        if ema_model is not None and ema_update_fn is not None:
-            ema_update_fn(ema_model, model)
-
-        current_batch = sample_device_batch(
+    def sample_train_batch():
+        return sample_device_batch(
             train_rng,
             dataset,
             config=config,
@@ -581,83 +730,114 @@ def main() -> None:
             device=device,
         )
 
-        if step % config.train.log_every == 0 or step == 1:
-            train_log = {
-                "train/loss": float(metrics["loss"]),
-                "train/blank_ce_loss": float(metrics["blank_ce_loss"]),
-                "train/final_blank_ce_loss": float(metrics["final_blank_ce_loss"]),
-                "train/blank_cell_accuracy": float(metrics["blank_cell_accuracy"]),
-                "train/solved_rate": float(metrics["solved_rate"]),
-                "train/learning_rate": schedule_learning_rate(config, step),
-            }
-            train_log.update(optional_scalar_log("train", metrics, scalar_metrics))
-            if wandb_run is not None:
-                wandb_run.log(train_log, step=step)
-            optional_summary = optional_scalar_summary(metrics, scalar_metrics)
-            print(
-                f"step={step} "
-                f"loss={float(metrics['loss']):.4f} "
-                f"ce={float(metrics['blank_ce_loss']):.4f} "
-                f"final_ce={float(metrics['final_blank_ce_loss']):.4f} "
-                f"blank_acc={float(metrics['blank_cell_accuracy']):.4f} "
-                f"solved={float(metrics['solved_rate']):.4f}"
-                f"{' ' + optional_summary if optional_summary else ''}"
-            )
+    prefetcher = BatchPrefetcher(sample_train_batch, depth=2)
 
-        if step % config.train.eval_every == 0 or step == config.train.max_steps:
-            eval_model = ema_model if ema_model is not None else model
-            eval_metrics = evaluate(
-                eval_step_fn,
-                eval_model,
-                dataset,
-                config=config,
-                rng=eval_rng,
-            )
-            if wandb_run is not None:
-                eval_log = {
-                    "eval/loss": eval_metrics["loss"],
-                    "eval/blank_ce_loss": eval_metrics["blank_ce_loss"],
-                    "eval/final_blank_ce_loss": eval_metrics["final_blank_ce_loss"],
-                    "eval/blank_cell_accuracy": eval_metrics["blank_cell_accuracy"],
-                    "eval/solved_rate": eval_metrics["solved_rate"],
-                }
-                eval_log.update(optional_scalar_log("eval", eval_metrics, scalar_metrics))
-                eval_log.update(flatten_step_metrics("eval/loss_by_step", eval_metrics["per_step_loss"]))
-                eval_log.update(
-                    flatten_step_metrics(
-                        "eval/hidden_delta_by_step",
-                        eval_metrics["per_step_hidden_delta"],
-                    )
+    current_batch = prefetcher.next()
+    train_carry = model.initial_carry(current_batch) if config.model.model_type == "trm" else None
+
+    try:
+        for step in range(resume_step + 1, config.train.max_steps + 1):
+            train_key, step_key = jax.random.split(train_key)
+            if config.model.model_type == "trm":
+                metrics, train_carry = train_step_fn(
+                    model,
+                    optimizer,
+                    train_carry,
+                    current_batch,
+                    step_key,
                 )
-                if "per_step_quality_score" in eval_metrics:
+            else:
+                metrics = train_step_fn(
+                    model,
+                    optimizer,
+                    current_batch,
+                    step_key,
+                )
+            current_batch = prefetcher.next()
+
+            if ema_model is not None and ema_update_fn is not None:
+                ema_update_fn(ema_model, model)
+
+            if step % config.train.log_every == 0 or step == 1:
+                train_log = {
+                    "train/loss": float(metrics["loss"]),
+                    "train/blank_ce_loss": float(metrics["blank_ce_loss"]),
+                    "train/final_blank_ce_loss": float(metrics["final_blank_ce_loss"]),
+                    "train/blank_cell_accuracy": float(metrics["blank_cell_accuracy"]),
+                    "train/solved_rate": float(metrics["solved_rate"]),
+                    "train/learning_rate": schedule_learning_rate(config, step),
+                }
+                train_log.update(optional_scalar_log("train", metrics, scalar_metrics))
+                if wandb_run is not None:
+                    wandb_run.log(train_log, step=step)
+                optional_summary = optional_scalar_summary(metrics, scalar_metrics)
+                print(
+                    f"step={step} "
+                    f"loss={float(metrics['loss']):.4f} "
+                    f"ce={float(metrics['blank_ce_loss']):.4f} "
+                    f"final_ce={float(metrics['final_blank_ce_loss']):.4f} "
+                    f"blank_acc={float(metrics['blank_cell_accuracy']):.4f} "
+                    f"solved={float(metrics['solved_rate']):.4f}"
+                    f"{' ' + optional_summary if optional_summary else ''}"
+                )
+
+            if step % config.train.eval_every == 0 or step == config.train.max_steps:
+                eval_model = ema_model if ema_model is not None else model
+                eval_metrics = evaluate(
+                    eval_step_fn,
+                    eval_model,
+                    dataset,
+                    config=config,
+                    rng=eval_rng,
+                )
+                if wandb_run is not None:
+                    eval_log = {
+                        "eval/loss": eval_metrics["loss"],
+                        "eval/blank_ce_loss": eval_metrics["blank_ce_loss"],
+                        "eval/final_blank_ce_loss": eval_metrics["final_blank_ce_loss"],
+                        "eval/blank_cell_accuracy": eval_metrics["blank_cell_accuracy"],
+                        "eval/solved_rate": eval_metrics["solved_rate"],
+                    }
+                    eval_log.update(optional_scalar_log("eval", eval_metrics, scalar_metrics))
+                    eval_log.update(flatten_step_metrics("eval/loss_by_step", eval_metrics["per_step_loss"]))
                     eval_log.update(
                         flatten_step_metrics(
-                            "eval/quality_by_step",
-                            eval_metrics["per_step_quality_score"],
+                            "eval/hidden_delta_by_step",
+                            eval_metrics["per_step_hidden_delta"],
                         )
                     )
-                wandb_run.log(eval_log, step=step)
-            optional_summary = optional_scalar_summary(eval_metrics, scalar_metrics)
-            print(
-                f"[eval{'/ema' if ema_model is not None else ''}] step={step} "
-                f"loss={eval_metrics['loss']:.4f} "
-                f"ce={eval_metrics['blank_ce_loss']:.4f} "
-                f"final_ce={eval_metrics['final_blank_ce_loss']:.4f} "
-                f"blank_acc={eval_metrics['blank_cell_accuracy']:.4f} "
-                f"solved={eval_metrics['solved_rate']:.4f}"
-                f"{' ' + optional_summary if optional_summary else ''}"
-            )
-            print(
-                "  "
-                + " ".join(
-                    [
-                        format_step_summary("loss", eval_metrics["per_step_loss"]),
-                        format_step_summary("delta", eval_metrics["per_step_hidden_delta"]),
-                        format_step_summary("q", eval_metrics.get("per_step_quality_score", [])),
-                    ]
+                    if "per_step_quality_score" in eval_metrics:
+                        eval_log.update(
+                            flatten_step_metrics(
+                                "eval/quality_by_step",
+                                eval_metrics["per_step_quality_score"],
+                            )
+                        )
+                    wandb_run.log(eval_log, step=step)
+                optional_summary = optional_scalar_summary(eval_metrics, scalar_metrics)
+                print(
+                    f"[eval{'/ema' if ema_model is not None else ''}] step={step} "
+                    f"loss={eval_metrics['loss']:.4f} "
+                    f"ce={eval_metrics['blank_ce_loss']:.4f} "
+                    f"final_ce={eval_metrics['final_blank_ce_loss']:.4f} "
+                    f"blank_acc={eval_metrics['blank_cell_accuracy']:.4f} "
+                    f"solved={eval_metrics['solved_rate']:.4f}"
+                    f"{' ' + optional_summary if optional_summary else ''}"
                 )
-            )
-            save_checkpoint(str(checkpoint_dir), model, optimizer, step, ema_model=ema_model)
+                print(
+                    "  "
+                    + " ".join(
+                        [
+                            format_step_summary("loss", eval_metrics["per_step_loss"]),
+                            format_step_summary("delta", eval_metrics["per_step_hidden_delta"]),
+                            format_step_summary("q", eval_metrics.get("per_step_quality_score", [])),
+                        ]
+                    )
+                )
+                save_checkpoint(str(checkpoint_dir), model, optimizer, step, ema_model=ema_model)
+    finally:
+        with suppress(Exception):
+            prefetcher.close()
 
     if wandb_run is not None:
         wandb_run.finish()
