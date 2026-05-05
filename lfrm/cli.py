@@ -611,6 +611,7 @@ CORE_SCALAR_METRICS = (
     "belief_entropy",
     "belief_confidence",
     "target_probability",
+    "mean_blank_ce_loss",
     "q_loss",
     "q_selected_blank_ce_loss",
     "q_selected_blank_cell_accuracy",

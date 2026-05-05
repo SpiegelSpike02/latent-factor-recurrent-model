@@ -26,32 +26,32 @@ halt_exploration_prob = 0.0
 
 [optimizer]
 learning_rate = 1e-4
-lr_min_ratio = 1.0
+lr_min_ratio = 0.1
 beta1 = 0.9
 beta2 = 0.95
 weight_decay = 0.1
 warmup_steps = 2000
-grad_clip_norm = 0.0
+grad_clip_norm = 1.0
 flatten_optimizer = true
 
 [train]
 # Dense unroll backprops through all recurrent steps, so it needs a much smaller batch than ACT training.
 batch_size = 64
 eval_batch_size = 256
-max_steps = 50000
+max_steps = 30000
 log_every = 10
-eval_every = 5000
+eval_every = 2500
 eval_batches = 32
 trm_train_mode = "dense_unroll"
-dense_loss_weight = 0.5
-final_loss_weight = 0.5
+dense_loss_weight = 0.35
+final_loss_weight = 0.65
 q_loss_weight = 0.0
 seed = 0
 checkpoint_dir = "checkpoints"
 
 [train.ema]
-enabled = false
-decay = 0.999
+enabled = true
+decay = 0.995
 
 [runtime]
 compute_dtype = "bfloat16"
@@ -59,5 +59,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-trm-gridpos-dense-unroll-b64"
+name = "sudoku-trm-gridpos-dense-unroll-stable-b64"
 mode = "online"

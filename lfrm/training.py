@@ -364,7 +364,15 @@ def trm_dense_unroll_loss_and_metrics(
     step_loss_mask = loss_mask[None, :, :]
     token_loss = optax.softmax_cross_entropy_with_integer_labels(step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
-    dense_ce_loss = jnp.mean(per_step_loss)
+    num_steps = per_step_loss.shape[0]
+    step_weights = jnp.full(
+        (num_steps,),
+        dense_loss_weight / jnp.asarray(num_steps, dtype=jnp.float32),
+        dtype=jnp.float32,
+    )
+    step_weights = step_weights.at[-1].add(final_loss_weight)
+    blank_ce_loss = jnp.sum(step_weights * per_step_loss)
+    mean_blank_ce_loss = jnp.mean(per_step_loss)
     final_blank_ce_loss = per_step_loss[-1]
 
     step_predictions = jnp.argmax(step_logits, axis=-1)
@@ -399,18 +407,15 @@ def trm_dense_unroll_loss_and_metrics(
         q_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
         q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(quality_logits, q_targets))
 
-    loss = (
-        dense_loss_weight * dense_ce_loss
-        + final_loss_weight * final_blank_ce_loss
-        + q_loss_weight * q_loss
-    )
+    loss = blank_ce_loss + q_loss_weight * q_loss
     oracle_step = jnp.argmin(
         jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :],
         axis=0,
     )
     metrics = {
         "loss": loss,
-        "blank_ce_loss": dense_ce_loss,
+        "blank_ce_loss": blank_ce_loss,
+        "mean_blank_ce_loss": mean_blank_ce_loss,
         "final_blank_ce_loss": final_blank_ce_loss,
         "target_probability": target_probability,
         "blank_cell_accuracy": blank_cell_accuracy,
