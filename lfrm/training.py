@@ -6,7 +6,12 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
-from orbax.checkpoint import Checkpointer, PyTreeCheckpointHandler, args as ocp_args
+from flax.training import orbax_utils
+from orbax.checkpoint import (
+    Checkpointer,
+    PyTreeCheckpointHandler,
+    args as ocp_args,
+)
 
 from lfrm.config import ExperimentConfig
 from lfrm.models import LatentFactorRecurrentModel, TinyRecursiveModel
@@ -755,7 +760,11 @@ def load_checkpoint(
         restore_target["ema_model"] = nnx.state(ema_model)
     payload = checkpointer.restore(
         Path(checkpoint_path).resolve(),
-        args=ocp_args.PyTreeRestore(item=restore_target, partial_restore=True),
+        args=ocp_args.PyTreeRestore(
+            item=restore_target,
+            restore_args=orbax_utils.restore_args_from_target(restore_target),
+            partial_restore=True,
+        ),
     )
     nnx.update(model, payload["model"])
     nnx.update(optimizer, payload["optimizer"])

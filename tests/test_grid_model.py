@@ -4,6 +4,7 @@ import inspect
 import os
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -698,8 +699,13 @@ class LFRMModelTests(unittest.TestCase):
 
             restored_model = create_model(config)
             restored_optimizer = create_optimizer(restored_model, config)
-            step = load_checkpoint(Path(tmpdir) / "step_7", restored_model, restored_optimizer)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                step = load_checkpoint(Path(tmpdir) / "step_7", restored_model, restored_optimizer)
             self.assertEqual(step, 7)
+            self.assertFalse(
+                any("Sharding info not provided" in str(item.message) for item in caught)
+            )
 
             checkpoint_path, run_dir = resolve_resume_checkpoint(tmpdir)
             self.assertEqual(checkpoint_path.name, "step_7")
