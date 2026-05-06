@@ -52,10 +52,90 @@ class SwiGLU(nnx.Module):
         return self.down(jax.nn.silu(gate) * up)
 
 
+class LocalConvSwiGLU(nnx.Module):
+    def __init__(
+        self,
+        config: ModelConfig,
+        prefix_len: int,
+        dtype: jnp.dtype,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        trm = config.trm_config
+        if trm.local_mixing_kernel < 1 or trm.local_mixing_kernel % 2 == 0:
+            raise ValueError("TRM local_mixing_kernel must be a positive odd integer")
+        self.config = config
+        self.prefix_len = prefix_len
+        self.dtype = dtype
+        self.depthwise = nnx.Conv(
+            config.d_model,
+            config.d_model,
+            kernel_size=(trm.local_mixing_kernel, trm.local_mixing_kernel),
+            padding="SAME",
+            feature_group_count=config.d_model,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            preferred_element_type=jnp.float32,
+            rngs=rngs,
+        )
+        self.gate_up = nnx.Linear(
+            config.d_model,
+            2 * config.d_model,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.down = nnx.Linear(
+            config.d_model,
+            config.d_model,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+
+    def __call__(self, hidden_states: Array) -> Array:
+        grid_tokens = hidden_states[:, self.prefix_len :, :]
+        batch_size = grid_tokens.shape[0]
+        grid = grid_tokens.reshape(
+            batch_size,
+            self.config.grid_height,
+            self.config.grid_width,
+            self.config.d_model,
+        )
+        local = self.depthwise(maybe_cast(grid, self.dtype))
+        local = local.reshape(batch_size, self.config.seq_len, self.config.d_model)
+        gate, up = jnp.split(self.gate_up(local), 2, axis=-1)
+        mixed = self.down(jax.nn.silu(gate) * up)
+        if self.prefix_len == 0:
+            return mixed
+        prefix = jnp.zeros_like(hidden_states[:, : self.prefix_len, :])
+        return jnp.concatenate([prefix, mixed], axis=1)
+
+
 class Attention(nnx.Module):
-    def __init__(self, d_model: int, num_heads: int, dtype: jnp.dtype, *, rngs: nnx.Rngs) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        prefix_len: int,
+        dtype: jnp.dtype,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        d_model = config.d_model
+        trm = config.trm_config
+        num_heads = trm.num_heads
         if d_model % num_heads != 0:
             raise ValueError("TRM d_model must be divisible by trm.num_heads")
+        if trm.attention_type not in ("standard", "gated_dual"):
+            raise ValueError("TRM attention_type must be one of: standard, gated_dual")
+        self.config = config
+        self.trm = trm
+        self.prefix_len = prefix_len
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.qkv = nnx.Linear(
@@ -67,6 +147,25 @@ class Attention(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
+        if trm.attention_type == "gated_dual":
+            self.dual_gate = nnx.Linear(
+                d_model,
+                num_heads,
+                dtype=dtype,
+                param_dtype=jnp.float32,
+                kernel_init=nnx.initializers.zeros,
+                bias_init=nnx.initializers.zeros,
+                rngs=rngs,
+            )
+            self.local_distance_logit = nnx.Param(jnp.zeros((num_heads,), dtype=jnp.float32))
+            rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
+            cols = jnp.arange(config.seq_len, dtype=jnp.int32) % config.grid_width
+            distance = jnp.abs(rows[:, None] - rows[None, :]) + jnp.abs(cols[:, None] - cols[None, :])
+            distance = distance.astype(jnp.float32)
+            if prefix_len > 0:
+                padded = jnp.zeros((prefix_len + config.seq_len, prefix_len + config.seq_len), dtype=jnp.float32)
+                distance = padded.at[prefix_len:, prefix_len:].set(distance)
+            self.local_distance = nnx.data(distance)
         self.out = nnx.Linear(
             d_model,
             d_model,
@@ -77,7 +176,13 @@ class Attention(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: Array, rope_cos: Array | None, rope_sin: Array | None) -> Array:
+    def __call__(
+        self,
+        x: Array,
+        rope_cos: Array | None,
+        rope_sin: Array | None,
+        attention_bias: Array | None,
+    ) -> Array:
         batch_size, seq_len, d_model = x.shape
         qkv = self.qkv(x)
         q, k, v = jnp.split(qkv, 3, axis=-1)
@@ -91,6 +196,32 @@ class Attention(nnx.Module):
         v = jnp.swapaxes(v, 1, 2)
         scores = jnp.einsum("bhqd,bhkd->bhqk", q, k, preferred_element_type=jnp.float32)
         scores = scores / math.sqrt(self.head_dim)
+        if self.trm.attention_type == "gated_dual":
+            global_weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(x.dtype)
+            global_attended = jnp.einsum(
+                "bhqk,bhkd->bhqd",
+                global_weights,
+                v,
+                preferred_element_type=jnp.float32,
+            )
+            distance_scale = jax.nn.softplus(self.local_distance_logit)[None, :, None, None]
+            local_scores = scores - distance_scale * self.local_distance[None, None, :, :]
+            if attention_bias is not None:
+                local_scores = local_scores + attention_bias[None, :, :, :].astype(jnp.float32)
+            local_weights = jax.nn.softmax(local_scores.astype(jnp.float32), axis=-1).astype(x.dtype)
+            local_attended = jnp.einsum(
+                "bhqk,bhkd->bhqd",
+                local_weights,
+                v,
+                preferred_element_type=jnp.float32,
+            )
+            gate = jax.nn.sigmoid(self.dual_gate(x)).astype(x.dtype)
+            gate = jnp.swapaxes(gate, 1, 2)[..., None]
+            attended = gate * global_attended + (1.0 - gate) * local_attended
+            attended = jnp.swapaxes(attended, 1, 2).reshape(batch_size, seq_len, d_model)
+            return self.out(attended)
+        if attention_bias is not None:
+            scores = scores + attention_bias[None, :, :, :].astype(jnp.float32)
         weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(x.dtype)
         attended = jnp.einsum("bhqk,bhkd->bhqd", weights, v, preferred_element_type=jnp.float32)
         attended = jnp.swapaxes(attended, 1, 2).reshape(batch_size, seq_len, d_model)
@@ -114,24 +245,45 @@ def _apply_rope(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Arra
 
 
 class TRMBlock(nnx.Module):
-    def __init__(self, config: ModelConfig, sequence_length: int, dtype: jnp.dtype, *, rngs: nnx.Rngs) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        sequence_length: int,
+        prefix_len: int,
+        dtype: jnp.dtype,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
         trm = config.trm_config
         self.config = config
         self.trm = trm
         if trm.mlp_t:
             self.token_mlp = SwiGLU(sequence_length, trm.mlp_ratio, dtype, rngs=rngs)
         else:
-            self.attention = Attention(config.d_model, trm.num_heads, dtype, rngs=rngs)
+            self.attention = Attention(config, prefix_len, dtype, rngs=rngs)
+        if trm.local_mixing:
+            self.local_mixing = LocalConvSwiGLU(config, prefix_len, dtype, rngs=rngs)
         self.channel_mlp = SwiGLU(config.d_model, trm.mlp_ratio, dtype, rngs=rngs)
 
-    def __call__(self, hidden_states: Array, rope_cos: Array | None, rope_sin: Array | None) -> Array:
+    def __call__(
+        self,
+        hidden_states: Array,
+        rope_cos: Array | None,
+        rope_sin: Array | None,
+        attention_bias: Array | None,
+    ) -> Array:
         if self.trm.mlp_t:
             mixed = jnp.swapaxes(hidden_states, 1, 2)
             mixed = _rms_norm(mixed + self.token_mlp(mixed), self.trm.rms_norm_eps)
             hidden_states = jnp.swapaxes(mixed, 1, 2)
         else:
             hidden_states = _rms_norm(
-                hidden_states + self.attention(hidden_states, rope_cos, rope_sin),
+                hidden_states + self.attention(hidden_states, rope_cos, rope_sin, attention_bias),
+                self.trm.rms_norm_eps,
+            )
+        if self.trm.local_mixing:
+            hidden_states = _rms_norm(
+                hidden_states + self.local_mixing(hidden_states),
                 self.trm.rms_norm_eps,
             )
         hidden_states = _rms_norm(
@@ -171,14 +323,18 @@ class TinyRecursiveModel(nnx.Module):
             raise ValueError("TRM l_cycles must be at least 1")
         if trm.mlp_ratio < 1:
             raise ValueError("TRM mlp_ratio must be at least 1")
+        if trm.attention_type not in ("standard", "gated_dual"):
+            raise ValueError("TRM attention_type must be one of: standard, gated_dual")
+        if trm.local_mixing_kernel < 1 or trm.local_mixing_kernel % 2 == 0:
+            raise ValueError("TRM local_mixing_kernel must be a positive odd integer")
         if trm.puzzle_emb_ndim < 0:
             raise ValueError("TRM puzzle_emb_ndim must be non-negative")
         if trm.puzzle_emb_len < 0:
             raise ValueError("TRM puzzle_emb_len must be non-negative")
         if config.num_puzzle_identifiers < 1:
             raise ValueError("TRM num_puzzle_identifiers must be at least 1")
-        if trm.pos_encodings not in ("none", "learned", "rope", "grid"):
-            raise ValueError("TRM pos_encodings must be one of: none, learned, rope, grid")
+        if trm.pos_encodings not in ("none", "learned", "rope", "grid", "rel2d"):
+            raise ValueError("TRM pos_encodings must be one of: none, learned, rope, grid, rel2d")
         if trm.pos_encodings == "rope" and config.d_model % trm.num_heads != 0:
             raise ValueError("TRM d_model must be divisible by trm.num_heads for RoPE")
         if trm.pos_encodings == "rope" and (config.d_model // trm.num_heads) % 2 != 0:
@@ -264,8 +420,31 @@ class TinyRecursiveModel(nnx.Module):
                 embedding_init=embed_init,
                 rngs=rngs,
             )
+        if trm.pos_encodings == "rel2d":
+            rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
+            cols = jnp.arange(config.seq_len, dtype=jnp.int32) % config.grid_width
+            rel_rows = rows[:, None] - rows[None, :] + config.grid_height - 1
+            rel_cols = cols[:, None] - cols[None, :] + config.grid_width - 1
+            self.rel2d_row_bias = nnx.Param(
+                jnp.zeros((trm.num_heads, 2 * config.grid_height - 1), dtype=jnp.float32)
+            )
+            self.rel2d_col_bias = nnx.Param(
+                jnp.zeros((trm.num_heads, 2 * config.grid_width - 1), dtype=jnp.float32)
+            )
+            if self.prefix_len > 0:
+                padded_rows = jnp.full((self.total_seq_len, self.total_seq_len), -1, dtype=jnp.int32)
+                padded_cols = jnp.full((self.total_seq_len, self.total_seq_len), -1, dtype=jnp.int32)
+                rel_rows = padded_rows.at[self.prefix_len :, self.prefix_len :].set(rel_rows)
+                rel_cols = padded_cols.at[self.prefix_len :, self.prefix_len :].set(rel_cols)
+            self.rel2d_row_indices = nnx.data(rel_rows)
+            self.rel2d_col_indices = nnx.data(rel_cols)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
-        self.blocks = nnx.List([TRMBlock(config, self.total_seq_len, dtype, rngs=rngs) for _ in range(trm.l_layers)])
+        self.blocks = nnx.List(
+            [
+                TRMBlock(config, self.total_seq_len, self.prefix_len, dtype, rngs=rngs)
+                for _ in range(trm.l_layers)
+            ]
+        )
         self.lm_head = nnx.Linear(
             config.d_model,
             config.vocab_size,
@@ -297,6 +476,18 @@ class TinyRecursiveModel(nnx.Module):
         else:
             self.rope_cos = None
             self.rope_sin = None
+
+    def _attention_bias(self) -> Array | None:
+        if self.trm.pos_encodings != "rel2d":
+            return None
+        row_valid = self.rel2d_row_indices >= 0
+        col_valid = self.rel2d_col_indices >= 0
+        row_indices = jnp.maximum(self.rel2d_row_indices, 0)
+        col_indices = jnp.maximum(self.rel2d_col_indices, 0)
+        row_bias = jnp.take(self.rel2d_row_bias[...], row_indices, axis=1)
+        col_bias = jnp.take(self.rel2d_col_bias[...], col_indices, axis=1)
+        rel2d_bias = row_bias + col_bias
+        return jnp.where((row_valid & col_valid)[None, :, :], rel2d_bias, 0.0)
 
     @staticmethod
     def _box_shape(grid_height: int, grid_width: int) -> tuple[int, int]:
@@ -393,8 +584,14 @@ class TinyRecursiveModel(nnx.Module):
 
     def _l_level(self, hidden_states: Array, input_injection: Array) -> Array:
         hidden_states = hidden_states + input_injection
+        attention_bias = self._attention_bias()
         for block in self.blocks:
-            hidden_states = block(maybe_cast(hidden_states, self.dtype), self.rope_cos, self.rope_sin)
+            hidden_states = block(
+                maybe_cast(hidden_states, self.dtype),
+                self.rope_cos,
+                self.rope_sin,
+                attention_bias,
+            )
         return hidden_states
 
     def _h_cycle(self, state: State, input_embeddings: Array) -> State:
@@ -449,9 +646,11 @@ class TinyRecursiveModel(nnx.Module):
         )
         state = self._reset_carry_state(carry)
         z_h_prev = state[0][:, self.prefix_len :]
+        z_l_prev = state[1][:, self.prefix_len :]
         next_state = self._act_step(state, input_embeddings)
         z_h_next, z_l_next = next_state
         z_h_data = z_h_next[:, self.prefix_len :]
+        z_l_data = z_l_next[:, self.prefix_len :]
         logits = self._logits_from_state(z_h_data)
         q_halt_logits, q_continue_logits = self._quality_logits(z_h_next)
 
@@ -477,7 +676,9 @@ class TinyRecursiveModel(nnx.Module):
             halted = is_last_step
 
         h_delta = jnp.linalg.norm((z_h_data - z_h_prev).astype(jnp.float32), axis=-1, keepdims=True)
+        l_delta = jnp.linalg.norm((z_l_data - z_l_prev).astype(jnp.float32), axis=-1, keepdims=True)
         hidden_delta = self._blank_mean(h_delta, condition_mask)
+        low_hidden_delta = self._blank_mean(l_delta, condition_mask)
         new_carry = {
             "z_h": jax.lax.stop_gradient(z_h_next),
             "z_l": jax.lax.stop_gradient(z_l_next),
@@ -490,6 +691,8 @@ class TinyRecursiveModel(nnx.Module):
         }
         diagnostics = {
             "hidden_delta_mean": hidden_delta,
+            "h_hidden_delta_mean": hidden_delta,
+            "l_hidden_delta_mean": low_hidden_delta,
             "quality_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits,
             "act_step": jnp.mean(new_steps.astype(jnp.float32)),
@@ -506,6 +709,7 @@ class TinyRecursiveModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
         compute_terminal_residual: bool = True,
+        include_layer_diagnostics: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
         condition_mask = self._condition_mask(tokens)
         input_embeddings = self._input_embeddings(
@@ -517,9 +721,9 @@ class TinyRecursiveModel(nnx.Module):
         state0 = self._initial_state(tokens.shape[0])
 
         def scan_step(state: State, _step_index):
-            z_h_prev = state[0]
+            z_h_prev, z_l_prev = state
             next_state = self._act_step(state, input_embeddings)
-            z_h_next, _z_l_next = next_state
+            z_h_next, z_l_next = next_state
             z_h_data = z_h_next[:, self.prefix_len :]
             z_h_prev_data = z_h_prev[:, self.prefix_len :]
             h_delta = jnp.linalg.norm((z_h_data - z_h_prev_data).astype(jnp.float32), axis=-1, keepdims=True)
@@ -527,9 +731,32 @@ class TinyRecursiveModel(nnx.Module):
             step_logits = self._logits_from_state(z_h_data)
             q_halt_logits, q_continue_logits = self._quality_logits(z_h_next)
             carry_state = jax.tree.map(jax.lax.stop_gradient, next_state)
-            return carry_state, (step_logits, hidden_delta, q_halt_logits, q_continue_logits)
+            if include_layer_diagnostics:
+                z_l_data = z_l_next[:, self.prefix_len :]
+                z_l_prev_data = z_l_prev[:, self.prefix_len :]
+                l_delta = jnp.linalg.norm((z_l_data - z_l_prev_data).astype(jnp.float32), axis=-1, keepdims=True)
+                low_hidden_delta = self._blank_mean(l_delta, condition_mask)
+                low_step_logits = jax.lax.stop_gradient(self._logits_from_state(z_l_data))
+            else:
+                low_hidden_delta = jnp.zeros_like(hidden_delta)
+                low_step_logits = jnp.zeros_like(step_logits)
+            return carry_state, (
+                step_logits,
+                low_step_logits,
+                hidden_delta,
+                low_hidden_delta,
+                q_halt_logits,
+                q_continue_logits,
+            )
 
-        final_state, (step_logits, step_hidden_delta, q_halt_logits, q_continue_logits) = jax.lax.scan(
+        final_state, (
+            step_logits,
+            low_step_logits,
+            step_hidden_delta,
+            low_step_hidden_delta,
+            q_halt_logits,
+            q_continue_logits,
+        ) = jax.lax.scan(
             scan_step,
             state0,
             jnp.arange(self.config.num_steps),
@@ -543,6 +770,10 @@ class TinyRecursiveModel(nnx.Module):
             "h": final_state[0][:, self.prefix_len :],
             "l": final_state[1][:, self.prefix_len :],
         }
+        if include_layer_diagnostics:
+            diagnostics["h_hidden_delta_mean"] = step_hidden_delta
+            diagnostics["l_hidden_delta_mean"] = low_step_hidden_delta
+            diagnostics["l_logits"] = low_step_logits
         if compute_terminal_residual:
             final_logits = step_logits[-1]
             next_state = self._act_step(final_state, input_embeddings)
@@ -563,6 +794,7 @@ class TinyRecursiveModel(nnx.Module):
         train: bool,
         dropout_key: Array | None = None,
         compute_terminal_residual: bool = True,
+        include_layer_diagnostics: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
         return self._run_unroll(
             tokens,
@@ -570,6 +802,7 @@ class TinyRecursiveModel(nnx.Module):
             train=train,
             dropout_key=dropout_key,
             compute_terminal_residual=compute_terminal_residual,
+            include_layer_diagnostics=include_layer_diagnostics,
         )
 
     def forward_final_with_diagnostics(

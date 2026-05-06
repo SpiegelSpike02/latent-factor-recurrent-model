@@ -34,6 +34,7 @@ from lfrm.training import (
     loss_and_metrics,
     save_checkpoint,
     step_loss_weights,
+    trm_dense_unroll_loss_and_metrics,
 )
 
 
@@ -338,13 +339,33 @@ class LFRMModelTests(unittest.TestCase):
             batch["inputs"],
             puzzle_identifiers=batch["puzzle_identifiers"],
             train=False,
+            include_layer_diagnostics=True,
         )
         self.assertEqual(logits.shape, (2, 1, 9, 11))
         self.assertEqual(diagnostics["quality_logits"].shape, (2, 1))
+        self.assertEqual(diagnostics["l_logits"].shape, (2, 1, 9, 11))
+        self.assertEqual(diagnostics["h_hidden_delta_mean"].shape, (2,))
+        self.assertEqual(diagnostics["l_hidden_delta_mean"].shape, (2,))
         _, metrics = loss_and_metrics(model, batch, True, jax.random.key(2), q_loss_weight=0.1)
         for key in ("loss", "q_loss", "q_selected_blank_ce_loss", "blank_cell_accuracy"):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
+        dense_loss, dense_metrics = trm_dense_unroll_loss_and_metrics(
+            model,
+            batch,
+            True,
+            jax.random.key(3),
+            sequence_loss_weight=0.1,
+        )
+        self.assertIn("sequence_loss", dense_metrics)
+        self.assertNotIn("per_step_h_loss", dense_metrics)
+        self.assertNotIn("per_step_l_loss", dense_metrics)
+        self.assertTrue(bool(jnp.isfinite(dense_metrics["sequence_loss"])))
+        self.assertAlmostEqual(
+            float(dense_loss),
+            float(dense_metrics["blank_ce_loss"] + 0.1 * dense_metrics["sequence_loss"]),
+            places=5,
+        )
 
     def test_trm_breaks_blank_symbol_symmetry(self) -> None:
         model = TinyRecursiveModel(
@@ -366,10 +387,149 @@ class LFRMModelTests(unittest.TestCase):
             tokens,
             puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
             train=False,
+            include_layer_diagnostics=True,
         )
         blank_digit_logits = logits[-1, 0, 1, 2:]
         self.assertGreater(float(jnp.std(blank_digit_logits)), 1e-6)
         self.assertIn("quality_logits", diagnostics)
+
+    def test_trm_rel2d_position_bias_forward_is_finite(self) -> None:
+        model = TinyRecursiveModel(
+            ModelConfig(
+                vocab_size=11,
+                model_type="trm",
+                seq_len=9,
+                grid_height=3,
+                grid_width=3,
+                d_model=12,
+                num_steps=2,
+                trm=TRMConfig(
+                    h_cycles=1,
+                    l_cycles=1,
+                    l_layers=1,
+                    num_heads=3,
+                    mlp_ratio=2,
+                    puzzle_emb_len=0,
+                    pos_encodings="rel2d",
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(23),
+        )
+        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
+        logits, diagnostics = model.forward_all_steps_with_diagnostics(
+            tokens,
+            puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
+            train=False,
+            include_layer_diagnostics=True,
+        )
+        attention_bias = model._attention_bias()
+        self.assertEqual(logits.shape, (2, 1, 9, 11))
+        self.assertEqual(model.rel2d_row_bias[...].shape, (3, 5))
+        self.assertEqual(model.rel2d_col_bias[...].shape, (3, 5))
+        self.assertEqual(attention_bias.shape, (3, 9, 9))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
+        self.assertIn("quality_logits", diagnostics)
+
+    def test_trm_local_mixing_forward_is_finite(self) -> None:
+        model = TinyRecursiveModel(
+            ModelConfig(
+                vocab_size=11,
+                model_type="trm",
+                seq_len=9,
+                grid_height=3,
+                grid_width=3,
+                d_model=12,
+                num_steps=2,
+                trm=TRMConfig(
+                    h_cycles=1,
+                    l_cycles=1,
+                    l_layers=1,
+                    num_heads=3,
+                    mlp_ratio=2,
+                    puzzle_emb_len=0,
+                    pos_encodings="rel2d",
+                    local_mixing=True,
+                    local_mixing_kernel=3,
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(24),
+        )
+        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
+        logits, diagnostics = model.forward_all_steps_with_diagnostics(
+            tokens,
+            puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
+            train=False,
+            include_layer_diagnostics=True,
+        )
+        self.assertEqual(logits.shape, (2, 1, 9, 11))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
+        self.assertIn("l_logits", diagnostics)
+
+    def test_trm_gated_dual_attention_forward_is_finite(self) -> None:
+        model = TinyRecursiveModel(
+            ModelConfig(
+                vocab_size=11,
+                model_type="trm",
+                seq_len=9,
+                grid_height=3,
+                grid_width=3,
+                d_model=12,
+                num_steps=2,
+                trm=TRMConfig(
+                    h_cycles=1,
+                    l_cycles=1,
+                    l_layers=1,
+                    num_heads=3,
+                    mlp_ratio=2,
+                    mlp_t=False,
+                    puzzle_emb_len=0,
+                    pos_encodings="rel2d",
+                    attention_type="gated_dual",
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(26),
+        )
+        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
+        logits, diagnostics = model.forward_all_steps_with_diagnostics(
+            tokens,
+            puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
+            train=False,
+            include_layer_diagnostics=True,
+        )
+        attention = model.blocks[0].attention
+        self.assertEqual(logits.shape, (2, 1, 9, 11))
+        self.assertEqual(attention.local_distance.shape, (9, 9))
+        self.assertEqual(attention.local_distance_logit[...].shape, (3,))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
+        self.assertIn("l_logits", diagnostics)
+
+    def test_trm_local_mixing_requires_odd_kernel(self) -> None:
+        with self.assertRaisesRegex(ValueError, "local_mixing_kernel"):
+            TinyRecursiveModel(
+                ModelConfig(
+                    vocab_size=11,
+                    model_type="trm",
+                    seq_len=9,
+                    grid_height=3,
+                    grid_width=3,
+                    d_model=12,
+                    num_steps=1,
+                    trm=TRMConfig(
+                        h_cycles=1,
+                        l_cycles=1,
+                        l_layers=1,
+                        num_heads=3,
+                        mlp_ratio=2,
+                        local_mixing=True,
+                        local_mixing_kernel=2,
+                    ),
+                ),
+                RuntimeConfig(compute_dtype="float32"),
+                rngs=nnx.Rngs(25),
+            )
 
     def test_trm_puzzle_embedding_uses_unified_optimizer_update(self) -> None:
         config = ExperimentConfig(

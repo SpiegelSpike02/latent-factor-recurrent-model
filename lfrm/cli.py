@@ -80,6 +80,8 @@ ALLOWED_SECTION_KEYS = {
         "trm_train_mode",
         "dense_loss_weight",
         "final_loss_weight",
+        "sequence_loss_weight",
+        "sequence_loss_temperature",
         "q_loss_weight",
         "terminal_residual_weight",
         "slot_consistency_weight",
@@ -114,6 +116,9 @@ ALLOWED_NESTED_KEYS = {
         "num_heads",
         "mlp_ratio",
         "mlp_t",
+        "attention_type",
+        "local_mixing",
+        "local_mixing_kernel",
         "puzzle_emb_ndim",
         "puzzle_emb_len",
         "pos_encodings",
@@ -192,6 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dense-loss-weight", type=float, default=0.5)
     parser.add_argument("--final-loss-weight", type=float, default=0.5)
+    parser.add_argument("--sequence-loss-weight", type=float, default=0.0)
+    parser.add_argument("--sequence-loss-temperature", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--q-loss-weight", type=float, default=0.0)
     parser.add_argument("--terminal-residual-weight", type=float, default=0.0)
@@ -221,9 +228,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-num-heads", type=int, default=8)
     parser.add_argument("--trm-mlp-ratio", type=int, default=4)
     parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--trm-attention-type", choices=("standard", "gated_dual"), default="standard")
+    parser.add_argument("--trm-local-mixing", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--trm-local-mixing-kernel", type=int, default=3)
     parser.add_argument("--trm-puzzle-emb-ndim", type=int, default=0)
     parser.add_argument("--trm-puzzle-emb-len", type=int, default=16)
-    parser.add_argument("--trm-pos-encodings", choices=("none", "learned", "rope", "grid"), default="none")
+    parser.add_argument("--trm-pos-encodings", choices=("none", "learned", "rope", "grid", "rel2d"), default="none")
     parser.add_argument("--trm-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--trm-rope-theta", type=float, default=10000.0)
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
@@ -289,6 +299,9 @@ def build_config(
             num_heads=args.trm_num_heads,
             mlp_ratio=args.trm_mlp_ratio,
             mlp_t=args.trm_mlp_t,
+            attention_type=args.trm_attention_type,
+            local_mixing=args.trm_local_mixing,
+            local_mixing_kernel=args.trm_local_mixing_kernel,
             puzzle_emb_ndim=args.trm_puzzle_emb_ndim,
             puzzle_emb_len=args.trm_puzzle_emb_len,
             pos_encodings=args.trm_pos_encodings,
@@ -319,6 +332,8 @@ def build_config(
         trm_train_mode=args.trm_train_mode,
         dense_loss_weight=args.dense_loss_weight,
         final_loss_weight=args.final_loss_weight,
+        sequence_loss_weight=args.sequence_loss_weight,
+        sequence_loss_temperature=args.sequence_loss_temperature,
         q_loss_weight=args.q_loss_weight,
         terminal_residual_weight=args.terminal_residual_weight,
         slot_consistency_weight=args.slot_consistency_weight,
@@ -612,6 +627,7 @@ CORE_SCALAR_METRICS = (
     "belief_confidence",
     "target_probability",
     "mean_blank_ce_loss",
+    "sequence_loss",
     "q_loss",
     "q_selected_blank_ce_loss",
     "q_selected_blank_cell_accuracy",
@@ -705,12 +721,21 @@ def main() -> None:
         raise ValueError("eval_batch_size must be non-negative")
     if config.model.model_type != "trm" and config.train.trm_train_mode != "act":
         raise ValueError("trm_train_mode is only supported for model_type='trm'")
-    if config.train.dense_loss_weight < 0.0 or config.train.final_loss_weight < 0.0:
-        raise ValueError("dense_loss_weight and final_loss_weight must be non-negative")
-    if config.train.trm_train_mode == "dense_unroll" and (
-        config.train.dense_loss_weight + config.train.final_loss_weight <= 0.0
+    if (
+        config.train.dense_loss_weight < 0.0
+        or config.train.final_loss_weight < 0.0
+        or config.train.sequence_loss_weight < 0.0
     ):
-        raise ValueError("dense_unroll requires a positive dense or final loss weight")
+        raise ValueError("dense_loss_weight, final_loss_weight, and sequence_loss_weight must be non-negative")
+    if config.train.sequence_loss_temperature <= 0.0:
+        raise ValueError("sequence_loss_temperature must be positive")
+    if config.train.trm_train_mode == "dense_unroll" and (
+        config.train.dense_loss_weight
+        + config.train.final_loss_weight
+        + config.train.sequence_loss_weight
+        <= 0.0
+    ):
+        raise ValueError("dense_unroll requires a positive dense, final, or sequence loss weight")
 
     resume_checkpoint: Path | None = None
     resume_step = 0
@@ -731,6 +756,8 @@ def main() -> None:
             train_step_fn = build_trm_dense_unroll_train_step_runner(
                 dense_loss_weight=config.train.dense_loss_weight,
                 final_loss_weight=config.train.final_loss_weight,
+                sequence_loss_weight=config.train.sequence_loss_weight,
+                sequence_loss_temperature=config.train.sequence_loss_temperature,
                 q_loss_weight=config.train.q_loss_weight,
             )
         else:
@@ -846,6 +873,18 @@ def main() -> None:
                             list(jax.device_get(metrics["per_step_loss"])),
                         )
                     )
+                for metric_name, log_prefix in (
+                    ("per_step_h_loss", "train/h_loss_by_step"),
+                    ("per_step_l_loss", "train/l_loss_by_step"),
+                    ("per_step_h_accuracy", "train/h_accuracy_by_step"),
+                    ("per_step_l_accuracy", "train/l_accuracy_by_step"),
+                    ("per_step_h_hidden_delta", "train/h_hidden_delta_by_step"),
+                    ("per_step_l_hidden_delta", "train/l_hidden_delta_by_step"),
+                ):
+                    if metric_name in metrics:
+                        train_log.update(
+                            flatten_step_metrics(log_prefix, list(jax.device_get(metrics[metric_name])))
+                        )
                 if wandb_run is not None:
                     wandb_run.log(train_log, step=step, commit=not is_eval_step)
                 optional_summary = optional_scalar_summary(metrics, scalar_metrics)
@@ -880,6 +919,18 @@ def main() -> None:
                         }
                         eval_log.update(optional_scalar_log(prefix, eval_metrics, scalar_metrics))
                         eval_log.update(flatten_step_metrics(f"{prefix}/loss_by_step", eval_metrics["per_step_loss"]))
+                        for metric_name, log_prefix in (
+                            ("per_step_h_loss", "h_loss_by_step"),
+                            ("per_step_l_loss", "l_loss_by_step"),
+                            ("per_step_h_accuracy", "h_accuracy_by_step"),
+                            ("per_step_l_accuracy", "l_accuracy_by_step"),
+                            ("per_step_h_hidden_delta", "h_hidden_delta_by_step"),
+                            ("per_step_l_hidden_delta", "l_hidden_delta_by_step"),
+                        ):
+                            if metric_name in eval_metrics:
+                                eval_log.update(
+                                    flatten_step_metrics(f"{prefix}/{log_prefix}", eval_metrics[metric_name])
+                                )
                         eval_log.update(
                             flatten_step_metrics(
                                 f"{prefix}/hidden_delta_by_step",
@@ -910,7 +961,13 @@ def main() -> None:
                         + " ".join(
                             [
                                 format_step_summary("loss", eval_metrics["per_step_loss"]),
+                                format_step_summary("h_loss", eval_metrics.get("per_step_h_loss", [])),
+                                format_step_summary("l_loss", eval_metrics.get("per_step_l_loss", [])),
+                                format_step_summary("h_acc", eval_metrics.get("per_step_h_accuracy", [])),
+                                format_step_summary("l_acc", eval_metrics.get("per_step_l_accuracy", [])),
                                 format_step_summary("delta", eval_metrics["per_step_hidden_delta"]),
+                                format_step_summary("h_delta", eval_metrics.get("per_step_h_hidden_delta", [])),
+                                format_step_summary("l_delta", eval_metrics.get("per_step_l_hidden_delta", [])),
                                 format_step_summary("q", eval_metrics.get("per_step_quality_score", [])),
                             ]
                         )

@@ -236,13 +236,12 @@ def _sample_grouped_indices(
     batch_size: int,
 ) -> np.ndarray:
     group_ids = rng.integers(group_indices.size - 1, size=batch_size, endpoint=False)
-    indices = np.empty((batch_size,), dtype=np.int64)
-    for row, group_id in enumerate(group_ids):
-        puzzle_id = rng.integers(group_indices[group_id], group_indices[group_id + 1])
-        start = int(puzzle_indices[puzzle_id])
-        end = int(puzzle_indices[puzzle_id + 1])
-        indices[row] = rng.integers(start, end)
-    return indices
+    puzzle_lows = group_indices[group_ids]
+    puzzle_highs = group_indices[group_ids + 1]
+    puzzle_ids = rng.integers(puzzle_lows, puzzle_highs, endpoint=False)
+    example_lows = puzzle_indices[puzzle_ids]
+    example_highs = puzzle_indices[puzzle_ids + 1]
+    return rng.integers(example_lows, example_highs, endpoint=False).astype(np.int64, copy=False)
 
 
 def _validate_indices(

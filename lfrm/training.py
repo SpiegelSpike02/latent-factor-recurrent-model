@@ -344,6 +344,8 @@ def trm_dense_unroll_loss_and_metrics(
     *,
     dense_loss_weight: float = 0.5,
     final_loss_weight: float = 0.5,
+    sequence_loss_weight: float = 0.0,
+    sequence_loss_temperature: float = 0.5,
     q_loss_weight: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     inputs = batch["inputs"]
@@ -359,6 +361,7 @@ def trm_dense_unroll_loss_and_metrics(
         train=train,
         dropout_key=dropout_key,
         compute_terminal_residual=False,
+        include_layer_diagnostics=False,
     )
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = loss_mask[None, :, :]
@@ -374,17 +377,24 @@ def trm_dense_unroll_loss_and_metrics(
     blank_ce_loss = jnp.sum(step_weights * per_step_loss)
     mean_blank_ce_loss = jnp.mean(per_step_loss)
     final_blank_ce_loss = per_step_loss[-1]
+    masked_token_loss = jnp.where(step_loss_mask.astype(bool), token_loss / sequence_loss_temperature, -1e9)
+    blanks_per_example = jnp.sum(loss_mask, axis=-1)
+    per_step_sequence_loss = sequence_loss_temperature * (
+        jax.nn.logsumexp(masked_token_loss, axis=-1)
+        - jnp.log(jnp.maximum(blanks_per_example[None, :], 1.0))
+    )
+    per_step_sequence_loss = jnp.where(blanks_per_example[None, :] > 0, per_step_sequence_loss, 0.0)
+    sequence_loss = jnp.sum(step_weights * jnp.mean(per_step_sequence_loss, axis=-1))
 
     step_predictions = jnp.argmax(step_logits, axis=-1)
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask
+    per_step_accuracy = jnp.sum(step_correct, axis=(1, 2)) / normalizer
     step_correct_per_example = jnp.sum(step_correct, axis=-1)
-    blanks_per_example = jnp.sum(loss_mask, axis=-1)
     per_step_example_solved = jnp.where(
         blanks_per_example[None, :] > 0,
         step_correct_per_example == blanks_per_example[None, :],
         True,
     )
-
     final_logits = step_logits[-1]
     predictions = jnp.argmax(final_logits, axis=-1)
     final_probs = jax.nn.softmax(final_logits, axis=-1)
@@ -407,7 +417,7 @@ def trm_dense_unroll_loss_and_metrics(
         q_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
         q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(quality_logits, q_targets))
 
-    loss = blank_ce_loss + q_loss_weight * q_loss
+    loss = blank_ce_loss + sequence_loss_weight * sequence_loss + q_loss_weight * q_loss
     oracle_step = jnp.argmin(
         jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :],
         axis=0,
@@ -417,6 +427,7 @@ def trm_dense_unroll_loss_and_metrics(
         "blank_ce_loss": blank_ce_loss,
         "mean_blank_ce_loss": mean_blank_ce_loss,
         "final_blank_ce_loss": final_blank_ce_loss,
+        "sequence_loss": sequence_loss,
         "target_probability": target_probability,
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
@@ -450,6 +461,7 @@ def trm_eval_loss_and_metrics(
         train=False,
         dropout_key=None,
         compute_terminal_residual=False,
+        include_layer_diagnostics=True,
     )
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = loss_mask[None, :, :]
@@ -459,6 +471,7 @@ def trm_eval_loss_and_metrics(
 
     step_predictions = jnp.argmax(step_logits, axis=-1)
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask
+    per_step_accuracy = jnp.sum(step_correct, axis=(1, 2)) / normalizer
     step_correct_per_example = jnp.sum(step_correct, axis=-1)
     blanks_per_example = jnp.sum(loss_mask, axis=-1)
     per_step_example_solved = jnp.where(
@@ -466,6 +479,15 @@ def trm_eval_loss_and_metrics(
         step_correct_per_example == blanks_per_example[None, :],
         True,
     )
+    l_logits = diagnostics.get("l_logits")
+    l_per_step_loss = jnp.zeros_like(per_step_loss)
+    l_per_step_accuracy = jnp.zeros_like(per_step_loss)
+    if l_logits is not None:
+        l_token_loss = optax.softmax_cross_entropy_with_integer_labels(l_logits, step_targets)
+        l_per_step_loss = jnp.sum(l_token_loss * step_loss_mask, axis=(1, 2)) / normalizer
+        l_predictions = jnp.argmax(l_logits, axis=-1)
+        l_correct = (l_predictions == step_targets).astype(jnp.float32) * step_loss_mask
+        l_per_step_accuracy = jnp.sum(l_correct, axis=(1, 2)) / normalizer
     quality_logits = diagnostics["quality_logits"]
     q_continue_logits = diagnostics.get("q_continue_logits")
     if model.trm.no_act_continue or q_continue_logits is None:
@@ -531,7 +553,13 @@ def trm_eval_loss_and_metrics(
         "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
         "final_solved_count": final_solved_count,
         "per_step_loss": per_step_loss,
+        "per_step_h_loss": per_step_loss,
+        "per_step_l_loss": l_per_step_loss,
+        "per_step_h_accuracy": per_step_accuracy,
+        "per_step_l_accuracy": l_per_step_accuracy,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
+        "per_step_h_hidden_delta": diagnostics.get("h_hidden_delta_mean", diagnostics["hidden_delta_mean"]),
+        "per_step_l_hidden_delta": diagnostics.get("l_hidden_delta_mean", jnp.zeros_like(diagnostics["hidden_delta_mean"])),
         "per_step_quality_score": jax.nn.sigmoid(jnp.mean(quality_logits, axis=1)),
         "unroll_steps": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
     }
@@ -609,6 +637,8 @@ def build_trm_dense_unroll_train_step_runner(
     *,
     dense_loss_weight: float = 0.5,
     final_loss_weight: float = 0.5,
+    sequence_loss_weight: float = 0.0,
+    sequence_loss_temperature: float = 0.5,
     q_loss_weight: float = 0.0,
 ):
     def train_step(
@@ -625,6 +655,8 @@ def build_trm_dense_unroll_train_step_runner(
                 dropout_key,
                 dense_loss_weight=dense_loss_weight,
                 final_loss_weight=final_loss_weight,
+                sequence_loss_weight=sequence_loss_weight,
+                sequence_loss_temperature=sequence_loss_temperature,
                 q_loss_weight=q_loss_weight,
             )
 

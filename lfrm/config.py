@@ -27,6 +27,9 @@ class TRMConfig:
     num_heads: int = 8
     mlp_ratio: int = 4
     mlp_t: bool = True
+    attention_type: str = "standard"
+    local_mixing: bool = False
+    local_mixing_kernel: int = 3
     puzzle_emb_ndim: int = 0
     puzzle_emb_len: int = 16
     pos_encodings: str = "none"
@@ -89,6 +92,8 @@ class TrainConfig:
     trm_train_mode: str = "act"
     dense_loss_weight: float = 0.5
     final_loss_weight: float = 0.5
+    sequence_loss_weight: float = 0.0
+    sequence_loss_temperature: float = 0.5
     q_loss_weight: float = 0.0
     terminal_residual_weight: float = 0.0
     slot_consistency_weight: float = 0.0
