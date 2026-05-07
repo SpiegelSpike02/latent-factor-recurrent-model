@@ -226,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-l-layers", type=int, default=2)
     parser.add_argument("--trm-num-heads", type=int, default=8)
     parser.add_argument("--trm-mlp-ratio", type=int, default=4)
-    parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trm-attention-type", choices=("standard", "gated_dual"), default="standard")
     parser.add_argument("--trm-local-mixing", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trm-local-mixing-kernel", type=int, default=3)

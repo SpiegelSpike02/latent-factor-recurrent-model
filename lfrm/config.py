@@ -29,7 +29,7 @@ class TRMConfig:
     l_layers: int = 2
     num_heads: int = 8
     mlp_ratio: int = 4
-    mlp_t: bool = True
+    mlp_t: bool = False
     attention_type: str = "standard"
     local_mixing: bool = False
     local_mixing_kernel: int = 3
