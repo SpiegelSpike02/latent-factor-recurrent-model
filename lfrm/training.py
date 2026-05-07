@@ -117,12 +117,18 @@ def loss_and_metrics(
 
     model_key = dropout_key
 
-    compute_terminal_residual = (not train) or terminal_residual_weight != 0.0
+    compute_terminal_residual = terminal_residual_weight != 0.0
     model_forward_kwargs = {}
     if isinstance(model, (LatentFactorRecurrentModel, TinyRecursiveModel)):
         model_forward_kwargs = {
             "compute_terminal_residual": compute_terminal_residual,
         }
+    if isinstance(model, LatentFactorRecurrentModel):
+        model_forward_kwargs["compute_slot_diagnostics"] = (
+            slot_consistency_weight != 0.0
+            or slot_usage_weight != 0.0
+            or slot_diversity_weight != 0.0
+        )
     if isinstance(model, TinyRecursiveModel):
         model_forward_kwargs["puzzle_identifiers"] = batch["puzzle_identifiers"]
     step_logits, diagnostics = model.forward_all_steps_with_diagnostics(
@@ -147,14 +153,16 @@ def loss_and_metrics(
     )
     step_weights = step_weights.at[-1].add(final_loss_weight)
     blank_ce_loss = jnp.sum(step_weights * per_step_loss)
-    masked_token_loss = jnp.where(step_loss_mask.astype(bool), token_loss / sequence_loss_temperature, -1e9)
     blanks_per_example = jnp.sum(loss_mask, axis=-1)
-    per_step_sequence_loss = sequence_loss_temperature * (
-        jax.nn.logsumexp(masked_token_loss, axis=-1)
-        - jnp.log(jnp.maximum(blanks_per_example[None, :], 1.0))
-    )
-    per_step_sequence_loss = jnp.where(blanks_per_example[None, :] > 0, per_step_sequence_loss, 0.0)
-    sequence_loss = jnp.sum(step_weights * jnp.mean(per_step_sequence_loss, axis=-1))
+    sequence_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    if sequence_loss_weight != 0.0:
+        masked_token_loss = jnp.where(step_loss_mask.astype(bool), token_loss / sequence_loss_temperature, -1e9)
+        per_step_sequence_loss = sequence_loss_temperature * (
+            jax.nn.logsumexp(masked_token_loss, axis=-1)
+            - jnp.log(jnp.maximum(blanks_per_example[None, :], 1.0))
+        )
+        per_step_sequence_loss = jnp.where(blanks_per_example[None, :] > 0, per_step_sequence_loss, 0.0)
+        sequence_loss = jnp.sum(step_weights * jnp.mean(per_step_sequence_loss, axis=-1))
     step_predictions = jnp.argmax(effective_step_logits, axis=-1)
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask
     per_step_example_accuracy = jnp.sum(step_correct, axis=-1) / per_example_normalizer[None, :]
@@ -168,7 +176,7 @@ def loss_and_metrics(
     q_loss = jnp.asarray(0.0, dtype=jnp.float32)
     q_selected_logits = effective_step_logits[-1]
     q_selected_step = jnp.full((inputs.shape[0],), effective_step_logits.shape[0] - 1, dtype=jnp.int32)
-    if quality_logits is not None:
+    if quality_logits is not None and q_loss_weight != 0.0:
         if "quality_target_solved" in diagnostics:
             q_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
         else:
@@ -214,18 +222,23 @@ def loss_and_metrics(
     )
     solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
     solved_count = jnp.sum(solved_examples.astype(jnp.float32))
-    q_selected_token_loss = optax.softmax_cross_entropy_with_integer_labels(q_selected_logits, targets)
-    q_selected_ce_loss = jnp.sum(q_selected_token_loss * loss_mask) / normalizer
-    q_selected_predictions = jnp.argmax(q_selected_logits, axis=-1)
-    q_selected_correct = (q_selected_predictions == targets).astype(jnp.float32) * loss_mask
-    q_selected_accuracy = jnp.sum(q_selected_correct) / normalizer
-    q_selected_correct_per_example = jnp.sum(q_selected_correct, axis=-1)
-    q_selected_solved_examples = jnp.where(
-        blanks_per_example > 0,
-        q_selected_correct_per_example == blanks_per_example,
-        True,
-    )
-    q_selected_solved_rate = jnp.mean(q_selected_solved_examples.astype(jnp.float32))
+    if q_loss_weight != 0.0:
+        q_selected_token_loss = optax.softmax_cross_entropy_with_integer_labels(q_selected_logits, targets)
+        q_selected_ce_loss = jnp.sum(q_selected_token_loss * loss_mask) / normalizer
+        q_selected_predictions = jnp.argmax(q_selected_logits, axis=-1)
+        q_selected_correct = (q_selected_predictions == targets).astype(jnp.float32) * loss_mask
+        q_selected_accuracy = jnp.sum(q_selected_correct) / normalizer
+        q_selected_correct_per_example = jnp.sum(q_selected_correct, axis=-1)
+        q_selected_solved_examples = jnp.where(
+            blanks_per_example > 0,
+            q_selected_correct_per_example == blanks_per_example,
+            True,
+        )
+        q_selected_solved_rate = jnp.mean(q_selected_solved_examples.astype(jnp.float32))
+    else:
+        q_selected_ce_loss = per_step_loss[-1]
+        q_selected_accuracy = blank_cell_accuracy
+        q_selected_solved_rate = solved_rate
     oracle_step = jnp.argmin(per_step_example_loss, axis=0)
 
     metrics = {
@@ -245,7 +258,7 @@ def loss_and_metrics(
         "per_step_loss": per_step_loss,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
     }
-    if quality_logits is not None:
+    if quality_logits is not None and q_loss_weight != 0.0:
         metrics["per_step_quality_score"] = jax.nn.sigmoid(jnp.mean(quality_logits, axis=1))
     if "terminal_belief_delta" in diagnostics or terminal_residual_weight != 0.0:
         metrics["terminal_belief_delta"] = diagnostics.get("terminal_belief_delta", terminal_residual)
@@ -395,14 +408,16 @@ def trm_dense_unroll_loss_and_metrics(
     blank_ce_loss = jnp.sum(step_weights * per_step_loss)
     mean_blank_ce_loss = jnp.mean(per_step_loss)
     final_blank_ce_loss = per_step_loss[-1]
-    masked_token_loss = jnp.where(step_loss_mask.astype(bool), token_loss / sequence_loss_temperature, -1e9)
     blanks_per_example = jnp.sum(loss_mask, axis=-1)
-    per_step_sequence_loss = sequence_loss_temperature * (
-        jax.nn.logsumexp(masked_token_loss, axis=-1)
-        - jnp.log(jnp.maximum(blanks_per_example[None, :], 1.0))
-    )
-    per_step_sequence_loss = jnp.where(blanks_per_example[None, :] > 0, per_step_sequence_loss, 0.0)
-    sequence_loss = jnp.sum(step_weights * jnp.mean(per_step_sequence_loss, axis=-1))
+    sequence_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    if sequence_loss_weight != 0.0:
+        masked_token_loss = jnp.where(step_loss_mask.astype(bool), token_loss / sequence_loss_temperature, -1e9)
+        per_step_sequence_loss = sequence_loss_temperature * (
+            jax.nn.logsumexp(masked_token_loss, axis=-1)
+            - jnp.log(jnp.maximum(blanks_per_example[None, :], 1.0))
+        )
+        per_step_sequence_loss = jnp.where(blanks_per_example[None, :] > 0, per_step_sequence_loss, 0.0)
+        sequence_loss = jnp.sum(step_weights * jnp.mean(per_step_sequence_loss, axis=-1))
 
     step_predictions = jnp.argmax(step_logits, axis=-1)
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask
@@ -456,7 +471,7 @@ def trm_dense_unroll_loss_and_metrics(
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
         "unroll_steps": jnp.asarray(step_logits.shape[0], dtype=jnp.float32),
     }
-    if quality_logits is not None:
+    if quality_logits is not None and q_loss_weight != 0.0:
         metrics["per_step_quality_score"] = jax.nn.sigmoid(jnp.mean(quality_logits, axis=1))
     for key in (
         "attention_gate_mean",

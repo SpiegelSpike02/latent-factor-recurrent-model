@@ -542,6 +542,7 @@ class LatentFactorRecurrentModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
         compute_terminal_residual: bool = True,
+        compute_slot_diagnostics: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
         state0, initial_logits, initial_q, condition_mask = self._initial_state(tokens, train=train, dropout_key=dropout_key)
         initial_h = state0[0]
@@ -577,21 +578,27 @@ class LatentFactorRecurrentModel(nnx.Module):
             h_prev = state[0]
             next_state, aux = remat_update_step(state)
             assignment = aux["assignment"]
-            prev = jnp.clip(prev_assignment, self.lfrm.belief_floor, 1.0)
-            curr = jnp.clip(assignment, self.lfrm.belief_floor, 1.0)
-            step_kl = jnp.mean(
-                jnp.sum(
-                    jax.lax.stop_gradient(prev)
-                    * (_safe_log(prev, self.lfrm.belief_floor) - _safe_log(curr, self.lfrm.belief_floor)),
-                    axis=-1,
+            if compute_slot_diagnostics:
+                prev = jnp.clip(prev_assignment, self.lfrm.belief_floor, 1.0)
+                curr = jnp.clip(assignment, self.lfrm.belief_floor, 1.0)
+                step_kl = jnp.mean(
+                    jnp.sum(
+                        jax.lax.stop_gradient(prev)
+                        * (_safe_log(prev, self.lfrm.belief_floor) - _safe_log(curr, self.lfrm.belief_floor)),
+                        axis=-1,
+                    )
                 )
-            )
-            step_kl = jnp.where(step_index > 0, step_kl, 0.0)
+                step_kl = jnp.where(step_index > 0, step_kl, 0.0)
 
-            usage = jnp.clip(aux["slot_usage"], self.lfrm.belief_floor, 1.0)
-            usage = usage / jnp.maximum(jnp.sum(usage, axis=-1, keepdims=True), self.lfrm.belief_floor)
-            usage_entropy = -jnp.sum(usage * _safe_log(usage, self.lfrm.belief_floor), axis=-1)
-            usage_entropy = jnp.mean(usage_entropy / max(math.log(self.lfrm.num_slots), 1e-6))
+                usage = jnp.clip(aux["slot_usage"], self.lfrm.belief_floor, 1.0)
+                usage = usage / jnp.maximum(jnp.sum(usage, axis=-1, keepdims=True), self.lfrm.belief_floor)
+                usage_entropy = -jnp.sum(usage * _safe_log(usage, self.lfrm.belief_floor), axis=-1)
+                usage_entropy = jnp.mean(usage_entropy / max(math.log(self.lfrm.num_slots), 1e-6))
+                slot_diversity_loss = aux["slot_diversity_loss"]
+            else:
+                step_kl = jnp.asarray(0.0, dtype=jnp.float32)
+                usage_entropy = jnp.asarray(0.0, dtype=jnp.float32)
+                slot_diversity_loss = jnp.asarray(0.0, dtype=jnp.float32)
 
             h_delta = jnp.linalg.norm((next_state[0] - h_prev).astype(jnp.float32), axis=-1, keepdims=True)
             hidden_delta = self._blank_mean(h_delta, condition_mask)
@@ -611,7 +618,7 @@ class LatentFactorRecurrentModel(nnx.Module):
                 assignment,
                 consistency_total + step_kl,
                 usage_entropy_total + usage_entropy,
-                slot_diversity_total + aux["slot_diversity_loss"],
+                slot_diversity_total + slot_diversity_loss,
                 hidden_delta,
             ), (step_logits, hidden_delta, quality_logit, cell_attention_metrics)
 
@@ -665,11 +672,12 @@ class LatentFactorRecurrentModel(nnx.Module):
             "h": h_final,
             "l": l_final,
             "slots": slots_final,
-            "slot_consistency_loss": slot_consistency_loss,
-            "slot_usage_entropy": slot_usage_entropy,
-            "slot_usage_loss": 1.0 - slot_usage_entropy,
-            "slot_diversity_loss": slot_diversity_loss,
         }
+        if compute_slot_diagnostics:
+            diagnostics["slot_consistency_loss"] = slot_consistency_loss
+            diagnostics["slot_usage_entropy"] = slot_usage_entropy
+            diagnostics["slot_usage_loss"] = 1.0 - slot_usage_entropy
+            diagnostics["slot_diversity_loss"] = slot_diversity_loss
         if compute_terminal_residual:
             next_state, _ = update_step(final_state)
             q_delta = next_state[3] - q_final
@@ -685,12 +693,14 @@ class LatentFactorRecurrentModel(nnx.Module):
         train: bool,
         dropout_key: Array | None = None,
         compute_terminal_residual: bool = True,
+        compute_slot_diagnostics: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
         return self._run_unroll(
             tokens,
             train=train,
             dropout_key=dropout_key,
             compute_terminal_residual=compute_terminal_residual,
+            compute_slot_diagnostics=compute_slot_diagnostics,
         )
 
     def forward_final_with_diagnostics(
@@ -700,12 +710,14 @@ class LatentFactorRecurrentModel(nnx.Module):
         train: bool,
         dropout_key: Array | None = None,
         compute_terminal_residual: bool = True,
+        compute_slot_diagnostics: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
         return self.forward_all_steps_with_diagnostics(
             tokens,
             train=train,
             dropout_key=dropout_key,
             compute_terminal_residual=compute_terminal_residual,
+            compute_slot_diagnostics=compute_slot_diagnostics,
         )
 
     def forward_all_steps(self, tokens: Array, *, train: bool, dropout_key: Array | None = None) -> Array:

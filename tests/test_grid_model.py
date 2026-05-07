@@ -150,6 +150,7 @@ class LFRMModelTests(unittest.TestCase):
             jax.random.key(1),
             dense_loss_weight=0.0,
             final_loss_weight=1.0,
+            q_loss_weight=0.1,
             terminal_residual_weight=0.1,
             slot_consistency_weight=0.01,
             slot_usage_weight=0.001,
@@ -174,6 +175,27 @@ class LFRMModelTests(unittest.TestCase):
         self.assertEqual(metrics["per_step_hidden_delta"].shape, (2,))
         self.assertEqual(metrics["per_step_quality_score"].shape, (2,))
 
+    def test_zero_q_weight_skips_quality_loss_metrics(self) -> None:
+        model = self._make_lfrm_model(num_steps=2, num_slots=4)
+        batch = {
+            "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
+            "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
+            "given_mask": jnp.asarray([[True, False, True, False, False, True, False, True, False]], dtype=bool),
+            "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
+        }
+        _, metrics = loss_and_metrics(
+            model,
+            batch,
+            True,
+            jax.random.key(1),
+            dense_loss_weight=0.0,
+            final_loss_weight=1.0,
+            q_loss_weight=0.0,
+        )
+        self.assertEqual(float(metrics["q_loss"]), 0.0)
+        self.assertNotIn("per_step_quality_score", metrics)
+        self.assertEqual(float(metrics["q_selected_step"]), 2.0)
+
     def test_zero_weight_training_skips_expensive_diagnostics(self) -> None:
         model = self._make_lfrm_model(num_steps=2, num_slots=4)
         batch = {
@@ -192,6 +214,10 @@ class LFRMModelTests(unittest.TestCase):
         )
         self.assertNotIn("terminal_belief_delta", metrics)
         self.assertNotIn("terminal_belief_mse", metrics)
+        self.assertNotIn("slot_consistency_loss", metrics)
+        self.assertNotIn("slot_usage_entropy", metrics)
+        self.assertNotIn("slot_usage_loss", metrics)
+        self.assertNotIn("slot_diversity_loss", metrics)
 
     def test_jax_defaults_set_gpu_startup_flags_without_overriding_user_values(self) -> None:
         with mock.patch.dict(
