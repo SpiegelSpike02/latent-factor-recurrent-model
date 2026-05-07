@@ -10,7 +10,7 @@ from lfrm.config import ModelConfig, RuntimeConfig
 from .common import Array, compute_dtype, maybe_cast
 
 
-State = tuple[Array, Array, Array, Array]
+State = tuple[Array, Array, Array, Array, Array]
 
 
 def _safe_log(x: Array, floor: float) -> Array:
@@ -19,6 +19,111 @@ def _safe_log(x: Array, floor: float) -> Array:
 
 def _contract(subscripts: str, *operands: Array) -> Array:
     return jnp.einsum(subscripts, *operands, preferred_element_type=jnp.float32)
+
+
+class CellAttentionBlock(nnx.Module):
+    def __init__(self, config: ModelConfig, dtype: jnp.dtype, *, rngs: nnx.Rngs) -> None:
+        lfrm = config.lfrm_config
+        if lfrm.cell_attention_type not in ("standard", "gated_dual"):
+            raise ValueError("LFRM cell_attention_type must be one of: standard, gated_dual")
+        self.config = config
+        self.lfrm = lfrm
+        self.dtype = dtype
+        self.num_heads = lfrm.num_heads
+        self.head_dim = config.d_model // lfrm.num_heads
+        self.norm = nnx.RMSNorm(config.d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+        self.qkv = nnx.Linear(
+            config.d_model,
+            3 * config.d_model,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            rngs=rngs,
+        )
+        self.out = nnx.Linear(
+            config.d_model,
+            config.d_model,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            rngs=rngs,
+        )
+        self.ff_norm = nnx.RMSNorm(config.d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+        self.ff_hidden = nnx.Linear(config.d_model, 2 * config.d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+        self.ff_out = nnx.Linear(2 * config.d_model, config.d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+        self.rel2d_row_bias = nnx.Param(jnp.zeros((lfrm.num_heads, 2 * config.grid_height - 1), dtype=jnp.float32))
+        self.rel2d_col_bias = nnx.Param(jnp.zeros((lfrm.num_heads, 2 * config.grid_width - 1), dtype=jnp.float32))
+
+        rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
+        cols = jnp.arange(config.seq_len, dtype=jnp.int32) % config.grid_width
+        self.rel2d_row_indices = nnx.data(rows[:, None] - rows[None, :] + config.grid_height - 1)
+        self.rel2d_col_indices = nnx.data(cols[:, None] - cols[None, :] + config.grid_width - 1)
+        distance = jnp.abs(rows[:, None] - rows[None, :]) + jnp.abs(cols[:, None] - cols[None, :])
+        self.local_distance = nnx.data(distance.astype(jnp.float32))
+        if lfrm.cell_attention_type == "gated_dual":
+            self.dual_gate = nnx.Linear(
+                config.d_model,
+                lfrm.num_heads,
+                dtype=dtype,
+                param_dtype=jnp.float32,
+                kernel_init=nnx.initializers.zeros,
+                bias_init=nnx.initializers.zeros,
+                rngs=rngs,
+            )
+            self.local_distance_logit = nnx.Param(jnp.zeros((lfrm.num_heads,), dtype=jnp.float32))
+
+    def _split_heads(self, x: Array) -> Array:
+        return x.reshape(*x.shape[:-1], self.num_heads, self.head_dim)
+
+    def _merge_heads(self, x: Array) -> Array:
+        return x.reshape(*x.shape[:-2], self.config.d_model)
+
+    def _attention_bias(self) -> Array:
+        row_bias = jnp.take(self.rel2d_row_bias[...], self.rel2d_row_indices, axis=1)
+        col_bias = jnp.take(self.rel2d_col_bias[...], self.rel2d_col_indices, axis=1)
+        return row_bias + col_bias
+
+    def __call__(self, h: Array) -> tuple[Array, dict[str, Array]]:
+        x = self.norm(maybe_cast(h, self.dtype))
+        qkv = self.qkv(x)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        q = jnp.swapaxes(self._split_heads(q), 1, 2)
+        k = jnp.swapaxes(self._split_heads(k), 1, 2)
+        v = jnp.swapaxes(self._split_heads(v), 1, 2)
+        scores = _contract("bhqd,bhkd->bhqk", q, k).astype(jnp.float32) / math.sqrt(self.head_dim)
+        rel2d_bias = self._attention_bias()[None, :, :, :]
+        global_weights = jax.nn.softmax(scores + rel2d_bias, axis=-1).astype(self.dtype)
+        global_attended = _contract("bhqk,bhkd->bhqd", global_weights, v)
+        diagnostics = {
+            "gate_mean": jnp.asarray(1.0, dtype=jnp.float32),
+            "gate_std": jnp.asarray(0.0, dtype=jnp.float32),
+            "gate_low_saturation": jnp.asarray(0.0, dtype=jnp.float32),
+            "gate_high_saturation": jnp.asarray(0.0, dtype=jnp.float32),
+            "local_distance_scale": jnp.asarray(0.0, dtype=jnp.float32),
+        }
+        if self.lfrm.cell_attention_type == "gated_dual":
+            distance_scale = jax.nn.softplus(self.local_distance_logit).astype(jnp.float32)
+            local_scores = scores + rel2d_bias - distance_scale[None, :, None, None] * self.local_distance[None, None, :, :]
+            local_weights = jax.nn.softmax(local_scores, axis=-1).astype(self.dtype)
+            local_attended = _contract("bhqk,bhkd->bhqd", local_weights, v)
+            gate = jax.nn.sigmoid(self.dual_gate(x)).astype(jnp.float32)
+            diagnostics = {
+                "gate_mean": jnp.mean(gate),
+                "gate_std": jnp.std(gate),
+                "gate_low_saturation": jnp.mean((gate < 0.05).astype(jnp.float32)),
+                "gate_high_saturation": jnp.mean((gate > 0.95).astype(jnp.float32)),
+                "local_distance_scale": jnp.mean(distance_scale),
+            }
+            gate = jnp.swapaxes(gate.astype(self.dtype), 1, 2)[..., None]
+            attended = gate * global_attended + (1.0 - gate) * local_attended
+        else:
+            attended = global_attended
+        message = self._merge_heads(jnp.swapaxes(attended, 1, 2))
+        h = h.astype(jnp.float32) + 0.1 * self.out(maybe_cast(message, self.dtype)).astype(jnp.float32)
+        ff_input = self.ff_norm(maybe_cast(h, self.dtype))
+        ff_hidden = jax.nn.silu(self.ff_hidden(ff_input).astype(jnp.float32))
+        h = h.astype(jnp.float32) + 0.1 * self.ff_out(maybe_cast(ff_hidden, self.dtype)).astype(jnp.float32)
+        return h, diagnostics
 
 
 class LatentFactorRecurrentModel(nnx.Module):
@@ -47,6 +152,12 @@ class LatentFactorRecurrentModel(nnx.Module):
             raise ValueError("LFRM num_slots must be at least 1")
         if lfrm.num_heads < 1:
             raise ValueError("LFRM num_heads must be at least 1")
+        if lfrm.cell_attention_layers < 0:
+            raise ValueError("LFRM cell_attention_layers must be non-negative")
+        if lfrm.cell_attention_type not in ("standard", "gated_dual"):
+            raise ValueError("LFRM cell_attention_type must be one of: standard, gated_dual")
+        if lfrm.l_cycles < 1:
+            raise ValueError("LFRM l_cycles must be at least 1")
         if lfrm.latent_processor_layers < 0:
             raise ValueError("LFRM latent_processor_layers must be non-negative")
         if config.d_model % lfrm.num_heads != 0:
@@ -74,6 +185,9 @@ class LatentFactorRecurrentModel(nnx.Module):
         self.condition_type_embed = nnx.Embed(2, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.slot_embed = nnx.Embed(lfrm.num_slots, d_model, dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
+        self.cell_attention_blocks = nnx.List(
+            [CellAttentionBlock(config, dtype, rngs=rngs) for _ in range(lfrm.cell_attention_layers)]
+        )
 
         local_dim = 2 * d_model + 2
         self.local_depthwise = nnx.Conv(
@@ -180,7 +294,8 @@ class LatentFactorRecurrentModel(nnx.Module):
         if self.lfrm.use_condition_type_embedding:
             base_hidden = base_hidden + condition_type
         base_hidden = self.dropout(base_hidden, deterministic=not train, rngs=dropout_key)
-        hidden = base_hidden.astype(jnp.float32)
+        h_hidden = base_hidden.astype(jnp.float32)
+        l_hidden = base_hidden.astype(jnp.float32)
         slots = self.slot_embed(self.slot_ids)[None, :, :]
         slots = jnp.broadcast_to(
             slots.astype(jnp.float32),
@@ -190,7 +305,7 @@ class LatentFactorRecurrentModel(nnx.Module):
                 self.config.d_model,
             ),
         )
-        return (hidden, logits0, q0, slots), logits0, q0, condition_mask
+        return (h_hidden, l_hidden, logits0, q0, slots), logits0, q0, condition_mask
 
     def _local_mix(self, h: Array) -> Array:
         batch, _, channels = h.shape
@@ -205,6 +320,51 @@ class LatentFactorRecurrentModel(nnx.Module):
         gate = jax.nn.sigmoid(self.local_gate(local_input).astype(jnp.float32))
         candidate = jnp.tanh(self.local_candidate(local_input).astype(jnp.float32))
         return h.astype(jnp.float32) + 0.1 * gate * candidate
+
+    def _cell_attention_update(self, h: Array) -> tuple[Array, dict[str, Array]]:
+        gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
+        gate_std = jnp.asarray(0.0, dtype=jnp.float32)
+        gate_low = jnp.asarray(0.0, dtype=jnp.float32)
+        gate_high = jnp.asarray(0.0, dtype=jnp.float32)
+        distance_scale = jnp.asarray(0.0, dtype=jnp.float32)
+        for block in self.cell_attention_blocks:
+            h, diagnostics = block(h)
+            gate_mean = gate_mean + diagnostics["gate_mean"]
+            gate_std = gate_std + diagnostics["gate_std"]
+            gate_low = gate_low + diagnostics["gate_low_saturation"]
+            gate_high = gate_high + diagnostics["gate_high_saturation"]
+            distance_scale = distance_scale + diagnostics["local_distance_scale"]
+        normalizer = jnp.maximum(jnp.asarray(len(self.cell_attention_blocks), dtype=jnp.float32), 1.0)
+        return h, {
+            "cell_attention_gate_mean": gate_mean / normalizer,
+            "cell_attention_gate_std": gate_std / normalizer,
+            "cell_attention_gate_low_saturation": gate_low / normalizer,
+            "cell_attention_gate_high_saturation": gate_high / normalizer,
+            "cell_attention_local_distance_scale": distance_scale / normalizer,
+        }
+
+    def _l_level_update(self, l: Array, h: Array, q: Array) -> tuple[Array, dict[str, Array]]:
+        gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
+        gate_std = jnp.asarray(0.0, dtype=jnp.float32)
+        gate_low = jnp.asarray(0.0, dtype=jnp.float32)
+        gate_high = jnp.asarray(0.0, dtype=jnp.float32)
+        distance_scale = jnp.asarray(0.0, dtype=jnp.float32)
+        for _ in range(self.lfrm.l_cycles):
+            l = self._local_update(l + 0.1 * h, q)
+            l, diagnostics = self._cell_attention_update(l)
+            gate_mean = gate_mean + diagnostics["cell_attention_gate_mean"]
+            gate_std = gate_std + diagnostics["cell_attention_gate_std"]
+            gate_low = gate_low + diagnostics["cell_attention_gate_low_saturation"]
+            gate_high = gate_high + diagnostics["cell_attention_gate_high_saturation"]
+            distance_scale = distance_scale + diagnostics["cell_attention_local_distance_scale"]
+        normalizer = jnp.asarray(self.lfrm.l_cycles, dtype=jnp.float32)
+        return l, {
+            "cell_attention_gate_mean": gate_mean / normalizer,
+            "cell_attention_gate_std": gate_std / normalizer,
+            "cell_attention_gate_low_saturation": gate_low / normalizer,
+            "cell_attention_gate_high_saturation": gate_high / normalizer,
+            "cell_attention_local_distance_scale": distance_scale / normalizer,
+        }
 
     def _given_channels(self, initial_q: Array, condition_mask: Array) -> Array:
         given = jnp.where(condition_mask[..., None], initial_q, 0.0)
@@ -312,17 +472,18 @@ class LatentFactorRecurrentModel(nnx.Module):
         initial_h: Array,
         condition_mask: Array,
     ) -> tuple[State, dict[str, Array]]:
-        h, logits, q, slots = state
-        h_local = self._local_update(h, q)
+        h, l, logits, q, slots = state
+        l_next, cell_attention_diagnostics = self._l_level_update(l, h, q)
+        h_context = h + 0.5 * l_next
         given_channels = self._given_channels(initial_q, condition_mask)
-        micro_tokens, symbol_context = self._cell_symbol_context(h_local, logits, q, given_channels)
+        micro_tokens, symbol_context = self._cell_symbol_context(h_context, logits, q, given_channels)
         slot_summary, assignment, input_slot_usage, slot_diversity_loss = self._cells_to_slots(micro_tokens, slots)
         slots_next = self._update_slots(slots, slot_summary, input_slot_usage)
         slots_next = self._process_latents(slots_next)
         symbol_message, _ = self._slots_to_cell_symbols(micro_tokens, slots_next)
         cell_message = jnp.sum(symbol_message * q[..., None], axis=-2)
         cell_stats = self._belief_stats(q)
-        cell_input = jnp.concatenate([h, h_local, cell_message, cell_stats], axis=-1)
+        cell_input = jnp.concatenate([h, l_next, cell_message, cell_stats], axis=-1)
         cell_input = self.cell_update_norm(maybe_cast(cell_input, self.dtype))
         cell_gate = jax.nn.sigmoid(self.cell_gate(cell_input).astype(jnp.float32))
         cell_candidate = jnp.tanh(self.cell_candidate(cell_input).astype(jnp.float32))
@@ -342,11 +503,12 @@ class LatentFactorRecurrentModel(nnx.Module):
         logits_next = self._clamp_logits(logits_next, initial_logits, condition_mask)
         q_next = jax.nn.softmax(logits_next / self.lfrm.belief_temperature, axis=-1)
         q_next = jnp.where(condition_mask[..., None], initial_q, q_next)
-        return (h_next, logits_next, q_next, slots_next), {
+        return (h_next, l_next, logits_next, q_next, slots_next), {
             "assignment": assignment,
             "slot_usage": input_slot_usage,
             "slot_diversity_loss": slot_diversity_loss,
             "symbol_context": symbol_context,
+            **cell_attention_diagnostics,
         }
 
     def _digit_logits_to_vocab(self, logits: Array) -> Array:
@@ -433,8 +595,17 @@ class LatentFactorRecurrentModel(nnx.Module):
 
             h_delta = jnp.linalg.norm((next_state[0] - h_prev).astype(jnp.float32), axis=-1, keepdims=True)
             hidden_delta = self._blank_mean(h_delta, condition_mask)
-            step_logits = self._digit_logits_to_vocab(next_state[1])
-            quality_logit = self._quality_logit(next_state[0], next_state[2], next_state[3], condition_mask)
+            step_logits = self._digit_logits_to_vocab(next_state[2])
+            quality_logit = self._quality_logit(next_state[0], next_state[3], next_state[4], condition_mask)
+            cell_attention_metrics = jnp.stack(
+                [
+                    aux["cell_attention_gate_mean"],
+                    aux["cell_attention_gate_std"],
+                    aux["cell_attention_gate_low_saturation"],
+                    aux["cell_attention_gate_high_saturation"],
+                    aux["cell_attention_local_distance_scale"],
+                ]
+            )
             return (
                 next_state,
                 assignment,
@@ -442,7 +613,7 @@ class LatentFactorRecurrentModel(nnx.Module):
                 usage_entropy_total + usage_entropy,
                 slot_diversity_total + aux["slot_diversity_loss"],
                 hidden_delta,
-            ), (step_logits, hidden_delta, quality_logit)
+            ), (step_logits, hidden_delta, quality_logit, cell_attention_metrics)
 
         initial_carry = (
             state0,
@@ -459,12 +630,12 @@ class LatentFactorRecurrentModel(nnx.Module):
             usage_entropy_total,
             slot_diversity_total,
             hidden_delta,
-        ), (step_logits, step_hidden_delta, step_quality_logits) = jax.lax.scan(
+        ), (step_logits, step_hidden_delta, step_quality_logits, step_cell_attention_metrics) = jax.lax.scan(
             scan_step,
             initial_carry,
             jnp.arange(self.config.num_steps),
         )
-        h_final, logits_final, q_final, slots_final = final_state
+        h_final, l_final, logits_final, q_final, slots_final = final_state
         selected_q = q_final
 
         entropy = -jnp.sum(selected_q * _safe_log(selected_q, self.lfrm.belief_floor), axis=-1, keepdims=True)
@@ -484,9 +655,15 @@ class LatentFactorRecurrentModel(nnx.Module):
             "unroll_steps": jnp.asarray(self.config.num_steps, dtype=jnp.float32),
             "belief_entropy": belief_entropy,
             "belief_confidence": belief_confidence,
+            "cell_attention_gate_mean": jnp.mean(step_cell_attention_metrics[:, 0]),
+            "cell_attention_gate_std": jnp.mean(step_cell_attention_metrics[:, 1]),
+            "cell_attention_gate_low_saturation": jnp.mean(step_cell_attention_metrics[:, 2]),
+            "cell_attention_gate_high_saturation": jnp.mean(step_cell_attention_metrics[:, 3]),
+            "cell_attention_local_distance_scale": jnp.mean(step_cell_attention_metrics[:, 4]),
             "digit_logits": logits_final,
             "q": q_final,
             "h": h_final,
+            "l": l_final,
             "slots": slots_final,
             "slot_consistency_loss": slot_consistency_loss,
             "slot_usage_entropy": slot_usage_entropy,
@@ -495,7 +672,7 @@ class LatentFactorRecurrentModel(nnx.Module):
         }
         if compute_terminal_residual:
             next_state, _ = update_step(final_state)
-            q_delta = next_state[2] - q_final
+            q_delta = next_state[3] - q_final
             q_residual_mse = self._blank_mean(jnp.square(q_delta), condition_mask)
             diagnostics["terminal_belief_mse"] = q_residual_mse
             diagnostics["terminal_belief_delta"] = jnp.sqrt(jnp.maximum(q_residual_mse, 0.0))

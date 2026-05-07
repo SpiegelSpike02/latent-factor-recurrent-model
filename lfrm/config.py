@@ -9,6 +9,9 @@ class LFRMConfig:
     belief_dim: int = 0
     num_slots: int = 64
     num_heads: int = 4
+    cell_attention_layers: int = 1
+    cell_attention_type: str = "gated_dual"
+    l_cycles: int = 3
     latent_processor_layers: int = 1
     symbol_context_mode: str = "cell_symbol_tokens"
     slot_readout_mode: str = "cell_symbol_attention"
@@ -88,7 +91,6 @@ class TrainConfig:
     log_every: int = 10
     eval_every: int = 100
     eval_batches: int = 20
-    step_loss_weighting: str = "uniform"
     trm_train_mode: str = "act"
     dense_loss_weight: float = 0.5
     final_loss_weight: float = 0.5

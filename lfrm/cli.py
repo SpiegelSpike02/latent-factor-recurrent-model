@@ -76,7 +76,6 @@ ALLOWED_SECTION_KEYS = {
         "log_every",
         "eval_every",
         "eval_batches",
-        "step_loss_weighting",
         "trm_train_mode",
         "dense_loss_weight",
         "final_loss_weight",
@@ -99,6 +98,9 @@ ALLOWED_NESTED_KEYS = {
         "belief_dim",
         "num_slots",
         "num_heads",
+        "cell_attention_layers",
+        "cell_attention_type",
+        "l_cycles",
         "latent_processor_layers",
         "symbol_context_mode",
         "slot_readout_mode",
@@ -184,12 +186,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-batches", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument(
-        "--step-loss-weighting",
-        choices=("uniform", "linear", "final"),
-        default="uniform",
-        help="How to weight losses from recurrent reasoning steps.",
-    )
-    parser.add_argument(
         "--trm-train-mode",
         choices=("act", "dense_unroll"),
         default="act",
@@ -214,6 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lfrm-belief-dim", type=int, default=0)
     parser.add_argument("--lfrm-num-slots", type=int, default=64)
     parser.add_argument("--lfrm-num-heads", type=int, default=4)
+    parser.add_argument("--lfrm-cell-attention-layers", type=int, default=1)
+    parser.add_argument("--lfrm-cell-attention-type", choices=("standard", "gated_dual"), default="gated_dual")
+    parser.add_argument("--lfrm-l-cycles", type=int, default=3)
     parser.add_argument("--lfrm-latent-processor-layers", type=int, default=1)
     parser.add_argument("--lfrm-symbol-context-mode", choices=("cell_symbol_tokens",), default="cell_symbol_tokens")
     parser.add_argument("--lfrm-slot-readout-mode", choices=("cell_symbol_attention",), default="cell_symbol_attention")
@@ -283,6 +282,9 @@ def build_config(
             belief_dim=args.lfrm_belief_dim,
             num_slots=args.lfrm_num_slots,
             num_heads=args.lfrm_num_heads,
+            cell_attention_layers=args.lfrm_cell_attention_layers,
+            cell_attention_type=args.lfrm_cell_attention_type,
+            l_cycles=args.lfrm_l_cycles,
             latent_processor_layers=args.lfrm_latent_processor_layers,
             symbol_context_mode=args.lfrm_symbol_context_mode,
             slot_readout_mode=args.lfrm_slot_readout_mode,
@@ -328,7 +330,6 @@ def build_config(
         log_every=args.log_every,
         eval_every=args.eval_every,
         eval_batches=args.eval_batches,
-        step_loss_weighting=args.step_loss_weighting,
         trm_train_mode=args.trm_train_mode,
         dense_loss_weight=args.dense_loss_weight,
         final_loss_weight=args.final_loss_weight,
@@ -625,6 +626,11 @@ CORE_SCALAR_METRICS = (
     "unroll_steps",
     "belief_entropy",
     "belief_confidence",
+    "cell_attention_gate_mean",
+    "cell_attention_gate_std",
+    "cell_attention_gate_low_saturation",
+    "cell_attention_gate_high_saturation",
+    "cell_attention_local_distance_scale",
     "target_probability",
     "mean_blank_ce_loss",
     "sequence_loss",
@@ -729,13 +735,13 @@ def main() -> None:
         raise ValueError("dense_loss_weight, final_loss_weight, and sequence_loss_weight must be non-negative")
     if config.train.sequence_loss_temperature <= 0.0:
         raise ValueError("sequence_loss_temperature must be positive")
-    if config.train.trm_train_mode == "dense_unroll" and (
+    if (
         config.train.dense_loss_weight
         + config.train.final_loss_weight
         + config.train.sequence_loss_weight
         <= 0.0
     ):
-        raise ValueError("dense_unroll requires a positive dense, final, or sequence loss weight")
+        raise ValueError("training requires a positive dense, final, or sequence loss weight")
 
     resume_checkpoint: Path | None = None
     resume_step = 0
@@ -765,7 +771,10 @@ def main() -> None:
         eval_step_fn = build_trm_eval_step_runner(config.train.q_loss_weight)
     else:
         train_step_fn = build_train_step_runner(
-            config.train.step_loss_weighting,
+            config.train.dense_loss_weight,
+            config.train.final_loss_weight,
+            config.train.sequence_loss_weight,
+            config.train.sequence_loss_temperature,
             config.train.q_loss_weight,
             config.train.terminal_residual_weight,
             config.train.slot_consistency_weight,
@@ -773,7 +782,10 @@ def main() -> None:
             config.train.slot_diversity_weight,
         )
         eval_step_fn = build_eval_step_runner(
-            config.train.step_loss_weighting,
+            config.train.dense_loss_weight,
+            config.train.final_loss_weight,
+            config.train.sequence_loss_weight,
+            config.train.sequence_loss_temperature,
             config.train.q_loss_weight,
             config.train.terminal_residual_weight,
             config.train.slot_consistency_weight,

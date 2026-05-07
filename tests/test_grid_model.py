@@ -34,7 +34,6 @@ from lfrm.training import (
     load_checkpoint,
     loss_and_metrics,
     save_checkpoint,
-    step_loss_weights,
     trm_dense_unroll_loss_and_metrics,
 )
 
@@ -127,7 +126,7 @@ class LFRMModelTests(unittest.TestCase):
         model = self._make_lfrm_model(num_steps=1, num_slots=4)
         tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
         state, initial_logits, initial_q, condition_mask = model._initial_state(tokens, train=False, dropout_key=None)
-        h, logits, q, slots = state
+        h, _, logits, q, slots = state
         given_channels = model._given_channels(initial_q, condition_mask)
         micro_tokens, symbol_context = model._cell_symbol_context(h, logits, q, given_channels)
         message, routing = model._slots_to_cell_symbols(micro_tokens, slots)
@@ -149,7 +148,8 @@ class LFRMModelTests(unittest.TestCase):
             batch,
             True,
             jax.random.key(1),
-            step_loss_weighting="final",
+            dense_loss_weight=0.0,
+            final_loss_weight=1.0,
             terminal_residual_weight=0.1,
             slot_consistency_weight=0.01,
             slot_usage_weight=0.001,
@@ -186,21 +186,12 @@ class LFRMModelTests(unittest.TestCase):
             batch,
             True,
             jax.random.key(1),
-            step_loss_weighting="final",
+            dense_loss_weight=0.0,
+            final_loss_weight=1.0,
             terminal_residual_weight=0.0,
         )
         self.assertNotIn("terminal_belief_delta", metrics)
         self.assertNotIn("terminal_belief_mse", metrics)
-
-    def test_step_loss_weighting_modes(self) -> None:
-        uniform = step_loss_weights(4, "uniform")
-        linear = step_loss_weights(4, "linear")
-        final = step_loss_weights(4, "final")
-        self.assertTrue(bool(jnp.allclose(uniform, jnp.asarray([0.25, 0.25, 0.25, 0.25]))))
-        self.assertTrue(bool(jnp.allclose(linear, jnp.asarray([0.1, 0.2, 0.3, 0.4]))))
-        self.assertTrue(bool(jnp.allclose(final, jnp.asarray([0.0, 0.0, 0.0, 1.0]))))
-        with self.assertRaisesRegex(ValueError, "Unsupported step_loss_weighting"):
-            step_loss_weights(4, "unknown")
 
     def test_jax_defaults_set_gpu_startup_flags_without_overriding_user_values(self) -> None:
         with mock.patch.dict(
@@ -232,7 +223,8 @@ class LFRMModelTests(unittest.TestCase):
                 batch,
                 True,
                 jax.random.key(1),
-                step_loss_weighting="final",
+                dense_loss_weight=0.0,
+                final_loss_weight=1.0,
                 terminal_residual_weight=0.1,
                 slot_consistency_weight=0.01,
                 slot_usage_weight=0.001,

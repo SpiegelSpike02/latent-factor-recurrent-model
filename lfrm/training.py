@@ -20,17 +20,6 @@ from lfrm.models import LatentFactorRecurrentModel, TinyRecursiveModel
 GridReasoningModel = LatentFactorRecurrentModel | TinyRecursiveModel
 
 
-def step_loss_weights(num_steps: int, weighting: str) -> jax.Array:
-    if weighting == "uniform":
-        return jnp.full((num_steps,), 1.0 / num_steps, dtype=jnp.float32)
-    if weighting == "linear":
-        weights = jnp.arange(1, num_steps + 1, dtype=jnp.float32)
-        return weights / jnp.sum(weights)
-    if weighting == "final":
-        return jax.nn.one_hot(num_steps - 1, num_steps, dtype=jnp.float32)
-    raise ValueError(f"Unsupported step_loss_weighting: {weighting}")
-
-
 def build_optimizer(config: ExperimentConfig) -> optax.GradientTransformation:
     optimizer_steps = max(1, config.train.max_steps)
     warmup_steps = max(1, config.optimizer.warmup_steps)
@@ -110,7 +99,10 @@ def loss_and_metrics(
     batch: dict[str, jax.Array],
     train: bool,
     dropout_key: jax.Array | None,
-    step_loss_weighting: str = "uniform",
+    dense_loss_weight: float = 0.5,
+    final_loss_weight: float = 0.5,
+    sequence_loss_weight: float = 0.0,
+    sequence_loss_temperature: float = 0.5,
     q_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
     slot_consistency_weight: float = 0.0,
@@ -125,7 +117,6 @@ def loss_and_metrics(
 
     model_key = dropout_key
 
-    use_final_forward = step_loss_weighting == "final" and hasattr(model, "forward_final_with_diagnostics")
     compute_terminal_residual = (not train) or terminal_residual_weight != 0.0
     model_forward_kwargs = {}
     if isinstance(model, (LatentFactorRecurrentModel, TinyRecursiveModel)):
@@ -134,20 +125,12 @@ def loss_and_metrics(
         }
     if isinstance(model, TinyRecursiveModel):
         model_forward_kwargs["puzzle_identifiers"] = batch["puzzle_identifiers"]
-    if use_final_forward:
-        step_logits, diagnostics = model.forward_final_with_diagnostics(
-            inputs,
-            train=train,
-            dropout_key=model_key,
-            **model_forward_kwargs,
-        )
-    else:
-        step_logits, diagnostics = model.forward_all_steps_with_diagnostics(
-            inputs,
-            train=train,
-            dropout_key=model_key,
-            **model_forward_kwargs,
-        )
+    step_logits, diagnostics = model.forward_all_steps_with_diagnostics(
+        inputs,
+        train=train,
+        dropout_key=model_key,
+        **model_forward_kwargs,
+    )
     effective_step_logits = step_logits
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = loss_mask[None, :, :]
@@ -156,12 +139,25 @@ def loss_and_metrics(
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
     per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
 
-    step_weights = step_loss_weights(effective_step_logits.shape[0], step_loss_weighting)
+    num_steps = effective_step_logits.shape[0]
+    step_weights = jnp.full(
+        (num_steps,),
+        dense_loss_weight / jnp.asarray(num_steps, dtype=jnp.float32),
+        dtype=jnp.float32,
+    )
+    step_weights = step_weights.at[-1].add(final_loss_weight)
     blank_ce_loss = jnp.sum(step_weights * per_step_loss)
+    masked_token_loss = jnp.where(step_loss_mask.astype(bool), token_loss / sequence_loss_temperature, -1e9)
+    blanks_per_example = jnp.sum(loss_mask, axis=-1)
+    per_step_sequence_loss = sequence_loss_temperature * (
+        jax.nn.logsumexp(masked_token_loss, axis=-1)
+        - jnp.log(jnp.maximum(blanks_per_example[None, :], 1.0))
+    )
+    per_step_sequence_loss = jnp.where(blanks_per_example[None, :] > 0, per_step_sequence_loss, 0.0)
+    sequence_loss = jnp.sum(step_weights * jnp.mean(per_step_sequence_loss, axis=-1))
     step_predictions = jnp.argmax(effective_step_logits, axis=-1)
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask
     per_step_example_accuracy = jnp.sum(step_correct, axis=-1) / per_example_normalizer[None, :]
-    blanks_per_example = jnp.sum(loss_mask, axis=-1)
     step_correct_per_example = jnp.sum(step_correct, axis=-1)
     per_step_example_solved = jnp.where(
         blanks_per_example[None, :] > 0,
@@ -194,6 +190,7 @@ def loss_and_metrics(
     slot_diversity_loss = diagnostics.get("slot_diversity_loss", jnp.asarray(0.0, dtype=jnp.float32))
     loss = (
         blank_ce_loss
+        + sequence_loss_weight * sequence_loss
         + q_loss_weight * q_loss
         + terminal_residual_weight * terminal_residual
         + slot_consistency_weight * slot_consistency_loss
@@ -234,6 +231,7 @@ def loss_and_metrics(
     metrics = {
         "loss": loss,
         "blank_ce_loss": blank_ce_loss,
+        "sequence_loss": sequence_loss,
         "q_loss": q_loss,
         "final_blank_ce_loss": per_step_loss[-1],
         "target_probability": target_probability,
@@ -263,6 +261,11 @@ def loss_and_metrics(
         "terminal_belief_mse",
         "belief_entropy",
         "belief_confidence",
+        "cell_attention_gate_mean",
+        "cell_attention_gate_std",
+        "cell_attention_gate_low_saturation",
+        "cell_attention_gate_high_saturation",
+        "cell_attention_local_distance_scale",
         "q_loss",
         "q_selected_blank_ce_loss",
         "q_selected_blank_cell_accuracy",
@@ -572,7 +575,10 @@ def trm_eval_loss_and_metrics(
 
 
 def build_train_step_runner(
-    step_loss_weighting: str = "uniform",
+    dense_loss_weight: float = 0.5,
+    final_loss_weight: float = 0.5,
+    sequence_loss_weight: float = 0.0,
+    sequence_loss_temperature: float = 0.5,
     q_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
     slot_consistency_weight: float = 0.0,
@@ -591,7 +597,10 @@ def build_train_step_runner(
                 batch,
                 train,
                 dropout_key,
-                step_loss_weighting,
+                dense_loss_weight,
+                final_loss_weight,
+                sequence_loss_weight,
+                sequence_loss_temperature,
                 q_loss_weight,
                 terminal_residual_weight,
                 slot_consistency_weight,
@@ -678,7 +687,10 @@ def build_trm_dense_unroll_train_step_runner(
 
 
 def build_eval_step_runner(
-    step_loss_weighting: str = "uniform",
+    dense_loss_weight: float = 0.5,
+    final_loss_weight: float = 0.5,
+    sequence_loss_weight: float = 0.0,
+    sequence_loss_temperature: float = 0.5,
     q_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
     slot_consistency_weight: float = 0.0,
@@ -694,7 +706,10 @@ def build_eval_step_runner(
             batch,
             False,
             None,
-            step_loss_weighting,
+            dense_loss_weight,
+            final_loss_weight,
+            sequence_loss_weight,
+            sequence_loss_temperature,
             q_loss_weight,
             terminal_residual_weight,
             slot_consistency_weight,
