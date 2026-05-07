@@ -929,11 +929,12 @@ def main() -> None:
                             f"{prefix}/loss": eval_metrics["loss"],
                             f"{prefix}/blank_ce_loss": eval_metrics["blank_ce_loss"],
                             f"{prefix}/final_blank_ce_loss": eval_metrics["final_blank_ce_loss"],
-                            f"{prefix}/final_blank_cell_accuracy": eval_metrics["final_blank_cell_accuracy"],
-                            f"{prefix}/final_solved_rate": eval_metrics["final_solved_rate"],
                             f"{prefix}/blank_cell_accuracy": eval_metrics["blank_cell_accuracy"],
                             f"{prefix}/solved_rate": eval_metrics["solved_rate"],
                         }
+                        for metric_name in ("final_blank_cell_accuracy", "final_solved_rate"):
+                            if metric_name in eval_metrics:
+                                eval_log[f"{prefix}/{metric_name}"] = eval_metrics[metric_name]
                         eval_log.update(optional_scalar_log(prefix, eval_metrics, scalar_metrics))
                         eval_log.update(flatten_step_metrics(f"{prefix}/loss_by_step", eval_metrics["per_step_loss"]))
                         for metric_name, log_prefix in (
@@ -969,7 +970,7 @@ def main() -> None:
                         f"ce={eval_metrics['blank_ce_loss']:.4f} "
                         f"final_ce={eval_metrics['final_blank_ce_loss']:.4f} "
                         f"blank_acc={eval_metrics['blank_cell_accuracy']:.4f} "
-                        f"final_acc={eval_metrics['final_blank_cell_accuracy']:.4f} "
+                        f"final_acc={eval_metrics.get('final_blank_cell_accuracy', eval_metrics['blank_cell_accuracy']):.4f} "
                         f"solved={eval_metrics['solved_rate']:.4f}"
                         f"{' ' + optional_summary if optional_summary else ''}"
                     )
