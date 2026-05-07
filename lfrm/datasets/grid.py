@@ -44,11 +44,11 @@ class GridDataset:
 def load_dataset(*, dataset_path: str) -> GridDataset:
     root = Path(dataset_path)
     train_dir = root / "train"
-    eval_dir = root / "eval"
+    eval_dir = root / "test"
     if not train_dir.is_dir():
         raise FileNotFoundError(f"Missing train split: {train_dir}")
     if not eval_dir.is_dir():
-        raise FileNotFoundError(f"Missing eval split: {eval_dir}")
+        raise FileNotFoundError(f"Missing test split: {eval_dir}")
 
     train_metadata = json.loads((train_dir / "dataset.json").read_text())
     eval_metadata = json.loads((eval_dir / "dataset.json").read_text())
@@ -59,7 +59,7 @@ def load_dataset(*, dataset_path: str) -> GridDataset:
     shared_keys = ("seq_len", "vocab_size", "num_puzzle_identifiers", "grid_height", "grid_width", "task_type")
     for key in shared_keys:
         if train_metadata[key] != eval_metadata[key]:
-            raise ValueError(f"Train/eval metadata mismatch for '{key}'")
+            raise ValueError(f"Train/test metadata mismatch for '{key}'")
 
     train_inputs = _load_split_array(train_dir, "inputs")
     train_labels = _load_split_array(train_dir, "labels")
@@ -127,13 +127,15 @@ def sample_batch(
         puzzle_identifiers = dataset.train_puzzle_identifiers
         puzzle_indices = dataset.train_puzzle_indices
         group_indices = dataset.train_group_indices
-    else:
+    elif split == "test":
         inputs = dataset.eval_inputs
         labels = dataset.eval_labels
         given_mask = dataset.eval_given_mask
         puzzle_identifiers = dataset.eval_puzzle_identifiers
         puzzle_indices = dataset.eval_puzzle_indices
         group_indices = dataset.eval_group_indices
+    else:
+        raise ValueError("split must be 'train' or 'test'")
 
     total = inputs.shape[0]
     if total == 0:

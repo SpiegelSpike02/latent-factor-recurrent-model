@@ -266,6 +266,11 @@ def loss_and_metrics(
         "cell_attention_gate_low_saturation",
         "cell_attention_gate_high_saturation",
         "cell_attention_local_distance_scale",
+        "attention_gate_mean",
+        "attention_gate_std",
+        "attention_gate_low_saturation",
+        "attention_gate_high_saturation",
+        "attention_local_distance_scale",
         "q_loss",
         "q_selected_blank_ce_loss",
         "q_selected_blank_cell_accuracy",
@@ -340,6 +345,11 @@ def trm_act_loss_and_metrics(
         "act_step": diagnostics["act_step"],
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
+        "attention_gate_mean": diagnostics["attention_gate_mean"],
+        "attention_gate_std": diagnostics["attention_gate_std"],
+        "attention_gate_low_saturation": diagnostics["attention_gate_low_saturation"],
+        "attention_gate_high_saturation": diagnostics["attention_gate_high_saturation"],
+        "attention_local_distance_scale": diagnostics["attention_local_distance_scale"],
     }
     return loss, (metrics, new_carry)
 
@@ -448,6 +458,15 @@ def trm_dense_unroll_loss_and_metrics(
     }
     if quality_logits is not None:
         metrics["per_step_quality_score"] = jax.nn.sigmoid(jnp.mean(quality_logits, axis=1))
+    for key in (
+        "attention_gate_mean",
+        "attention_gate_std",
+        "attention_gate_low_saturation",
+        "attention_gate_high_saturation",
+        "attention_local_distance_scale",
+    ):
+        if key in diagnostics:
+            metrics[key] = diagnostics[key]
     return loss, metrics
 
 
@@ -571,6 +590,15 @@ def trm_eval_loss_and_metrics(
         "per_step_quality_score": jax.nn.sigmoid(jnp.mean(quality_logits, axis=1)),
         "unroll_steps": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
     }
+    for key in (
+        "attention_gate_mean",
+        "attention_gate_std",
+        "attention_gate_low_saturation",
+        "attention_gate_high_saturation",
+        "attention_local_distance_scale",
+    ):
+        if key in diagnostics:
+            metrics[key] = diagnostics[key]
     return loss, metrics
 
 

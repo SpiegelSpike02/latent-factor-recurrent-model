@@ -6,7 +6,7 @@ model_type = "lfrm"
 seq_len = 81
 grid_height = 9
 grid_width = 9
-d_model = 320
+d_model = 384
 num_steps = 32
 dropout_rate = 0.05
 

@@ -25,8 +25,8 @@ A short architecture overview lives in [docs/architecture.md](docs/architecture.
 
 The implementation lives under the `lfrm` package:
 
-- `lfrm.models`: the LFRM model
-- `lfrm.datasets`: generic grid dataset loading plus Sudoku dataset building
+- `lfrm.models`: LFRM and TRM models
+- `lfrm.datasets`: generic grid dataset loading plus Sudoku/Maze dataset building
 - `lfrm.training`: optimizer, loss, metrics, and checkpoint helpers
 - `lfrm.scripts`: console-script entry points
 
@@ -44,6 +44,12 @@ Build an offline Sudoku dataset from local `train.csv` / `test.csv` files:
 uv run lfrm-build-sudoku --source-csv-dir path/to/sudoku_csvs --output-dir data/sudoku-extreme-1k-aug-1000 --subsample-size 1000 --num-aug 1000
 ```
 
+Build an offline Maze dataset in the HRM/TRM format:
+
+```bash
+uv run lfrm-build-maze --output-dir data/maze-30x30-hard-1k
+```
+
 Train LFRM:
 
 ```bash
@@ -56,12 +62,12 @@ CLI flags override config values:
 uv run lfrm-train --config configs/sudoku_lfrm.toml --learning-rate 1e-4 --batch-size 16
 ```
 
-For recurrent supervision, `--step-loss-weighting` can be `final`, `uniform`,
-or `linear`. `uniform` and `linear` apply token-level CE across all recurrent
-steps, which is useful for dense supervision and diagnosing refinement dynamics.
-`--q-loss-weight` trains a task-agnostic per-step quality head from target
-token accuracy, and evaluation reports both the final step and the step selected
-by that head.
+Recurrent supervision is controlled by `dense_loss_weight`,
+`final_loss_weight`, and `sequence_loss_weight`. Dense loss applies token-level
+CE across all recurrent steps, final loss emphasizes the last step, and sequence
+loss adds a set-style blank-token objective. `q_loss_weight` trains a
+task-agnostic per-step quality head from target token accuracy, and evaluation
+reports both the final step and the step selected by that head.
 
 The package also applies project-level JAX defaults before JAX initializes:
 Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, GPU preallocation
@@ -71,8 +77,8 @@ allocation. Values already set in the shell are preserved.
 
 ## Notes
 
-- Sudoku data is built offline and sampled at runtime.
-- The builder writes `given_mask.npy`; training derives blank-cell supervision
-  by inverting it.
+- Datasets are built offline with `train/` and `test/` splits and sampled at runtime.
+- Sudoku derives blank-cell supervision from token `1`; Maze writes an explicit
+  all-False `given_mask.npy` so every output token is supervised.
 - Old UT/RT checkpoints and configs are not compatible with the current
   LFRM-only code path.

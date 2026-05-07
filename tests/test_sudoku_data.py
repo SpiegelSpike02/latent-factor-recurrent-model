@@ -91,7 +91,7 @@ class SudokuDataTests(unittest.TestCase):
                 num_aug=1,
                 seed=0,
             )
-            for split in ("train", "eval"):
+            for split in ("train", "test"):
                 split_dir = output_dir / split
                 (split_dir / "all__puzzle_identifiers.npy").unlink()
                 metadata_path = split_dir / "dataset.json"

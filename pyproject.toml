@@ -21,6 +21,7 @@ dependencies = [
 [project.scripts]
 lfrm-train = "lfrm.cli:main"
 lfrm-build-sudoku = "lfrm.scripts.build_sudoku_dataset:main"
+lfrm-build-maze = "lfrm.scripts.build_maze_dataset:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["lfrm"]

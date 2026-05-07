@@ -498,6 +498,9 @@ class LFRMModelTests(unittest.TestCase):
         self.assertEqual(attention.local_distance_logit[...].shape, (3,))
         self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
         self.assertIn("l_logits", diagnostics)
+        self.assertIn("attention_gate_mean", diagnostics)
+        self.assertIn("attention_local_distance_scale", diagnostics)
+        self.assertTrue(bool(jnp.isfinite(diagnostics["attention_gate_mean"])))
 
     def test_trm_local_mixing_requires_odd_kernel(self) -> None:
         with self.assertRaisesRegex(ValueError, "local_mixing_kernel"):

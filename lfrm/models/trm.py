@@ -182,7 +182,7 @@ class Attention(nnx.Module):
         rope_cos: Array | None,
         rope_sin: Array | None,
         attention_bias: Array | None,
-    ) -> Array:
+    ) -> tuple[Array, dict[str, Array]]:
         batch_size, seq_len, d_model = x.shape
         qkv = self.qkv(x)
         q, k, v = jnp.split(qkv, 3, axis=-1)
@@ -215,17 +215,30 @@ class Attention(nnx.Module):
                 v,
                 preferred_element_type=jnp.float32,
             )
-            gate = jax.nn.sigmoid(self.dual_gate(x)).astype(x.dtype)
-            gate = jnp.swapaxes(gate, 1, 2)[..., None]
+            gate = jax.nn.sigmoid(self.dual_gate(x)).astype(jnp.float32)
+            diagnostics = {
+                "attention_gate_mean": jnp.mean(gate),
+                "attention_gate_std": jnp.std(gate),
+                "attention_gate_low_saturation": jnp.mean((gate < 0.05).astype(jnp.float32)),
+                "attention_gate_high_saturation": jnp.mean((gate > 0.95).astype(jnp.float32)),
+                "attention_local_distance_scale": jnp.mean(jax.nn.softplus(self.local_distance_logit)),
+            }
+            gate = jnp.swapaxes(gate.astype(x.dtype), 1, 2)[..., None]
             attended = gate * global_attended + (1.0 - gate) * local_attended
             attended = jnp.swapaxes(attended, 1, 2).reshape(batch_size, seq_len, d_model)
-            return self.out(attended)
+            return self.out(attended), diagnostics
         if attention_bias is not None:
             scores = scores + attention_bias[None, :, :, :].astype(jnp.float32)
         weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(x.dtype)
         attended = jnp.einsum("bhqk,bhkd->bhqd", weights, v, preferred_element_type=jnp.float32)
         attended = jnp.swapaxes(attended, 1, 2).reshape(batch_size, seq_len, d_model)
-        return self.out(attended)
+        return self.out(attended), {
+            "attention_gate_mean": jnp.asarray(1.0, dtype=jnp.float32),
+            "attention_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_gate_low_saturation": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_gate_high_saturation": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_local_distance_scale": jnp.asarray(0.0, dtype=jnp.float32),
+        }
 
 
 def _rotate_half(x: Array) -> Array:
@@ -271,14 +284,22 @@ class TRMBlock(nnx.Module):
         rope_cos: Array | None,
         rope_sin: Array | None,
         attention_bias: Array | None,
-    ) -> Array:
+    ) -> tuple[Array, dict[str, Array]]:
+        diagnostics = {
+            "attention_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_gate_low_saturation": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_gate_high_saturation": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_local_distance_scale": jnp.asarray(0.0, dtype=jnp.float32),
+        }
         if self.trm.mlp_t:
             mixed = jnp.swapaxes(hidden_states, 1, 2)
             mixed = _rms_norm(mixed + self.token_mlp(mixed), self.trm.rms_norm_eps)
             hidden_states = jnp.swapaxes(mixed, 1, 2)
         else:
+            attention_out, diagnostics = self.attention(hidden_states, rope_cos, rope_sin, attention_bias)
             hidden_states = _rms_norm(
-                hidden_states + self.attention(hidden_states, rope_cos, rope_sin, attention_bias),
+                hidden_states + attention_out,
                 self.trm.rms_norm_eps,
             )
         if self.trm.local_mixing:
@@ -290,7 +311,7 @@ class TRMBlock(nnx.Module):
             hidden_states + self.channel_mlp(hidden_states),
             self.trm.rms_norm_eps,
         )
-        return hidden_states
+        return hidden_states, diagnostics
 
 
 class TinyRecursiveModel(nnx.Module):
@@ -582,32 +603,61 @@ class TinyRecursiveModel(nnx.Module):
             ),
         }
 
-    def _l_level(self, hidden_states: Array, input_injection: Array) -> Array:
+    def _empty_attention_diagnostics(self) -> dict[str, Array]:
+        return {
+            "attention_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_gate_low_saturation": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_gate_high_saturation": jnp.asarray(0.0, dtype=jnp.float32),
+            "attention_local_distance_scale": jnp.asarray(0.0, dtype=jnp.float32),
+        }
+
+    @staticmethod
+    def _add_attention_diagnostics(lhs: dict[str, Array], rhs: dict[str, Array]) -> dict[str, Array]:
+        return {key: lhs[key] + rhs[key] for key in lhs}
+
+    @staticmethod
+    def _scale_attention_diagnostics(diagnostics: dict[str, Array], normalizer: float | Array) -> dict[str, Array]:
+        return {key: value / normalizer for key, value in diagnostics.items()}
+
+    def _l_level(self, hidden_states: Array, input_injection: Array) -> tuple[Array, dict[str, Array]]:
         hidden_states = hidden_states + input_injection
         attention_bias = self._attention_bias()
+        diagnostics = self._empty_attention_diagnostics()
         for block in self.blocks:
-            hidden_states = block(
+            hidden_states, block_diagnostics = block(
                 maybe_cast(hidden_states, self.dtype),
                 self.rope_cos,
                 self.rope_sin,
                 attention_bias,
             )
-        return hidden_states
+            diagnostics = self._add_attention_diagnostics(diagnostics, block_diagnostics)
+        normalizer = jnp.maximum(jnp.asarray(len(self.blocks), dtype=jnp.float32), 1.0)
+        return hidden_states, self._scale_attention_diagnostics(diagnostics, normalizer)
 
-    def _h_cycle(self, state: State, input_embeddings: Array) -> State:
+    def _h_cycle(self, state: State, input_embeddings: Array) -> tuple[State, dict[str, Array]]:
         z_h, z_l = state
+        diagnostics = self._empty_attention_diagnostics()
         for _ in range(self.trm.l_cycles):
-            z_l = self._l_level(z_l, z_h + input_embeddings)
-            z_h = self._l_level(z_h, z_l)
-        return z_h, z_l
+            z_l, l_diagnostics = self._l_level(z_l, z_h + input_embeddings)
+            z_h, h_diagnostics = self._l_level(z_h, z_l)
+            diagnostics = self._add_attention_diagnostics(diagnostics, l_diagnostics)
+            diagnostics = self._add_attention_diagnostics(diagnostics, h_diagnostics)
+        normalizer = jnp.asarray(2 * self.trm.l_cycles, dtype=jnp.float32)
+        return (z_h, z_l), self._scale_attention_diagnostics(diagnostics, normalizer)
 
-    def _act_step(self, state: State, input_embeddings: Array) -> State:
+    def _act_step(self, state: State, input_embeddings: Array) -> tuple[State, dict[str, Array]]:
         z_h, z_l = state
+        diagnostics = self._empty_attention_diagnostics()
         for _ in range(self.trm.h_cycles - 1):
-            z_h, z_l = self._h_cycle((z_h, z_l), input_embeddings)
+            (z_h, z_l), cycle_diagnostics = self._h_cycle((z_h, z_l), input_embeddings)
+            diagnostics = self._add_attention_diagnostics(diagnostics, cycle_diagnostics)
             z_h = jax.lax.stop_gradient(z_h)
             z_l = jax.lax.stop_gradient(z_l)
-        return self._h_cycle((z_h, z_l), input_embeddings)
+        (z_h, z_l), cycle_diagnostics = self._h_cycle((z_h, z_l), input_embeddings)
+        diagnostics = self._add_attention_diagnostics(diagnostics, cycle_diagnostics)
+        normalizer = jnp.asarray(self.trm.h_cycles, dtype=jnp.float32)
+        return (z_h, z_l), self._scale_attention_diagnostics(diagnostics, normalizer)
 
     def _blank_mean(self, values: Array, condition_mask: Array) -> Array:
         mask = (~condition_mask).astype(jnp.float32)[..., None]
@@ -647,7 +697,7 @@ class TinyRecursiveModel(nnx.Module):
         state = self._reset_carry_state(carry)
         z_h_prev = state[0][:, self.prefix_len :]
         z_l_prev = state[1][:, self.prefix_len :]
-        next_state = self._act_step(state, input_embeddings)
+        next_state, attention_diagnostics = self._act_step(state, input_embeddings)
         z_h_next, z_l_next = next_state
         z_h_data = z_h_next[:, self.prefix_len :]
         z_l_data = z_l_next[:, self.prefix_len :]
@@ -698,6 +748,7 @@ class TinyRecursiveModel(nnx.Module):
             "act_step": jnp.mean(new_steps.astype(jnp.float32)),
             "halted_rate": jnp.mean(halted.astype(jnp.float32)),
             "reset_rate": jnp.mean(carry["halted"].astype(jnp.float32)),
+            **attention_diagnostics,
         }
         return new_carry, logits, diagnostics
 
@@ -722,7 +773,7 @@ class TinyRecursiveModel(nnx.Module):
 
         def scan_step(state: State, _step_index):
             z_h_prev, z_l_prev = state
-            next_state = self._act_step(state, input_embeddings)
+            next_state, attention_diagnostics = self._act_step(state, input_embeddings)
             z_h_next, z_l_next = next_state
             z_h_data = z_h_next[:, self.prefix_len :]
             z_h_prev_data = z_h_prev[:, self.prefix_len :]
@@ -747,6 +798,15 @@ class TinyRecursiveModel(nnx.Module):
                 low_hidden_delta,
                 q_halt_logits,
                 q_continue_logits,
+                jnp.stack(
+                    [
+                        attention_diagnostics["attention_gate_mean"],
+                        attention_diagnostics["attention_gate_std"],
+                        attention_diagnostics["attention_gate_low_saturation"],
+                        attention_diagnostics["attention_gate_high_saturation"],
+                        attention_diagnostics["attention_local_distance_scale"],
+                    ]
+                ),
             )
 
         final_state, (
@@ -756,6 +816,7 @@ class TinyRecursiveModel(nnx.Module):
             low_step_hidden_delta,
             q_halt_logits,
             q_continue_logits,
+            step_attention_diagnostics,
         ) = jax.lax.scan(
             scan_step,
             state0,
@@ -769,6 +830,11 @@ class TinyRecursiveModel(nnx.Module):
             "unroll_steps": jnp.asarray(self.config.num_steps, dtype=jnp.float32),
             "h": final_state[0][:, self.prefix_len :],
             "l": final_state[1][:, self.prefix_len :],
+            "attention_gate_mean": jnp.mean(step_attention_diagnostics[:, 0]),
+            "attention_gate_std": jnp.mean(step_attention_diagnostics[:, 1]),
+            "attention_gate_low_saturation": jnp.mean(step_attention_diagnostics[:, 2]),
+            "attention_gate_high_saturation": jnp.mean(step_attention_diagnostics[:, 3]),
+            "attention_local_distance_scale": jnp.mean(step_attention_diagnostics[:, 4]),
         }
         if include_layer_diagnostics:
             diagnostics["h_hidden_delta_mean"] = step_hidden_delta
@@ -776,7 +842,7 @@ class TinyRecursiveModel(nnx.Module):
             diagnostics["l_logits"] = low_step_logits
         if compute_terminal_residual:
             final_logits = step_logits[-1]
-            next_state = self._act_step(final_state, input_embeddings)
+            next_state, _ = self._act_step(final_state, input_embeddings)
             next_logits = self._logits_from_state(next_state[0][:, self.prefix_len :])
             probs = jax.nn.softmax(final_logits, axis=-1)
             next_probs = jax.nn.softmax(next_logits, axis=-1)
