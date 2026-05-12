@@ -171,19 +171,8 @@ def dataset_overview(dataset: GridDataset) -> dict[str, Any]:
     }
 
 
-def _official_path(split_dir: Path, name: str) -> Path:
-    return split_dir / f"all__{name}.npy"
-
-
-def _plain_path(split_dir: Path, name: str) -> Path:
-    return split_dir / f"{name}.npy"
-
-
 def _split_path(split_dir: Path, name: str) -> Path:
-    official = _official_path(split_dir, name)
-    if official.is_file():
-        return official
-    return _plain_path(split_dir, name)
+    return split_dir / f"{name}.npy"
 
 
 def _load_split_array(split_dir: Path, name: str) -> np.ndarray:

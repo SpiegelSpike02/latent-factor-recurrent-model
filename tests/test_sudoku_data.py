@@ -56,11 +56,11 @@ class SudokuDataTests(unittest.TestCase):
             self.assertEqual(dataset.train_puzzle_indices.tolist(), [0, 1, 2])
             self.assertEqual(dataset.train_group_indices.tolist(), [0, 2])
             self.assertTrue(np.all(dataset.train_puzzle_identifiers == 0))
-            self.assertTrue((output_dir / "train" / "all__inputs.npy").is_file())
-            self.assertTrue((output_dir / "train" / "all__labels.npy").is_file())
-            self.assertTrue((output_dir / "train" / "all__puzzle_identifiers.npy").is_file())
-            self.assertTrue((output_dir / "train" / "all__puzzle_indices.npy").is_file())
-            self.assertTrue((output_dir / "train" / "all__group_indices.npy").is_file())
+            self.assertTrue((output_dir / "train" / "inputs.npy").is_file())
+            self.assertTrue((output_dir / "train" / "labels.npy").is_file())
+            self.assertTrue((output_dir / "train" / "puzzle_identifiers.npy").is_file())
+            self.assertTrue((output_dir / "train" / "puzzle_indices.npy").is_file())
+            self.assertTrue((output_dir / "train" / "group_indices.npy").is_file())
             self.assertFalse((output_dir / "train" / "given_mask.npy").exists())
 
             rng = np.random.default_rng(0)
@@ -93,7 +93,7 @@ class SudokuDataTests(unittest.TestCase):
             )
             for split in ("train", "test"):
                 split_dir = output_dir / split
-                (split_dir / "all__puzzle_identifiers.npy").unlink()
+                (split_dir / "puzzle_identifiers.npy").unlink()
                 metadata_path = split_dir / "dataset.json"
                 metadata = json.loads(metadata_path.read_text())
                 metadata.pop("num_puzzle_identifiers")

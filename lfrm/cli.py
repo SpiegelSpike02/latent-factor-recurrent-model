@@ -16,7 +16,7 @@ from lfrm.config import (
     DataConfig,
     EMAConfig,
     ExperimentConfig,
-    LFRMConfig,
+    BRCSudokuConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
@@ -43,7 +43,7 @@ from lfrm.training import (
 
 CONFIG_SECTIONS = ("data", "model", "optimizer", "train", "runtime", "wandb")
 NESTED_SECTIONS = {
-    "model": {"lfrm", "trm"},
+    "model": {"trm", "brc"},
     "train": {"ema"},
 }
 ALLOWED_SECTION_KEYS = {
@@ -56,8 +56,8 @@ ALLOWED_SECTION_KEYS = {
         "d_model",
         "num_steps",
         "dropout_rate",
-        "lfrm",
         "trm",
+        "brc",
     },
     "optimizer": {
         "learning_rate",
@@ -77,15 +77,8 @@ ALLOWED_SECTION_KEYS = {
         "eval_every",
         "eval_batches",
         "trm_train_mode",
-        "dense_loss_weight",
-        "final_loss_weight",
-        "sequence_loss_weight",
-        "sequence_loss_temperature",
         "q_loss_weight",
         "terminal_residual_weight",
-        "slot_consistency_weight",
-        "slot_usage_weight",
-        "slot_diversity_weight",
         "seed",
         "checkpoint_dir",
         "ema",
@@ -94,22 +87,6 @@ ALLOWED_SECTION_KEYS = {
     "wandb": {"enabled", "project", "entity", "name", "mode"},
 }
 ALLOWED_NESTED_KEYS = {
-    "lfrm": {
-        "belief_dim",
-        "num_slots",
-        "num_heads",
-        "cell_attention_layers",
-        "cell_attention_type",
-        "l_cycles",
-        "latent_processor_layers",
-        "symbol_context_mode",
-        "slot_readout_mode",
-        "belief_temperature",
-        "belief_step_size",
-        "belief_floor",
-        "assignment_temperature",
-        "use_condition_type_embedding",
-    },
     "ema": {"enabled", "decay"},
     "trm": {
         "h_cycles",
@@ -128,6 +105,26 @@ ALLOWED_NESTED_KEYS = {
         "rope_theta",
         "halt_exploration_prob",
         "no_act_continue",
+        "step_loss_weights",
+    },
+    "brc": {
+        "latent_dim",
+        "num_heads",
+        "mlp_ratio",
+        "step_loss_weights",
+        "inner_steps",
+        "latent_lr",
+        "latent_grad_clip_norm",
+        "latent_update_clip_norm",
+        "denoise_loss_weight",
+        "verifier_loss_weight",
+        "meta_loss_weight",
+        "fit_given_weight",
+        "fit_energy_weight",
+        "fit_consistency_weight",
+        "fit_prior_weight",
+        "verifier_layers",
+        "verifier_margin",
     },
 }
 
@@ -162,8 +159,8 @@ def load_toml_config(path: str | None) -> dict[str, object]:
                 normalized_key = f"wandb_{normalized_key}"
             flat[normalized_key] = value
 
-    if flat.get("model_type", "lfrm") not in ("lfrm", "trm"):
-        raise ValueError("Only model_type='lfrm' or model_type='trm' is supported")
+    if flat.get("model_type", "brc_sudoku") not in ("trm", "brc_sudoku"):
+        raise ValueError("Only model_type='trm' or model_type='brc_sudoku' is supported")
     return flat
 
 
@@ -191,36 +188,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="act",
         help="TRM training path: ACT single-step carry or full-unroll dense CE.",
     )
-    parser.add_argument("--dense-loss-weight", type=float, default=0.5)
-    parser.add_argument("--final-loss-weight", type=float, default=0.5)
-    parser.add_argument("--sequence-loss-weight", type=float, default=0.0)
-    parser.add_argument("--sequence-loss-temperature", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--q-loss-weight", type=float, default=0.0)
     parser.add_argument("--terminal-residual-weight", type=float, default=0.0)
-    parser.add_argument("--slot-consistency-weight", type=float, default=0.0)
-    parser.add_argument("--slot-usage-weight", type=float, default=0.0)
-    parser.add_argument("--slot-diversity-weight", type=float, default=0.0)
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ema-decay", type=float, default=0.999)
-    parser.add_argument("--model-type", choices=("lfrm", "trm"), default="lfrm")
+    parser.add_argument("--model-type", choices=("trm", "brc_sudoku"), default="brc_sudoku")
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--num-steps", type=int, default=6)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
-    parser.add_argument("--lfrm-belief-dim", type=int, default=0)
-    parser.add_argument("--lfrm-num-slots", type=int, default=64)
-    parser.add_argument("--lfrm-num-heads", type=int, default=4)
-    parser.add_argument("--lfrm-cell-attention-layers", type=int, default=1)
-    parser.add_argument("--lfrm-cell-attention-type", choices=("standard", "gated_dual"), default="gated_dual")
-    parser.add_argument("--lfrm-l-cycles", type=int, default=3)
-    parser.add_argument("--lfrm-latent-processor-layers", type=int, default=1)
-    parser.add_argument("--lfrm-symbol-context-mode", choices=("cell_symbol_tokens",), default="cell_symbol_tokens")
-    parser.add_argument("--lfrm-slot-readout-mode", choices=("cell_symbol_attention",), default="cell_symbol_attention")
-    parser.add_argument("--lfrm-belief-temperature", type=float, default=1.0)
-    parser.add_argument("--lfrm-belief-step-size", type=float, default=0.25)
-    parser.add_argument("--lfrm-belief-floor", type=float, default=1e-5)
-    parser.add_argument("--lfrm-assignment-temperature", type=float, default=1.0)
-    parser.add_argument("--lfrm-use-condition-type-embedding", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-h-cycles", type=int, default=3)
     parser.add_argument("--trm-l-cycles", type=int, default=6)
     parser.add_argument("--trm-l-layers", type=int, default=2)
@@ -237,6 +213,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-rope-theta", type=float, default=10000.0)
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
+    parser.add_argument("--brc-latent-dim", type=int, default=128)
+    parser.add_argument("--brc-num-heads", type=int, default=4)
+    parser.add_argument("--brc-mlp-ratio", type=int, default=2)
+    parser.add_argument("--brc-step-loss-weights", type=float, nargs="*", default=None)
+    parser.add_argument("--brc-inner-steps", type=int, default=4)
+    parser.add_argument("--brc-latent-lr", type=float, default=0.1)
+    parser.add_argument("--brc-latent-grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--brc-latent-update-clip-norm", type=float, default=0.5)
+    parser.add_argument("--brc-denoise-loss-weight", type=float, default=1.0)
+    parser.add_argument("--brc-verifier-loss-weight", type=float, default=0.2)
+    parser.add_argument("--brc-meta-loss-weight", type=float, default=0.0)
+    parser.add_argument("--brc-fit-given-weight", type=float, default=0.2)
+    parser.add_argument("--brc-fit-energy-weight", type=float, default=1.0)
+    parser.add_argument("--brc-fit-consistency-weight", type=float, default=0.1)
+    parser.add_argument("--brc-fit-prior-weight", type=float, default=0.02)
+    parser.add_argument("--brc-verifier-layers", type=int, default=4)
+    parser.add_argument("--brc-verifier-margin", type=float, default=1.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
     parser.add_argument("--beta1", type=float, default=0.9)
@@ -278,22 +272,6 @@ def build_config(
         d_model=args.d_model,
         num_steps=args.num_steps,
         dropout_rate=args.dropout_rate,
-        lfrm=LFRMConfig(
-            belief_dim=args.lfrm_belief_dim,
-            num_slots=args.lfrm_num_slots,
-            num_heads=args.lfrm_num_heads,
-            cell_attention_layers=args.lfrm_cell_attention_layers,
-            cell_attention_type=args.lfrm_cell_attention_type,
-            l_cycles=args.lfrm_l_cycles,
-            latent_processor_layers=args.lfrm_latent_processor_layers,
-            symbol_context_mode=args.lfrm_symbol_context_mode,
-            slot_readout_mode=args.lfrm_slot_readout_mode,
-            belief_temperature=args.lfrm_belief_temperature,
-            belief_step_size=args.lfrm_belief_step_size,
-            belief_floor=args.lfrm_belief_floor,
-            assignment_temperature=args.lfrm_assignment_temperature,
-            use_condition_type_embedding=args.lfrm_use_condition_type_embedding,
-        ),
         trm=TRMConfig(
             h_cycles=args.trm_h_cycles,
             l_cycles=args.trm_l_cycles,
@@ -311,6 +289,26 @@ def build_config(
             rope_theta=args.trm_rope_theta,
             halt_exploration_prob=args.trm_halt_exploration_prob,
             no_act_continue=args.trm_no_act_continue,
+            step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
+        ),
+        brc=BRCSudokuConfig(
+            latent_dim=args.brc_latent_dim,
+            num_heads=args.brc_num_heads,
+            mlp_ratio=args.brc_mlp_ratio,
+            step_loss_weights=tuple(args.brc_step_loss_weights) if args.brc_step_loss_weights is not None else None,
+            inner_steps=args.brc_inner_steps,
+            latent_lr=args.brc_latent_lr,
+            latent_grad_clip_norm=args.brc_latent_grad_clip_norm,
+            latent_update_clip_norm=args.brc_latent_update_clip_norm,
+            denoise_loss_weight=args.brc_denoise_loss_weight,
+            verifier_loss_weight=args.brc_verifier_loss_weight,
+            meta_loss_weight=args.brc_meta_loss_weight,
+            fit_given_weight=args.brc_fit_given_weight,
+            fit_energy_weight=args.brc_fit_energy_weight,
+            fit_consistency_weight=args.brc_fit_consistency_weight,
+            fit_prior_weight=args.brc_fit_prior_weight,
+            verifier_layers=args.brc_verifier_layers,
+            verifier_margin=args.brc_verifier_margin,
         ),
     )
     optimizer = OptimizerConfig(
@@ -331,15 +329,8 @@ def build_config(
         eval_every=args.eval_every,
         eval_batches=args.eval_batches,
         trm_train_mode=args.trm_train_mode,
-        dense_loss_weight=args.dense_loss_weight,
-        final_loss_weight=args.final_loss_weight,
-        sequence_loss_weight=args.sequence_loss_weight,
-        sequence_loss_temperature=args.sequence_loss_temperature,
         q_loss_weight=args.q_loss_weight,
         terminal_residual_weight=args.terminal_residual_weight,
-        slot_consistency_weight=args.slot_consistency_weight,
-        slot_usage_weight=args.slot_usage_weight,
-        slot_diversity_weight=args.slot_diversity_weight,
         seed=args.seed,
         checkpoint_dir=args.checkpoint_dir,
         ema=EMAConfig(
@@ -638,7 +629,28 @@ CORE_SCALAR_METRICS = (
     "attention_local_distance_scale",
     "target_probability",
     "mean_blank_ce_loss",
-    "sequence_loss",
+    "step_weighted_ce_loss",
+    "latent_fit_loss",
+    "fit_given_loss",
+    "fit_energy",
+    "fit_consistency_loss",
+    "fit_prior_loss",
+    "latent_update_norm",
+    "latent_grad_norm",
+    "latent_step_norm",
+    "meta_outer_loss",
+    "denoise_loss",
+    "verifier_loss",
+    "verifier_ranking_accuracy",
+    "given_consistency",
+    "invalid_board_rate",
+    "conflict_count",
+    "diffusion_filled_ratio",
+    "brc_gate_mean",
+    "brc_gate_std",
+    "true_energy",
+    "fake_energy",
+    "step_loss_weights",
     "q_loss",
     "q_selected_blank_ce_loss",
     "q_selected_blank_cell_accuracy",
@@ -654,23 +666,130 @@ CORE_SCALAR_METRICS = (
     "final_solved_rate",
     "final_solved_count",
 )
-SLOT_DIAGNOSTIC_METRICS = (
-    "slot_consistency_loss",
-    "slot_usage_entropy",
-    "slot_usage_loss",
-    "slot_diversity_loss",
-)
 TERMINAL_DIAGNOSTIC_METRICS = (
     "terminal_belief_delta",
     "terminal_belief_mse",
 )
-INTEGER_SCALAR_METRICS = {"unroll_steps"}
+INTEGER_SCALAR_METRICS = {
+    "unroll_steps",
+    "solved_count",
+    "q_selected_solved_count",
+    "final_solved_count",
+}
+METRIC_DISPLAY_NAMES = {
+    "blank_ce_loss": "ce_step",
+    "step_weighted_ce_loss": "ce_step",
+    "final_blank_ce_loss": "ce_final",
+    "mean_blank_ce_loss": "ce_mean",
+    "blank_cell_accuracy": "acc_blank",
+    "final_blank_cell_accuracy": "acc_final",
+    "target_probability": "p_target",
+    "solved_rate": "solved",
+    "final_solved_rate": "solved_final",
+    "q_selected_blank_ce_loss": "q_ce",
+    "q_selected_blank_cell_accuracy": "q_acc",
+    "q_selected_solved_rate": "q_solved",
+    "q_selected_step": "q_step",
+    "oracle_step": "oracle_step",
+    "act_step": "act_step",
+    "unroll_steps": "unroll",
+    "per_step_hidden_delta": "hidden_delta",
+    "diffusion_filled_ratio": "filled",
+    "brc_gate_mean": "gate_mean",
+    "brc_gate_std": "gate_std",
+    "given_consistency": "given_ok",
+    "invalid_board_rate": "invalid",
+    "conflict_count": "conflicts",
+    "verifier_ranking_accuracy": "verifier_acc",
+    "fit_energy": "energy_fit",
+}
+METRIC_GROUPS = (
+    (
+        "loss",
+        (
+            "loss",
+            "blank_ce_loss",
+            "final_blank_ce_loss",
+            "mean_blank_ce_loss",
+            "denoise_loss",
+            "verifier_loss",
+            "meta_outer_loss",
+            "q_loss",
+        ),
+    ),
+    (
+        "accuracy",
+        (
+            "blank_cell_accuracy",
+            "final_blank_cell_accuracy",
+            "target_probability",
+            "solved_rate",
+            "final_solved_rate",
+            "solved_count",
+            "final_solved_count",
+        ),
+    ),
+    (
+        "selection",
+        (
+            "q_selected_step",
+            "oracle_step",
+            "act_step",
+            "q_selected_blank_ce_loss",
+            "q_selected_blank_cell_accuracy",
+            "q_selected_solved_rate",
+            "q_selected_solved_count",
+        ),
+    ),
+    (
+        "sudoku",
+        (
+            "given_consistency",
+            "invalid_board_rate",
+            "conflict_count",
+            "verifier_ranking_accuracy",
+            "true_energy",
+            "fake_energy",
+        ),
+    ),
+    (
+        "latent",
+        (
+            "latent_fit_loss",
+            "fit_given_loss",
+            "fit_energy",
+            "fit_consistency_loss",
+            "fit_prior_loss",
+            "latent_update_norm",
+            "latent_grad_norm",
+            "latent_step_norm",
+        ),
+    ),
+    (
+        "dynamics",
+        (
+            "unroll_steps",
+            "belief_entropy",
+            "belief_confidence",
+            "diffusion_filled_ratio",
+            "brc_gate_mean",
+            "brc_gate_std",
+            "attention_gate_mean",
+            "attention_gate_std",
+            "attention_local_distance_scale",
+            "terminal_belief_delta",
+            "terminal_belief_mse",
+        ),
+    ),
+)
 
 
 def format_scalar_metric(name: str, value: Any) -> str:
-    scalar = float(value)
+    array = np.asarray(value)
+    scalar = float(array)
     is_integer_like = np.isfinite(scalar) and np.isclose(scalar, round(scalar), atol=1e-6)
-    if name in INTEGER_SCALAR_METRICS or name.endswith(("_count", "_iters", "_steps")):
+    is_integer_dtype = np.issubdtype(array.dtype, np.integer)
+    if is_integer_dtype or name in INTEGER_SCALAR_METRICS or name.endswith(("_count", "_iters", "_steps")):
         if is_integer_like:
             return str(int(round(scalar)))
     if scalar != 0.0 and abs(scalar) < 1e-3:
@@ -678,14 +797,12 @@ def format_scalar_metric(name: str, value: Any) -> str:
     return f"{scalar:.4f}"
 
 
+def metric_display_name(name: str) -> str:
+    return METRIC_DISPLAY_NAMES.get(name, name)
+
+
 def scalar_metric_names(config: ExperimentConfig) -> tuple[str, ...]:
     names = list(CORE_SCALAR_METRICS)
-    if (
-        config.train.slot_consistency_weight != 0.0
-        or config.train.slot_usage_weight != 0.0
-        or config.train.slot_diversity_weight != 0.0
-    ):
-        names.extend(SLOT_DIAGNOSTIC_METRICS)
     if config.train.terminal_residual_weight != 0.0:
         names.extend(TERMINAL_DIAGNOSTIC_METRICS)
     return tuple(names)
@@ -701,14 +818,33 @@ def optional_scalar_log(prefix: str, metrics: dict[str, Any], names: tuple[str, 
     return log
 
 
-def optional_scalar_summary(metrics: dict[str, Any], names: tuple[str, ...]) -> str:
-    parts = []
-    for name in names:
-        if name in metrics:
+def grouped_scalar_summary(metrics: dict[str, Any], names: tuple[str, ...]) -> str:
+    allowed = set(names)
+    lines: list[str] = []
+    emitted: set[str] = set()
+    for group_name, group_metrics in METRIC_GROUPS:
+        parts = []
+        for name in group_metrics:
+            if name not in allowed or name not in metrics:
+                continue
             value = metrics[name]
-            if np.ndim(np.asarray(value)) == 0:
-                parts.append(f"{name}={format_scalar_metric(name, value)}")
-    return " ".join(parts)
+            if np.ndim(np.asarray(value)) != 0:
+                continue
+            parts.append(f"{metric_display_name(name)}={format_scalar_metric(name, value)}")
+            emitted.add(name)
+        if parts:
+            lines.append(f"  {group_name}: " + " ".join(parts))
+
+    misc = []
+    for name in names:
+        if name in emitted or name not in metrics:
+            continue
+        value = metrics[name]
+        if np.ndim(np.asarray(value)) == 0:
+            misc.append(f"{metric_display_name(name)}={format_scalar_metric(name, value)}")
+    if misc:
+        lines.append("  misc: " + " ".join(misc))
+    return "\n".join(lines)
 
 
 def main() -> None:
@@ -732,21 +868,6 @@ def main() -> None:
         raise ValueError("eval_batch_size must be non-negative")
     if config.model.model_type != "trm" and config.train.trm_train_mode != "act":
         raise ValueError("trm_train_mode is only supported for model_type='trm'")
-    if (
-        config.train.dense_loss_weight < 0.0
-        or config.train.final_loss_weight < 0.0
-        or config.train.sequence_loss_weight < 0.0
-    ):
-        raise ValueError("dense_loss_weight, final_loss_weight, and sequence_loss_weight must be non-negative")
-    if config.train.sequence_loss_temperature <= 0.0:
-        raise ValueError("sequence_loss_temperature must be positive")
-    if (
-        config.train.dense_loss_weight
-        + config.train.final_loss_weight
-        + config.train.sequence_loss_weight
-        <= 0.0
-    ):
-        raise ValueError("training requires a positive dense, final, or sequence loss weight")
 
     resume_checkpoint: Path | None = None
     resume_step = 0
@@ -765,10 +886,6 @@ def main() -> None:
     if config.model.model_type == "trm":
         if config.train.trm_train_mode == "dense_unroll":
             train_step_fn = build_trm_dense_unroll_train_step_runner(
-                dense_loss_weight=config.train.dense_loss_weight,
-                final_loss_weight=config.train.final_loss_weight,
-                sequence_loss_weight=config.train.sequence_loss_weight,
-                sequence_loss_temperature=config.train.sequence_loss_temperature,
                 q_loss_weight=config.train.q_loss_weight,
             )
         else:
@@ -776,26 +893,12 @@ def main() -> None:
         eval_step_fn = build_trm_eval_step_runner(config.train.q_loss_weight)
     else:
         train_step_fn = build_train_step_runner(
-            config.train.dense_loss_weight,
-            config.train.final_loss_weight,
-            config.train.sequence_loss_weight,
-            config.train.sequence_loss_temperature,
             config.train.q_loss_weight,
             config.train.terminal_residual_weight,
-            config.train.slot_consistency_weight,
-            config.train.slot_usage_weight,
-            config.train.slot_diversity_weight,
         )
         eval_step_fn = build_eval_step_runner(
-            config.train.dense_loss_weight,
-            config.train.final_loss_weight,
-            config.train.sequence_loss_weight,
-            config.train.sequence_loss_temperature,
             config.train.q_loss_weight,
             config.train.terminal_residual_weight,
-            config.train.slot_consistency_weight,
-            config.train.slot_usage_weight,
-            config.train.slot_diversity_weight,
         )
     ema_model = create_ema_model(model, config) if config.train.use_ema else None
     ema_update_fn = (
@@ -904,16 +1007,10 @@ def main() -> None:
                         )
                 if wandb_run is not None:
                     wandb_run.log(train_log, step=step, commit=not is_eval_step)
-                optional_summary = optional_scalar_summary(metrics, scalar_metrics)
-                print(
-                    f"step={step} "
-                    f"loss={float(metrics['loss']):.4f} "
-                    f"ce={float(metrics['blank_ce_loss']):.4f} "
-                    f"final_ce={float(metrics['final_blank_ce_loss']):.4f} "
-                    f"blank_acc={float(metrics['blank_cell_accuracy']):.4f} "
-                    f"solved={float(metrics['solved_rate']):.4f}"
-                    f"{' ' + optional_summary if optional_summary else ''}"
-                )
+                summary = grouped_scalar_summary(metrics, scalar_metrics)
+                print(f"[train] step={step} lr={schedule_learning_rate(config, step):.2e}")
+                if summary:
+                    print(summary)
 
             if is_eval_step:
                 def run_eval_and_log(eval_model, prefix: str, label: str, *, commit: bool) -> dict[str, Any]:
@@ -963,17 +1060,10 @@ def main() -> None:
                                 )
                             )
                         wandb_run.log(eval_log, step=step, commit=commit)
-                    optional_summary = optional_scalar_summary(eval_metrics, scalar_metrics)
-                    print(
-                        f"[{label}] step={step} "
-                        f"loss={eval_metrics['loss']:.4f} "
-                        f"ce={eval_metrics['blank_ce_loss']:.4f} "
-                        f"final_ce={eval_metrics['final_blank_ce_loss']:.4f} "
-                        f"blank_acc={eval_metrics['blank_cell_accuracy']:.4f} "
-                        f"final_acc={eval_metrics.get('final_blank_cell_accuracy', eval_metrics['blank_cell_accuracy']):.4f} "
-                        f"solved={eval_metrics['solved_rate']:.4f}"
-                        f"{' ' + optional_summary if optional_summary else ''}"
-                    )
+                    summary = grouped_scalar_summary(eval_metrics, scalar_metrics)
+                    print(f"[{label}] step={step}")
+                    if summary:
+                        print(summary)
                     print(
                         "  "
                         + " ".join(

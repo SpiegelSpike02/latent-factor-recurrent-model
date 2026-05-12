@@ -1,5 +1,5 @@
 [data]
-dataset_path = "data/maze-30x30-hard-1k"
+dataset_path = "data/maze-30x30-hard-1k-aug"
 
 [model]
 model_type = "trm"
@@ -26,6 +26,12 @@ pos_encodings = "rope"
 rms_norm_eps = 1e-5
 rope_theta = 10000.0
 halt_exploration_prob = 0.1
+step_loss_weights = [
+  1, 2, 3, 4,
+  5, 6, 7, 8,
+  9, 10, 11, 12,
+  13, 14, 15, 16,
+]
 
 [optimizer]
 learning_rate = 1e-4
@@ -45,10 +51,6 @@ log_every = 10
 eval_every = 2000
 eval_batches = 32
 trm_train_mode = "act"
-dense_loss_weight = 0.0
-final_loss_weight = 1.0
-sequence_loss_weight = 0.0
-sequence_loss_temperature = 0.5
 q_loss_weight = 0.5
 seed = 0
 checkpoint_dir = "checkpoints"
@@ -63,5 +65,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-trm-official-rope-gated-act"
+name = "maze-trm-rope-gated-act-masked-aug"
 mode = "online"

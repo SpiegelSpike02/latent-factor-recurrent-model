@@ -360,6 +360,13 @@ class TinyRecursiveModel(nnx.Module):
             raise ValueError("TRM d_model must be divisible by trm.num_heads for RoPE")
         if trm.pos_encodings == "rope" and (config.d_model // trm.num_heads) % 2 != 0:
             raise ValueError("TRM RoPE head dimension must be even")
+        if trm.step_loss_weights is not None:
+            if len(trm.step_loss_weights) != config.num_steps:
+                raise ValueError("TRM step_loss_weights length must equal num_steps")
+            if any(weight < 0.0 for weight in trm.step_loss_weights):
+                raise ValueError("TRM step_loss_weights must be non-negative")
+            if sum(trm.step_loss_weights) <= 0.0:
+                raise ValueError("TRM step_loss_weights must contain a positive weight")
 
         self.config = config
         self.runtime = runtime

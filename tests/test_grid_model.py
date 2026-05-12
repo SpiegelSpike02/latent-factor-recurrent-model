@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import os
 import tempfile
 import unittest
@@ -16,7 +15,7 @@ from lfrm.cli import load_toml_config, resolve_resume_checkpoint
 from lfrm.config import (
     DataConfig,
     ExperimentConfig,
-    LFRMConfig,
+    BRCSudokuConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
@@ -24,10 +23,10 @@ from lfrm.config import (
     TrainConfig,
     WandbConfig,
 )
-from lfrm.models import LatentFactorRecurrentModel, TinyRecursiveModel
-import lfrm.models.lfrm as lfrm_module
+from lfrm.models import BRCSudokuModel, TinyRecursiveModel
 from lfrm.jax_defaults import apply_jax_defaults
 from lfrm.training import (
+    build_train_step_runner,
     build_trm_act_train_step_runner,
     create_model,
     create_optimizer,
@@ -38,187 +37,7 @@ from lfrm.training import (
 )
 
 
-class LFRMModelTests(unittest.TestCase):
-    def _make_lfrm_model(
-        self,
-        *,
-        num_steps: int = 3,
-        num_slots: int = 5,
-    ) -> LatentFactorRecurrentModel:
-        return LatentFactorRecurrentModel(
-            ModelConfig(
-                vocab_size=11,
-                model_type="lfrm",
-                seq_len=9,
-                grid_height=3,
-                grid_width=3,
-                d_model=12,
-                num_steps=num_steps,
-                lfrm=LFRMConfig(
-                    belief_dim=9,
-                    num_slots=num_slots,
-                    num_heads=4,
-                    latent_processor_layers=1,
-                ),
-            ),
-            RuntimeConfig(compute_dtype="float32"),
-            rngs=nnx.Rngs(12),
-        )
-
-    def test_forward_all_steps_shape_and_diagnostics(self) -> None:
-        model = self._make_lfrm_model(num_steps=2)
-        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
-        logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
-        self.assertEqual(logits.shape, (2, 1, 9, 11))
-        self.assertEqual(diagnostics["digit_logits"].shape, (1, 9, 9))
-        self.assertEqual(diagnostics["q"].shape, (1, 9, 9))
-        self.assertEqual(diagnostics["slots"].shape, (1, 5, 12))
-        self.assertEqual(diagnostics["hidden_delta_mean"].shape, (2,))
-        self.assertEqual(diagnostics["quality_logits"].shape, (2, 1))
-        self.assertEqual(int(diagnostics["unroll_steps"]), 2)
-
-    def test_given_cells_are_clamped(self) -> None:
-        model = self._make_lfrm_model(num_steps=2)
-        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
-        logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
-        predictions = jnp.argmax(logits[-1], axis=-1)
-        self.assertEqual(int(predictions[0, 0]), 2)
-        self.assertEqual(int(predictions[0, 2]), 3)
-        self.assertEqual(int(predictions[0, 5]), 4)
-        self.assertEqual(int(predictions[0, 7]), 5)
-        given_q = jnp.take(diagnostics["q"][0], jnp.asarray([0, 2, 5, 7]), axis=0)
-        expected_digits = jnp.asarray([0, 1, 2, 3], dtype=jnp.int32)
-        self.assertTrue(bool(jnp.all(jnp.argmax(given_q, axis=-1) == expected_digits)))
-
-    def test_lfrm_uses_no_sudoku_specific_relations(self) -> None:
-        source = inspect.getsource(lfrm_module)
-        self.assertNotIn("tasks.sudoku", source)
-        self.assertNotIn("sudoku_relation", source)
-        self.assertNotIn("sudoku_unit", source)
-        self.assertNotIn("row_unit_matrix", source)
-        self.assertNotIn("box_relation", source)
-        self.assertFalse(hasattr(self._make_lfrm_model(), "row_unit_matrix"))
-
-    def test_symbol_equivariance(self) -> None:
-        model = self._make_lfrm_model(num_steps=2, num_slots=4)
-        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
-        permutation = jnp.asarray([2, 0, 1, 3, 4, 5, 6, 7, 8], dtype=jnp.int32)
-        digit_ids = tokens - 2
-        permuted_digits = permutation[jnp.clip(digit_ids, 0, 8)] + 2
-        permuted_tokens = jnp.where(tokens == 1, tokens, permuted_digits)
-        logits, _ = model.forward_all_steps_with_diagnostics(tokens, train=False)
-        permuted_logits, _ = model.forward_all_steps_with_diagnostics(permuted_tokens, train=False)
-        restored_digit_logits = permuted_logits[..., 2:][..., permutation]
-        self.assertTrue(bool(jnp.allclose(logits[..., 2:], restored_digit_logits, atol=1e-4, rtol=1e-4)))
-
-    def test_initial_hidden_is_symbol_invariant(self) -> None:
-        model = self._make_lfrm_model(num_steps=1, num_slots=4)
-        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
-        permutation = jnp.asarray([2, 0, 1, 3, 4, 5, 6, 7, 8], dtype=jnp.int32)
-        digit_ids = tokens - 2
-        permuted_digits = permutation[jnp.clip(digit_ids, 0, 8)] + 2
-        permuted_tokens = jnp.where(tokens == 1, tokens, permuted_digits)
-        state, _, _, _ = model._initial_state(tokens, train=False, dropout_key=None)
-        permuted_state, _, _, _ = model._initial_state(permuted_tokens, train=False, dropout_key=None)
-        self.assertTrue(bool(jnp.allclose(state[0], permuted_state[0], atol=1e-6, rtol=1e-6)))
-
-    def test_symbol_conditioned_slot_readout_shape(self) -> None:
-        model = self._make_lfrm_model(num_steps=1, num_slots=4)
-        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
-        state, initial_logits, initial_q, condition_mask = model._initial_state(tokens, train=False, dropout_key=None)
-        h, _, logits, q, slots = state
-        given_channels = model._given_channels(initial_q, condition_mask)
-        micro_tokens, symbol_context = model._cell_symbol_context(h, logits, q, given_channels)
-        message, routing = model._slots_to_cell_symbols(micro_tokens, slots)
-        self.assertEqual(micro_tokens.shape, (1, 9, 9, 12))
-        self.assertEqual(symbol_context.shape, (1, 9, 12))
-        self.assertEqual(message.shape, (1, 9, 9, 12))
-        self.assertEqual(routing.shape, (1, 9, 9, 4))
-
-    def test_training_losses_are_finite(self) -> None:
-        model = self._make_lfrm_model(num_steps=2, num_slots=4)
-        batch = {
-            "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
-            "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
-            "given_mask": jnp.asarray([[True, False, True, False, False, True, False, True, False]], dtype=bool),
-            "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
-        }
-        _, metrics = loss_and_metrics(
-            model,
-            batch,
-            True,
-            jax.random.key(1),
-            dense_loss_weight=0.0,
-            final_loss_weight=1.0,
-            q_loss_weight=0.1,
-            terminal_residual_weight=0.1,
-            slot_consistency_weight=0.01,
-            slot_usage_weight=0.001,
-        )
-        self.assertNotIn("validity_loss", metrics)
-        for key in (
-            "loss",
-            "q_loss",
-            "q_selected_blank_ce_loss",
-            "q_selected_blank_cell_accuracy",
-            "q_selected_solved_rate",
-            "q_selected_step",
-            "oracle_step",
-            "slot_consistency_loss",
-            "slot_usage_entropy",
-            "terminal_belief_delta",
-            "terminal_belief_mse",
-        ):
-            self.assertIn(key, metrics)
-            self.assertTrue(bool(jnp.isfinite(metrics[key])))
-        self.assertEqual(metrics["per_step_loss"].shape, (2,))
-        self.assertEqual(metrics["per_step_hidden_delta"].shape, (2,))
-        self.assertEqual(metrics["per_step_quality_score"].shape, (2,))
-
-    def test_zero_q_weight_skips_quality_loss_metrics(self) -> None:
-        model = self._make_lfrm_model(num_steps=2, num_slots=4)
-        batch = {
-            "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
-            "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
-            "given_mask": jnp.asarray([[True, False, True, False, False, True, False, True, False]], dtype=bool),
-            "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
-        }
-        _, metrics = loss_and_metrics(
-            model,
-            batch,
-            True,
-            jax.random.key(1),
-            dense_loss_weight=0.0,
-            final_loss_weight=1.0,
-            q_loss_weight=0.0,
-        )
-        self.assertEqual(float(metrics["q_loss"]), 0.0)
-        self.assertNotIn("per_step_quality_score", metrics)
-        self.assertEqual(float(metrics["q_selected_step"]), 2.0)
-
-    def test_zero_weight_training_skips_expensive_diagnostics(self) -> None:
-        model = self._make_lfrm_model(num_steps=2, num_slots=4)
-        batch = {
-            "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
-            "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
-            "given_mask": jnp.asarray([[True, False, True, False, False, True, False, True, False]], dtype=bool),
-        }
-        _, metrics = loss_and_metrics(
-            model,
-            batch,
-            True,
-            jax.random.key(1),
-            dense_loss_weight=0.0,
-            final_loss_weight=1.0,
-            terminal_residual_weight=0.0,
-        )
-        self.assertNotIn("terminal_belief_delta", metrics)
-        self.assertNotIn("terminal_belief_mse", metrics)
-        self.assertNotIn("slot_consistency_loss", metrics)
-        self.assertNotIn("slot_usage_entropy", metrics)
-        self.assertNotIn("slot_usage_loss", metrics)
-        self.assertNotIn("slot_diversity_loss", metrics)
-
+class GridModelTests(unittest.TestCase):
     def test_jax_defaults_set_gpu_startup_flags_without_overriding_user_values(self) -> None:
         with mock.patch.dict(
             os.environ,
@@ -234,32 +53,6 @@ class LFRMModelTests(unittest.TestCase):
             self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "cuda_malloc_async")
             self.assertIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
-
-    def test_gradient_path_finite(self) -> None:
-        model = self._make_lfrm_model(num_steps=1, num_slots=3)
-        batch = {
-            "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
-            "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
-            "given_mask": jnp.asarray([[True, False, True, False, False, True, False, True, False]], dtype=bool),
-        }
-
-        def objective(m):
-            return loss_and_metrics(
-                m,
-                batch,
-                True,
-                jax.random.key(1),
-                dense_loss_weight=0.0,
-                final_loss_weight=1.0,
-                terminal_residual_weight=0.1,
-                slot_consistency_weight=0.01,
-                slot_usage_weight=0.001,
-            )[0]
-
-        value, grads = nnx.value_and_grad(objective)(model)
-        grad_leaves = [leaf for leaf in jax.tree.leaves(grads) if hasattr(leaf, "shape")]
-        self.assertTrue(bool(jnp.isfinite(value)))
-        self.assertTrue(all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in grad_leaves))
 
     def test_solved_rate_metric(self) -> None:
         class FixedModel:
@@ -282,28 +75,7 @@ class LFRMModelTests(unittest.TestCase):
         self.assertAlmostEqual(float(metrics["blank_cell_accuracy"]), 0.75, places=6)
         self.assertAlmostEqual(float(metrics["solved_rate"]), 0.5, places=6)
 
-    def test_create_model_is_lfrm_only(self) -> None:
-        config = ExperimentConfig(
-            model=ModelConfig(
-                vocab_size=11,
-                model_type="lfrm",
-                seq_len=9,
-                grid_height=3,
-                grid_width=3,
-                d_model=12,
-                num_steps=1,
-                lfrm=LFRMConfig(
-                    belief_dim=9,
-                    num_slots=3,
-                ),
-            ),
-            optimizer=OptimizerConfig(),
-            train=TrainConfig(),
-            data=DataConfig(),
-            runtime=RuntimeConfig(compute_dtype="float32"),
-            wandb=WandbConfig(),
-        )
-        self.assertIsInstance(create_model(config), LatentFactorRecurrentModel)
+    def test_create_model_supports_trm_and_brc(self) -> None:
         trm_config = ExperimentConfig(
             model=ModelConfig(
                 vocab_size=11,
@@ -313,7 +85,7 @@ class LFRMModelTests(unittest.TestCase):
                 grid_width=3,
                 d_model=12,
                 num_steps=1,
-                trm=TRMConfig(),
+                trm=TRMConfig(num_heads=3),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),
@@ -322,6 +94,24 @@ class LFRMModelTests(unittest.TestCase):
             wandb=WandbConfig(),
         )
         self.assertIsInstance(create_model(trm_config), TinyRecursiveModel)
+        brc_config = ExperimentConfig(
+            model=ModelConfig(
+                vocab_size=11,
+                model_type="brc_sudoku",
+                seq_len=81,
+                grid_height=9,
+                grid_width=9,
+                d_model=16,
+                num_steps=1,
+                brc=BRCSudokuConfig(latent_dim=16, num_heads=4, verifier_layers=1),
+            ),
+            optimizer=OptimizerConfig(),
+            train=TrainConfig(),
+            data=DataConfig(),
+            runtime=RuntimeConfig(compute_dtype="float32"),
+            wandb=WandbConfig(),
+        )
+        self.assertIsInstance(create_model(brc_config), BRCSudokuModel)
         invalid = ExperimentConfig(
             model=ModelConfig(vocab_size=11, model_type="legacy_shared_block"),
             optimizer=OptimizerConfig(),
@@ -330,7 +120,7 @@ class LFRMModelTests(unittest.TestCase):
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
         )
-        with self.assertRaisesRegex(ValueError, "Only model_type='lfrm' or model_type='trm'"):
+        with self.assertRaisesRegex(ValueError, "brc_sudoku"):
             create_model(invalid)
 
     def test_trm_forward_and_losses_are_finite(self) -> None:
@@ -374,17 +164,180 @@ class LFRMModelTests(unittest.TestCase):
             batch,
             True,
             jax.random.key(3),
-            sequence_loss_weight=0.1,
         )
-        self.assertIn("sequence_loss", dense_metrics)
+        self.assertIn("step_weighted_ce_loss", dense_metrics)
+        self.assertIn("step_loss_weights", dense_metrics)
         self.assertNotIn("per_step_h_loss", dense_metrics)
         self.assertNotIn("per_step_l_loss", dense_metrics)
-        self.assertTrue(bool(jnp.isfinite(dense_metrics["sequence_loss"])))
+        self.assertEqual(dense_metrics["step_loss_weights"].shape, (2,))
+        self.assertTrue(bool(jnp.isfinite(dense_metrics["step_weighted_ce_loss"])))
         self.assertAlmostEqual(
             float(dense_loss),
-            float(dense_metrics["blank_ce_loss"] + 0.1 * dense_metrics["sequence_loss"]),
+            float(dense_metrics["step_weighted_ce_loss"]),
             places=5,
         )
+
+    def test_brc_forward_and_verifier_are_finite(self) -> None:
+        model = BRCSudokuModel(
+            ModelConfig(
+                vocab_size=11,
+                model_type="brc_sudoku",
+                seq_len=81,
+                grid_height=9,
+                grid_width=9,
+                d_model=16,
+                num_steps=2,
+                brc=BRCSudokuConfig(
+                    latent_dim=16,
+                    num_heads=4,
+                    mlp_ratio=1,
+                    inner_steps=1,
+                    verifier_layers=1,
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(31),
+        )
+        puzzle = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
+        solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+        tokens = jnp.asarray([[int(ch) + 1 for ch in puzzle]], dtype=jnp.int32)
+        labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
+        logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
+        self.assertEqual(logits.shape, (2, 1, 81, 11))
+        self.assertEqual(diagnostics["hidden_delta_mean"].shape, (2,))
+        self.assertEqual(diagnostics["diffusion_filled_ratio"].shape, (2,))
+        self.assertEqual(diagnostics["draft"].shape, (1, 81))
+        self.assertEqual(diagnostics["belief_logits"].shape, (1, 81, 9))
+        self.assertEqual(model.relation_masks.shape, (4, 81, 81))
+        predictions = jnp.argmax(logits[-1], axis=-1)
+        given_mask = tokens != 1
+        self.assertTrue(bool(jnp.all(predictions[given_mask] == tokens[given_mask])))
+        energy = model.verifier_energy(tokens, labels)
+        self.assertEqual(energy.shape, (1,))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(energy))))
+        soft_candidate = jax.nn.one_hot(labels, 11)
+        soft_energy = model.verifier_energy_from_probs(tokens, soft_candidate)
+        self.assertEqual(soft_energy.shape, (1,))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(soft_energy))))
+        refined_belief, refine_metrics = model.refine_belief_with_verifier(
+            tokens,
+            diagnostics["belief_logits"],
+            steps=1,
+        )
+        self.assertEqual(refined_belief.shape, (1, 81, 9))
+        self.assertTrue(bool(jnp.isfinite(refine_metrics["belief_refine_loss"])))
+
+    def test_brc_losses_are_finite(self) -> None:
+        model = BRCSudokuModel(
+            ModelConfig(
+                vocab_size=11,
+                model_type="brc_sudoku",
+                seq_len=81,
+                grid_height=9,
+                grid_width=9,
+                d_model=16,
+                num_steps=2,
+                brc=BRCSudokuConfig(
+                    latent_dim=16,
+                    num_heads=4,
+                    mlp_ratio=1,
+                    inner_steps=1,
+                    latent_lr=0.05,
+                    verifier_layers=1,
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(32),
+        )
+        puzzle = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
+        solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+        tokens = jnp.asarray([[int(ch) + 1 for ch in puzzle]], dtype=jnp.int32)
+        labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
+        batch = {
+            "inputs": tokens,
+            "labels": labels,
+            "given_mask": tokens != 1,
+            "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
+        }
+        _, metrics = loss_and_metrics(
+            model,
+            batch,
+            True,
+            jax.random.key(33),
+        )
+        for key in (
+            "loss",
+            "blank_ce_loss",
+            "step_weighted_ce_loss",
+            "final_blank_ce_loss",
+            "mean_blank_ce_loss",
+            "latent_fit_loss",
+            "fit_given_loss",
+            "fit_energy",
+            "fit_consistency_loss",
+            "fit_prior_loss",
+            "latent_update_norm",
+            "latent_grad_norm",
+            "latent_step_norm",
+            "meta_outer_loss",
+            "denoise_loss",
+            "verifier_loss",
+            "verifier_ranking_accuracy",
+            "given_consistency",
+            "invalid_board_rate",
+            "conflict_count",
+        ):
+            self.assertIn(key, metrics)
+            self.assertTrue(bool(jnp.isfinite(metrics[key])))
+        self.assertEqual(metrics["per_step_loss"].shape, (2,))
+        self.assertEqual(metrics["step_loss_weights"].shape, (2,))
+
+    def test_brc_train_step_updates_parameters(self) -> None:
+        config = ExperimentConfig(
+            model=ModelConfig(
+                vocab_size=11,
+                model_type="brc_sudoku",
+                seq_len=81,
+                grid_height=9,
+                grid_width=9,
+                d_model=16,
+                num_steps=1,
+                brc=BRCSudokuConfig(
+                    latent_dim=16,
+                    num_heads=4,
+                    mlp_ratio=1,
+                    inner_steps=1,
+                    latent_lr=0.05,
+                    meta_loss_weight=0.5,
+                    verifier_layers=1,
+                ),
+            ),
+            optimizer=OptimizerConfig(learning_rate=1e-4, warmup_steps=1),
+            train=TrainConfig(batch_size=1, max_steps=1),
+            data=DataConfig(),
+            runtime=RuntimeConfig(compute_dtype="float32"),
+            wandb=WandbConfig(),
+        )
+        model = create_model(config)
+        optimizer = create_optimizer(model, config)
+        train_step = build_train_step_runner()
+        puzzle = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
+        solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
+        tokens = jnp.asarray([[int(ch) + 1 for ch in puzzle]], dtype=jnp.int32)
+        labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
+        batch = {
+            "inputs": tokens,
+            "labels": labels,
+            "given_mask": tokens != 1,
+            "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
+        }
+        before = model.z_global[...]
+        metrics = train_step(model, optimizer, batch, jax.random.key(34))
+        after = model.z_global[...]
+        self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
+        self.assertTrue(bool(jnp.isfinite(metrics["meta_outer_loss"])))
+        self.assertTrue(bool(jnp.isfinite(metrics["latent_fit_loss"])))
+        self.assertGreater(float(jnp.sum(jnp.abs(after - before))), 0.0)
 
     def test_trm_breaks_blank_symbol_symmetry(self) -> None:
         model = TinyRecursiveModel(
@@ -668,16 +621,16 @@ class LFRMModelTests(unittest.TestCase):
 
     def test_num_heads_must_divide_d_model(self) -> None:
         with self.assertRaisesRegex(ValueError, "divisible by num_heads"):
-            LatentFactorRecurrentModel(
+            BRCSudokuModel(
                 ModelConfig(
                     vocab_size=11,
-                    model_type="lfrm",
-                    seq_len=9,
-                    grid_height=3,
-                    grid_width=3,
+                    model_type="brc_sudoku",
+                    seq_len=81,
+                    grid_height=9,
+                    grid_width=9,
                     d_model=10,
                     num_steps=1,
-                    lfrm=LFRMConfig(belief_dim=9, num_heads=4),
+                    brc=BRCSudokuConfig(latent_dim=16, num_heads=4),
                 ),
                 RuntimeConfig(compute_dtype="float32"),
                 rngs=nnx.Rngs(0),
@@ -688,24 +641,63 @@ class LFRMModelTests(unittest.TestCase):
             config_path = Path(tmpdir) / "legacy.toml"
             config_path.write_text(
                 "[model]\n"
-                "model_type = \"lfrm\"\n"
+                "model_type = \"brc_sudoku\"\n"
                 "legacy_field = \"old\"\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "Unsupported \\[model\\] field"):
                 load_toml_config(str(config_path))
 
+    def test_config_loader_accepts_brc_and_trm_step_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "brc.toml"
+            config_path.write_text(
+                "[model]\n"
+                "model_type = \"brc_sudoku\"\n"
+                "d_model = 16\n"
+                "\n"
+                "[model.brc]\n"
+                "latent_dim = 16\n"
+                "num_heads = 4\n"
+                "step_loss_weights = [1.0, 2.0]\n"
+                "inner_steps = 1\n"
+                "meta_loss_weight = 0.5\n"
+                "fit_energy_weight = 0.75\n",
+                encoding="utf-8",
+            )
+            loaded = load_toml_config(str(config_path))
+            self.assertEqual(loaded["model_type"], "brc_sudoku")
+            self.assertEqual(loaded["brc_latent_dim"], 16)
+            self.assertEqual(loaded["brc_num_heads"], 4)
+            self.assertEqual(loaded["brc_step_loss_weights"], [1.0, 2.0])
+            self.assertEqual(loaded["brc_meta_loss_weight"], 0.5)
+            self.assertEqual(loaded["brc_fit_energy_weight"], 0.75)
+
+            trm_config_path = Path(tmpdir) / "trm.toml"
+            trm_config_path.write_text(
+                "[model]\n"
+                "model_type = \"trm\"\n"
+                "d_model = 16\n"
+                "\n"
+                "[model.trm]\n"
+                "num_heads = 4\n"
+                "step_loss_weights = [1.0, 2.0, 3.0]\n",
+                encoding="utf-8",
+            )
+            trm_loaded = load_toml_config(str(trm_config_path))
+            self.assertEqual(trm_loaded["trm_step_loss_weights"], [1.0, 2.0, 3.0])
+
     def test_checkpoint_round_trip_restores_step(self) -> None:
         config = ExperimentConfig(
             model=ModelConfig(
                 vocab_size=11,
-                model_type="lfrm",
+                model_type="trm",
                 seq_len=9,
                 grid_height=3,
                 grid_width=3,
                 d_model=12,
                 num_steps=1,
-                lfrm=LFRMConfig(belief_dim=9, num_slots=3),
+                trm=TRMConfig(h_cycles=1, l_cycles=1, l_layers=1, num_heads=3, mlp_ratio=2),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),

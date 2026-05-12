@@ -1,23 +1,25 @@
-# Latent Factor Recurrent Model
+# Recurrent Grid Reasoning
 
-Latent Factor Recurrent Model is a JAX + `flax.nnx` research codebase for
-recurrent reasoning on 2D grid tasks. The repository now has one primary model
-path:
+This is a JAX + `flax.nnx` research codebase for recurrent reasoning on 2D grid
+tasks. The current Sudoku MVP is BRC-Sudoku, a belief-first recurrent solver
+that keeps working memory out of the latent controller.
 
-- `lfrm`: a Perceiver IO-style multi-head latent bottleneck modified into a
-  recurrent belief solver with dynamic latent factors and symbol-equivariant
-  updates.
+- `brc_sudoku`: the current Sudoku path. It uses a soft digit belief field,
+  recurrent spatial hidden state, relation-typed attention, a small controller
+  latent, and an independent verifier/energy model.
+- `trm`: a Tiny Recursive Model baseline.
 
-The older Universal Transformer and Recurrent Transformer implementations have
-been removed. LFRM is the generalized shared-block recurrent reasoning path:
-the same block is applied for multiple refinement steps, but the state being
-refined is structured as cell hidden state, residual belief logits, a discrete
-belief canvas, and latent factor slots.
+The BRC design separates state by capacity: size-growing information lives in
+`B` (explicit output belief) and `H` (spatial hidden field), while `z` is a small
+controller that only modulates update dynamics. Sudoku supplies a relation
+schema `G` with `self`, `same_row`, `same_col`, and `same_box`; the learned
+verifier `E` ranks hard candidates and can conservatively refine belief logits.
 
-LFRM intentionally does not consume Sudoku row/column/box relation matrices,
-Sudoku unit matrices, hand-written validity losses, or task-specific solver
-rules. Sudoku is currently the first smoke-test data format for a broader
-task-agnostic grid solver.
+BRC-Sudoku does not use clue-dropout pseudo-labels, symbolic traces, DSL rules,
+or a hand-written Sudoku checker in the loss. Training uses a single
+step-weighted recurrent CE schedule, mixed belief starts
+(`full_mask`/teacher/self-conditioned/corrupt), digit permutation augmentation,
+and verifier hard negatives.
 
 A short architecture overview lives in [docs/architecture.md](docs/architecture.md).
 
@@ -25,7 +27,7 @@ A short architecture overview lives in [docs/architecture.md](docs/architecture.
 
 The implementation lives under the `lfrm` package:
 
-- `lfrm.models`: LFRM and TRM models
+- `lfrm.models`: BRC-Sudoku and TRM models
 - `lfrm.datasets`: generic grid dataset loading plus Sudoku/Maze dataset building
 - `lfrm.training`: optimizer, loss, metrics, and checkpoint helpers
 - `lfrm.scripts`: console-script entry points
@@ -47,27 +49,26 @@ uv run lfrm-build-sudoku --source-csv-dir path/to/sudoku_csvs --output-dir data/
 Build an offline Maze dataset in the HRM/TRM format:
 
 ```bash
-uv run lfrm-build-maze --output-dir data/maze-30x30-hard-1k
+uv run lfrm-build-maze --output-dir data/maze-30x30-hard-1k-aug --aug
 ```
 
-Train LFRM:
+Train BRC-Sudoku:
 
 ```bash
-uv run lfrm-train --config configs/sudoku_lfrm.toml
+uv run lfrm-train --config configs/sudoku_brc.toml
 ```
 
 CLI flags override config values:
 
 ```bash
-uv run lfrm-train --config configs/sudoku_lfrm.toml --learning-rate 1e-4 --batch-size 16
+uv run lfrm-train --config configs/sudoku_brc.toml --learning-rate 1e-4 --batch-size 16
 ```
 
-Recurrent supervision is controlled by `dense_loss_weight`,
-`final_loss_weight`, and `sequence_loss_weight`. Dense loss applies token-level
-CE across all recurrent steps, final loss emphasizes the last step, and sequence
-loss adds a set-style blank-token objective. `q_loss_weight` trains a
-task-agnostic per-step quality head from target token accuracy, and evaluation
-reports both the final step and the step selected by that head.
+BRC-Sudoku and TRM dense-unroll recurrent supervision are controlled by
+`model.brc.step_loss_weights` and `model.trm.step_loss_weights`: one relative
+CE weight per recurrent step, normalized internally. BRC-Sudoku additionally
+reports given consistency, invalid-board rate, row/column/box conflict count,
+verifier ranking accuracy, and belief/refinement diagnostics.
 
 The package also applies project-level JAX defaults before JAX initializes:
 Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, GPU preallocation
@@ -79,6 +80,7 @@ allocation. Values already set in the shell are preserved.
 
 - Datasets are built offline with `train/` and `test/` splits and sampled at runtime.
 - Sudoku derives blank-cell supervision from token `1`; Maze writes an explicit
-  all-False `given_mask.npy` so every output token is supervised.
-- Old UT/RT checkpoints and configs are not compatible with the current
-  LFRM-only code path.
+  `given_mask.npy` so known walls, start, and goal cells are treated as givens,
+  while open cells are supervised as path/non-path decisions.
+- Old Sudoku LFRM/Mini-GLIDER configs are not compatible with the current
+  BRC-Sudoku path. The TRM Sudoku baseline config is still available.

@@ -148,13 +148,13 @@ def build_maze_dataset(
         split_dir = output_root / split_name
         split_dir.mkdir(parents=True, exist_ok=True)
         encoded_inputs = open_memmap(
-            split_dir / "all__inputs.npy",
+            split_dir / "inputs.npy",
             mode="w+",
             dtype=np.int32,
             shape=(num_examples, seq_len),
         )
         encoded_labels = open_memmap(
-            split_dir / "all__labels.npy",
+            split_dir / "labels.npy",
             mode="w+",
             dtype=np.int32,
             shape=(num_examples, seq_len),
@@ -166,19 +166,19 @@ def build_maze_dataset(
             shape=(num_examples, seq_len),
         )
         puzzle_indices = open_memmap(
-            split_dir / "all__puzzle_indices.npy",
+            split_dir / "puzzle_indices.npy",
             mode="w+",
             dtype=np.int32,
             shape=(num_examples + 1,),
         )
         group_indices = open_memmap(
-            split_dir / "all__group_indices.npy",
+            split_dir / "group_indices.npy",
             mode="w+",
             dtype=np.int32,
             shape=(selected_examples + 1,),
         )
         puzzle_identifiers = open_memmap(
-            split_dir / "all__puzzle_identifiers.npy",
+            split_dir / "puzzle_identifiers.npy",
             mode="w+",
             dtype=np.int32,
             shape=(num_examples,),
@@ -200,7 +200,7 @@ def build_maze_dataset(
                 aug_solution = np.ascontiguousarray(solution_variants[aug_idx])
                 encoded_inputs[output_idx] = aug_maze.reshape(-1)
                 encoded_labels[output_idx] = aug_solution.reshape(-1)
-                given_mask[output_idx] = False
+                given_mask[output_idx] = (aug_maze.reshape(-1) != MAZE_VOCAB[" "])
                 puzzle_identifiers[output_idx] = 0
                 output_idx += 1
                 puzzle_indices[output_idx] = output_idx
@@ -240,7 +240,7 @@ def build_maze_dataset(
             "sets": ["all"],
             "pad_id": 0,
             "ignore_label_id": 0,
-            "blank_identifier_id": 0,
+            "blank_identifier_id": MAZE_VOCAB[" "],
             "token_map": {"wall": 1, "blank": 2, "start": 3, "goal": 4, "path": 5},
         }
         (split_dir / "dataset.json").write_text(json.dumps(metadata))

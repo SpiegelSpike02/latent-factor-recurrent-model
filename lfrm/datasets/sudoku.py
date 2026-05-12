@@ -160,22 +160,22 @@ def build_sudoku_dataset(
 
         split_dir = output_root / split_name
         split_dir.mkdir(parents=True, exist_ok=True)
-        encoded_inputs = open_memmap(split_dir / "all__inputs.npy", mode="w+", dtype=np.int32, shape=(num_examples, 81))
-        encoded_labels = open_memmap(split_dir / "all__labels.npy", mode="w+", dtype=np.int32, shape=(num_examples, 81))
+        encoded_inputs = open_memmap(split_dir / "inputs.npy", mode="w+", dtype=np.int32, shape=(num_examples, 81))
+        encoded_labels = open_memmap(split_dir / "labels.npy", mode="w+", dtype=np.int32, shape=(num_examples, 81))
         puzzle_indices = open_memmap(
-            split_dir / "all__puzzle_indices.npy",
+            split_dir / "puzzle_indices.npy",
             mode="w+",
             dtype=np.int32,
             shape=(num_examples + 1,),
         )
         group_indices = open_memmap(
-            split_dir / "all__group_indices.npy",
+            split_dir / "group_indices.npy",
             mode="w+",
             dtype=np.int32,
             shape=(selected_examples + 1,),
         )
         puzzle_identifiers = open_memmap(
-            split_dir / "all__puzzle_identifiers.npy",
+            split_dir / "puzzle_identifiers.npy",
             mode="w+",
             dtype=np.int32,
             shape=(num_examples,),

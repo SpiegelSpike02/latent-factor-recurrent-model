@@ -5,24 +5,6 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
-class LFRMConfig:
-    belief_dim: int = 0
-    num_slots: int = 64
-    num_heads: int = 4
-    cell_attention_layers: int = 1
-    cell_attention_type: str = "gated_dual"
-    l_cycles: int = 3
-    latent_processor_layers: int = 1
-    symbol_context_mode: str = "cell_symbol_tokens"
-    slot_readout_mode: str = "cell_symbol_attention"
-    belief_temperature: float = 1.0
-    belief_step_size: float = 0.25
-    belief_floor: float = 1e-5
-    assignment_temperature: float = 1.0
-    use_condition_type_embedding: bool = True
-
-
-@dataclass(frozen=True)
 class TRMConfig:
     h_cycles: int = 3
     l_cycles: int = 6
@@ -40,12 +22,34 @@ class TRMConfig:
     rope_theta: float = 10000.0
     halt_exploration_prob: float = 0.1
     no_act_continue: bool = True
+    step_loss_weights: tuple[float, ...] | None = None
+
+
+@dataclass(frozen=True)
+class BRCSudokuConfig:
+    latent_dim: int = 128
+    num_heads: int = 4
+    mlp_ratio: int = 2
+    step_loss_weights: tuple[float, ...] | None = None
+    inner_steps: int = 4
+    latent_lr: float = 0.1
+    latent_grad_clip_norm: float = 1.0
+    latent_update_clip_norm: float = 0.5
+    denoise_loss_weight: float = 1.0
+    verifier_loss_weight: float = 0.2
+    meta_loss_weight: float = 0.0
+    fit_given_weight: float = 0.2
+    fit_energy_weight: float = 1.0
+    fit_consistency_weight: float = 0.1
+    fit_prior_weight: float = 0.02
+    verifier_layers: int = 4
+    verifier_margin: float = 1.0
 
 
 @dataclass(frozen=True)
 class ModelConfig:
     vocab_size: int
-    model_type: str = "lfrm"
+    model_type: str = "brc_sudoku"
     num_puzzle_identifiers: int = 1
     seq_len: int = 81
     grid_height: int = 9
@@ -53,16 +57,16 @@ class ModelConfig:
     d_model: int = 256
     num_steps: int = 6
     dropout_rate: float = 0.0
-    lfrm: LFRMConfig | None = None
     trm: TRMConfig | None = None
-
-    @property
-    def lfrm_config(self) -> LFRMConfig:
-        return self.lfrm or LFRMConfig()
+    brc: BRCSudokuConfig | None = None
 
     @property
     def trm_config(self) -> TRMConfig:
         return self.trm or TRMConfig()
+
+    @property
+    def brc_config(self) -> BRCSudokuConfig:
+        return self.brc or BRCSudokuConfig()
 
 
 @dataclass(frozen=True)
@@ -92,15 +96,8 @@ class TrainConfig:
     eval_every: int = 100
     eval_batches: int = 20
     trm_train_mode: str = "act"
-    dense_loss_weight: float = 0.5
-    final_loss_weight: float = 0.5
-    sequence_loss_weight: float = 0.0
-    sequence_loss_temperature: float = 0.5
     q_loss_weight: float = 0.0
     terminal_residual_weight: float = 0.0
-    slot_consistency_weight: float = 0.0
-    slot_usage_weight: float = 0.0
-    slot_diversity_weight: float = 0.0
     seed: int = 0
     checkpoint_dir: str = "checkpoints"
     ema: EMAConfig | None = None
