@@ -4,9 +4,9 @@ This is a JAX + `flax.nnx` research codebase for recurrent reasoning on 2D grid
 tasks. The current Sudoku MVP is BRC-Sudoku, a belief-first recurrent solver
 that keeps working memory out of the latent controller.
 
-- `brc_sudoku`: the current Sudoku path. It uses a soft digit belief field,
-  recurrent spatial hidden state, relation-typed attention, a small controller
-  latent, and an independent verifier/energy model.
+- `brc_sudoku`: the current Sudoku path. It uses digit belief logits, recurrent
+  spatial hidden state, relation-typed attention, a small controller latent, and
+  an independent verifier/energy model.
 - `trm`: a Tiny Recursive Model baseline.
 
 The BRC design separates state by capacity: size-growing information lives in
@@ -17,9 +17,11 @@ verifier `E` ranks hard candidates and can conservatively refine belief logits.
 
 BRC-Sudoku does not use clue-dropout pseudo-labels, symbolic traces, DSL rules,
 or a hand-written Sudoku checker in the loss. Training uses a single
-step-weighted recurrent CE schedule, mixed belief starts
-(`full_mask`/teacher/self-conditioned/corrupt), digit permutation augmentation,
-and verifier hard negatives.
+step-weighted unknown-cell CE schedule with stronger late-step weights, mixed
+answer-belief starts (`full_mask`/teacher/self-conditioned/corrupt), digit
+permutation augmentation, and verifier hard negatives. Verifier margin training
+uses detached model-generated fakes; generator-side verifier use is handled
+separately through energy minimization or belief refinement.
 
 A short architecture overview lives in [docs/architecture.md](docs/architecture.md).
 
