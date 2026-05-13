@@ -56,6 +56,7 @@ ALLOWED_SECTION_KEYS = {
         "d_model",
         "num_steps",
         "dropout_rate",
+        "clamp_given",
         "trm",
         "brc",
     },
@@ -197,6 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--num-steps", type=int, default=6)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
+    parser.add_argument("--clamp-given", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trm-h-cycles", type=int, default=3)
     parser.add_argument("--trm-l-cycles", type=int, default=6)
     parser.add_argument("--trm-l-layers", type=int, default=2)
@@ -272,6 +274,7 @@ def build_config(
         d_model=args.d_model,
         num_steps=args.num_steps,
         dropout_rate=args.dropout_rate,
+        clamp_given=args.clamp_given,
         trm=TRMConfig(
             h_cycles=args.trm_h_cycles,
             l_cycles=args.trm_l_cycles,

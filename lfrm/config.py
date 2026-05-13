@@ -57,6 +57,7 @@ class ModelConfig:
     d_model: int = 256
     num_steps: int = 6
     dropout_rate: float = 0.0
+    clamp_given: bool = False
     trm: TRMConfig | None = None
     brc: BRCSudokuConfig | None = None
 

@@ -86,6 +86,24 @@ def _masked_token_ce(logits: jax.Array, targets: jax.Array, mask: jax.Array) -> 
     return jnp.sum(token_loss * mask_f32) / normalizer
 
 
+def _clamp_logits_to_given(
+    logits: jax.Array,
+    inputs: jax.Array,
+    given_mask: jax.Array,
+    vocab_size: int,
+) -> jax.Array:
+    given_logits = jnp.full_like(logits, -1.0e4)
+    given_logits = given_logits + 2.0e4 * jax.nn.one_hot(inputs.astype(jnp.int32), vocab_size)
+    while given_mask.ndim < logits.ndim - 1:
+        given_mask = given_mask[None, ...]
+    return jnp.where(given_mask[..., None], given_logits, logits)
+
+
+def _should_clamp_given(model: GridReasoningModel) -> bool:
+    config = getattr(model, "config", None)
+    return bool(getattr(config, "clamp_given", False))
+
+
 def _permute_sudoku_digits(
     inputs: jax.Array,
     targets: jax.Array,
@@ -559,7 +577,11 @@ def loss_and_metrics(
         dropout_key=model_key,
         **model_forward_kwargs,
     )
-    effective_step_logits = step_logits
+    effective_step_logits = (
+        _clamp_logits_to_given(step_logits, inputs, given_mask, model.config.vocab_size)
+        if _should_clamp_given(model)
+        else step_logits
+    )
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = loss_mask[None, :, :]
     token_loss = optax.softmax_cross_entropy_with_integer_labels(effective_step_logits, step_targets)
@@ -719,6 +741,8 @@ def trm_act_loss_and_metrics(
     loss_mask = (~given_mask).astype(jnp.float32)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
+    if _should_clamp_given(model):
+        logits = _clamp_logits_to_given(logits, new_carry["current_inputs"], given_mask, model.config.vocab_size)
 
     token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
     per_example_loss = jnp.sum(token_loss * loss_mask, axis=-1) / per_example_normalizer
@@ -788,6 +812,8 @@ def trm_dense_unroll_loss_and_metrics(
         compute_terminal_residual=False,
         include_layer_diagnostics=False,
     )
+    if _should_clamp_given(model):
+        step_logits = _clamp_logits_to_given(step_logits, inputs, given_mask, model.config.vocab_size)
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = loss_mask[None, :, :]
     token_loss = optax.softmax_cross_entropy_with_integer_labels(step_logits, step_targets)
@@ -886,6 +912,15 @@ def trm_eval_loss_and_metrics(
         compute_terminal_residual=False,
         include_layer_diagnostics=True,
     )
+    if _should_clamp_given(model):
+        step_logits = _clamp_logits_to_given(step_logits, inputs, given_mask, model.config.vocab_size)
+        if "l_logits" in diagnostics:
+            diagnostics["l_logits"] = _clamp_logits_to_given(
+                diagnostics["l_logits"],
+                inputs,
+                given_mask,
+                model.config.vocab_size,
+            )
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = loss_mask[None, :, :]
     token_loss = optax.softmax_cross_entropy_with_integer_labels(step_logits, step_targets)

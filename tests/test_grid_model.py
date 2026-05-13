@@ -26,6 +26,7 @@ from lfrm.config import (
 from lfrm.models import BRCSudokuModel, TinyRecursiveModel
 from lfrm.jax_defaults import apply_jax_defaults
 from lfrm.training import (
+    _clamp_logits_to_given,
     build_train_step_runner,
     build_trm_act_train_step_runner,
     create_model,
@@ -619,6 +620,18 @@ class GridModelTests(unittest.TestCase):
         self.assertAlmostEqual(float(metrics["q_selected_blank_cell_accuracy"]), 1.0, places=6)
         self.assertAlmostEqual(float(metrics["q_selected_step"]), 2.0, places=6)
 
+    def test_clamp_logits_to_given_uses_given_mask_not_blank_id(self) -> None:
+        logits = jnp.zeros((2, 1, 4, 6), dtype=jnp.float32)
+        inputs = jnp.asarray([[2, 1, 3, 4]], dtype=jnp.int32)
+        given_mask = jnp.asarray([[False, True, False, True]], dtype=bool)
+
+        clamped = _clamp_logits_to_given(logits, inputs, given_mask, vocab_size=6)
+        predictions = jnp.argmax(clamped, axis=-1)
+
+        self.assertTrue(bool(jnp.all(predictions[:, 0, 1] == 1)))
+        self.assertTrue(bool(jnp.all(predictions[:, 0, 3] == 4)))
+        self.assertTrue(bool(jnp.all(clamped[:, 0, 0] == logits[:, 0, 0])))
+
     def test_num_heads_must_divide_d_model(self) -> None:
         with self.assertRaisesRegex(ValueError, "divisible by num_heads"):
             BRCSudokuModel(
@@ -655,6 +668,7 @@ class GridModelTests(unittest.TestCase):
                 "[model]\n"
                 "model_type = \"brc_sudoku\"\n"
                 "d_model = 16\n"
+                "clamp_given = true\n"
                 "\n"
                 "[model.brc]\n"
                 "latent_dim = 16\n"
@@ -667,6 +681,7 @@ class GridModelTests(unittest.TestCase):
             )
             loaded = load_toml_config(str(config_path))
             self.assertEqual(loaded["model_type"], "brc_sudoku")
+            self.assertTrue(loaded["clamp_given"])
             self.assertEqual(loaded["brc_latent_dim"], 16)
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_step_loss_weights"], [1.0, 2.0])
