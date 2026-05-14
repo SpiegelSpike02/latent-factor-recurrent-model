@@ -301,6 +301,14 @@ class BRCSudokuModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
+        self.state_init_to_hidden = nnx.Linear(
+            config.d_model,
+            config.d_model,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
         self.h0 = nnx.Param(trunc_normal(rngs.params(), (config.d_model,), 1.0 / math.sqrt(config.d_model)))
         self.solver_block = RelationTypedSolverBlock(
             config,
@@ -436,6 +444,16 @@ class BRCSudokuModel(nnx.Module):
             + self.box_embed(self.box_ids)
         )
 
+    def _belief_embedding(self, tokens: Array, belief_logits: Array) -> Array:
+        belief_probs = jax.nn.softmax(self._clamp_belief_logits(belief_logits, tokens), axis=-1)
+        digit_embedding_table = maybe_cast(self.draft_embed.embedding[1:10], self.dtype)
+        return jnp.einsum(
+            "bnd,dk->bnk",
+            maybe_cast(belief_probs, self.dtype),
+            digit_embedding_table,
+            preferred_element_type=jnp.float32,
+        )
+
     def _cell_embeddings(
         self,
         tokens: Array,
@@ -446,14 +464,7 @@ class BRCSudokuModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
     ) -> Array:
-        belief_probs = jax.nn.softmax(self._clamp_belief_logits(belief_logits, tokens), axis=-1)
-        digit_embedding_table = maybe_cast(self.draft_embed.embedding[1:10], self.dtype)
-        belief_embedding = jnp.einsum(
-            "bnd,dk->bnk",
-            maybe_cast(belief_probs, self.dtype),
-            digit_embedding_table,
-            preferred_element_type=jnp.float32,
-        )
+        belief_embedding = self._belief_embedding(tokens, belief_logits)
         x = (
             base_embeddings
             + belief_embedding
@@ -495,6 +506,27 @@ class BRCSudokuModel(nnx.Module):
         next_belief = 0.5 * belief_logits.astype(jnp.float32) + delta
         return self._clamp_belief_logits(next_belief, tokens)
 
+    def initial_recurrent_state(
+        self,
+        tokens: Array,
+        z: Array,
+        initial_belief: Array,
+    ) -> tuple[Array, Array, Array]:
+        position_embeddings = self._position_embeddings()
+        given = self.condition_mask(tokens)
+        base_embeddings = (
+            self.puzzle_embed(tokens.astype(jnp.int32))
+            + self.given_embed(given.astype(jnp.int32))
+            + position_embeddings[None, :, :]
+        )
+        init_belief_embedding = self._belief_embedding(tokens, initial_belief)
+        state_init_input = (base_embeddings + init_belief_embedding) * math.sqrt(1.0 / 4.0)
+        latent_hidden = self.latent_to_hidden(maybe_cast(z, self.dtype)).astype(jnp.float32)
+        h_bias = self.h0[...][None, None, :].astype(jnp.float32)
+        h = self.state_init_to_hidden(maybe_cast(state_init_input, self.dtype)).astype(jnp.float32)
+        h = _rms_norm(h + latent_hidden[:, None, :] + h_bias).astype(self.dtype)
+        return h, base_embeddings, given
+
     def run_diffusion(
         self,
         tokens: Array,
@@ -514,19 +546,9 @@ class BRCSudokuModel(nnx.Module):
                 initial_belief = self.initial_belief_logits(tokens)
             else:
                 initial_belief = self.belief_logits_from_draft(tokens, initial_draft)
-        batch_size = tokens.shape[0]
-        latent_hidden = self.latent_to_hidden(maybe_cast(z, self.dtype)).astype(jnp.float32)
-        h = self.h0[...][None, None, :].astype(jnp.float32) + latent_hidden[:, None, :]
-        h = jnp.broadcast_to(h, (batch_size, self.config.seq_len, self.config.d_model)).astype(self.dtype)
-        position_embeddings = self._position_embeddings()
-        given = self.condition_mask(tokens)
+        h, base_embeddings, given = self.initial_recurrent_state(tokens, z, initial_belief)
         unknown = (~given).astype(jnp.float32)
         unknown_normalizer = jnp.maximum(jnp.sum(unknown), 1.0)
-        base_embeddings = (
-            self.puzzle_embed(tokens.astype(jnp.int32))
-            + self.given_embed(given.astype(jnp.int32))
-            + position_embeddings[None, :, :]
-        )
 
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key, time_embedding = scan_inputs

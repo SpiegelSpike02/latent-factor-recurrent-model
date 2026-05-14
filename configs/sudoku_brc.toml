@@ -26,9 +26,13 @@ inner_steps = 4
 latent_lr = 0.1
 latent_grad_clip_norm = 1.0
 latent_update_clip_norm = 0.5
+# Denoise is implemented as an initial belief-space sampling strategy, not as
+# an extra side trajectory or token-level puzzle corruption. Modes are:
+# uniform/full-mask, teacher-partial belief, corrupt-solution belief,
+# soft candidate belief.
 denoise_initial_prob = 0.4
 denoise_teacher_reveal_prob = 0.25
-denoise_mode_weights = [0.3, 0.15, 0.25, 0.3]
+denoise_mode_weights = [0.35, 0.20, 0.30, 0.15]
 verifier_loss_weight = 0.2
 meta_loss_weight = 0.0
 fit_given_weight = 0.2

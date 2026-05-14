@@ -294,6 +294,11 @@ class GridModelTests(unittest.TestCase):
             "given_consistency",
             "invalid_board_rate",
             "conflict_count",
+            "belief_init_noise_rate",
+            "belief_init_uniform_rate",
+            "belief_init_teacher_rate",
+            "belief_init_corrupt_rate",
+            "belief_init_soft_rate",
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
@@ -686,7 +691,7 @@ class GridModelTests(unittest.TestCase):
                 "fit_energy_weight = 0.75\n"
                 "denoise_initial_prob = 0.4\n"
                 "denoise_teacher_reveal_prob = 0.25\n"
-                "denoise_mode_weights = [0.3, 0.15, 0.25, 0.3]\n",
+                "denoise_mode_weights = [0.35, 0.20, 0.30, 0.15]\n",
                 encoding="utf-8",
             )
             loaded = load_toml_config(str(config_path))
@@ -698,7 +703,7 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_meta_loss_weight"], 0.5)
             self.assertEqual(loaded["brc_fit_energy_weight"], 0.75)
             self.assertEqual(loaded["brc_denoise_initial_prob"], 0.4)
-            self.assertEqual(loaded["brc_denoise_mode_weights"], [0.3, 0.15, 0.25, 0.3])
+            self.assertEqual(loaded["brc_denoise_mode_weights"], [0.35, 0.20, 0.30, 0.15])
 
             trm_config_path = Path(tmpdir) / "trm.toml"
             trm_config_path.write_text(
