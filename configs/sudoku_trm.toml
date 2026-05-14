@@ -17,7 +17,7 @@ l_layers = 2
 num_heads = 8
 mlp_ratio = 4
 mlp_t = false
-attention_type = "gated_dual"
+attention_type = "local_global_gate"
 local_mixing = false
 local_mixing_kernel = 3
 puzzle_emb_ndim = 0
@@ -52,7 +52,7 @@ log_every = 10
 eval_every = 2500
 eval_batches = 32
 trm_train_mode = "dense_unroll"
-q_loss_weight = 0.0
+halt_loss_weight = 0.5
 seed = 0
 checkpoint_dir = "checkpoints"
 

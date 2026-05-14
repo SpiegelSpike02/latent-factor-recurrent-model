@@ -21,7 +21,6 @@ class TRMConfig:
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     halt_exploration_prob: float = 0.1
-    no_act_continue: bool = True
     step_loss_weights: tuple[float, ...] | None = None
 
 
@@ -99,7 +98,7 @@ class TrainConfig:
     eval_every: int = 100
     eval_batches: int = 20
     trm_train_mode: str = "act"
-    q_loss_weight: float = 0.0
+    halt_loss_weight: float = 0.0
     terminal_residual_weight: float = 0.0
     seed: int = 0
     checkpoint_dir: str = "checkpoints"

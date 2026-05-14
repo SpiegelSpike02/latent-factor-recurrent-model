@@ -78,7 +78,7 @@ ALLOWED_SECTION_KEYS = {
         "eval_every",
         "eval_batches",
         "trm_train_mode",
-        "q_loss_weight",
+        "halt_loss_weight",
         "terminal_residual_weight",
         "seed",
         "checkpoint_dir",
@@ -105,7 +105,6 @@ ALLOWED_NESTED_KEYS = {
         "rms_norm_eps",
         "rope_theta",
         "halt_exploration_prob",
-        "no_act_continue",
         "step_loss_weights",
     },
     "brc": {
@@ -192,7 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="TRM training path: ACT single-step carry or full-unroll dense CE.",
     )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--q-loss-weight", type=float, default=0.0)
+    parser.add_argument("--halt-loss-weight", type=float, default=0.0)
     parser.add_argument("--terminal-residual-weight", type=float, default=0.0)
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ema-decay", type=float, default=0.999)
@@ -207,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-num-heads", type=int, default=8)
     parser.add_argument("--trm-mlp-ratio", type=int, default=4)
     parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--trm-attention-type", choices=("standard", "gated_dual"), default="standard")
+    parser.add_argument("--trm-attention-type", choices=("standard", "local_global_gate"), default="standard")
     parser.add_argument("--trm-local-mixing", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trm-local-mixing-kernel", type=int, default=3)
     parser.add_argument("--trm-puzzle-emb-ndim", type=int, default=0)
@@ -216,7 +215,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--trm-rope-theta", type=float, default=10000.0)
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
-    parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-latent-dim", type=int, default=128)
     parser.add_argument("--brc-num-heads", type=int, default=4)
@@ -295,7 +293,6 @@ def build_config(
             rms_norm_eps=args.trm_rms_norm_eps,
             rope_theta=args.trm_rope_theta,
             halt_exploration_prob=args.trm_halt_exploration_prob,
-            no_act_continue=args.trm_no_act_continue,
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
         brc=BRCSudokuConfig(
@@ -342,7 +339,7 @@ def build_config(
         eval_every=args.eval_every,
         eval_batches=args.eval_batches,
         trm_train_mode=args.trm_train_mode,
-        q_loss_weight=args.q_loss_weight,
+        halt_loss_weight=args.halt_loss_weight,
         terminal_residual_weight=args.terminal_residual_weight,
         seed=args.seed,
         checkpoint_dir=args.checkpoint_dir,
@@ -663,12 +660,12 @@ CORE_SCALAR_METRICS = (
     "true_energy",
     "fake_energy",
     "step_loss_weights",
-    "q_loss",
-    "q_selected_blank_ce_loss",
-    "q_selected_blank_cell_accuracy",
-    "q_selected_solved_rate",
-    "q_selected_solved_count",
-    "q_selected_step",
+    "halt_loss",
+    "halt_selected_blank_ce_loss",
+    "halt_selected_blank_cell_accuracy",
+    "halt_selected_solved_rate",
+    "halt_selected_solved_count",
+    "halt_selected_step",
     "oracle_step",
     "act_step",
     "halted_rate",
@@ -685,7 +682,7 @@ TERMINAL_DIAGNOSTIC_METRICS = (
 INTEGER_SCALAR_METRICS = {
     "unroll_steps",
     "solved_count",
-    "q_selected_solved_count",
+    "halt_selected_solved_count",
     "final_solved_count",
 }
 METRIC_DISPLAY_NAMES = {
@@ -698,10 +695,10 @@ METRIC_DISPLAY_NAMES = {
     "target_probability": "p_target",
     "solved_rate": "solved",
     "final_solved_rate": "solved_final",
-    "q_selected_blank_ce_loss": "q_ce",
-    "q_selected_blank_cell_accuracy": "q_acc",
-    "q_selected_solved_rate": "q_solved",
-    "q_selected_step": "q_step",
+    "halt_selected_blank_ce_loss": "halt_ce",
+    "halt_selected_blank_cell_accuracy": "halt_acc",
+    "halt_selected_solved_rate": "halt_solved",
+    "halt_selected_step": "halt_step",
     "oracle_step": "oracle_step",
     "act_step": "act_step",
     "unroll_steps": "unroll",
@@ -725,7 +722,7 @@ METRIC_GROUPS = (
             "mean_blank_ce_loss",
             "verifier_loss",
             "meta_outer_loss",
-            "q_loss",
+            "halt_loss",
         ),
     ),
     (
@@ -743,13 +740,13 @@ METRIC_GROUPS = (
     (
         "selection",
         (
-            "q_selected_step",
+            "halt_selected_step",
             "oracle_step",
             "act_step",
-            "q_selected_blank_ce_loss",
-            "q_selected_blank_cell_accuracy",
-            "q_selected_solved_rate",
-            "q_selected_solved_count",
+            "halt_selected_blank_ce_loss",
+            "halt_selected_blank_cell_accuracy",
+            "halt_selected_solved_rate",
+            "halt_selected_solved_count",
         ),
     ),
     (
@@ -897,18 +894,18 @@ def main() -> None:
     if config.model.model_type == "trm":
         if config.train.trm_train_mode == "dense_unroll":
             train_step_fn = build_trm_dense_unroll_train_step_runner(
-                q_loss_weight=config.train.q_loss_weight,
+                halt_loss_weight=config.train.halt_loss_weight,
             )
         else:
-            train_step_fn = build_trm_act_train_step_runner(config.train.q_loss_weight)
-        eval_step_fn = build_trm_eval_step_runner(config.train.q_loss_weight)
+            train_step_fn = build_trm_act_train_step_runner(config.train.halt_loss_weight)
+        eval_step_fn = build_trm_eval_step_runner(config.train.halt_loss_weight)
     else:
         train_step_fn = build_train_step_runner(
-            config.train.q_loss_weight,
+            config.train.halt_loss_weight,
             config.train.terminal_residual_weight,
         )
         eval_step_fn = build_eval_step_runner(
-            config.train.q_loss_weight,
+            config.train.halt_loss_weight,
             config.train.terminal_residual_weight,
         )
     ema_model = create_ema_model(model, config) if config.train.use_ema else None
@@ -1063,11 +1060,11 @@ def main() -> None:
                                 eval_metrics["per_step_hidden_delta"],
                             )
                         )
-                        if "per_step_quality_score" in eval_metrics:
+                        if "per_step_halt_probability" in eval_metrics:
                             eval_log.update(
                                 flatten_step_metrics(
-                                    f"{prefix}/quality_by_step",
-                                    eval_metrics["per_step_quality_score"],
+                                    f"{prefix}/halt_probability_by_step",
+                                    eval_metrics["per_step_halt_probability"],
                                 )
                             )
                         wandb_run.log(eval_log, step=step, commit=commit)
@@ -1087,7 +1084,7 @@ def main() -> None:
                                 format_step_summary("delta", eval_metrics["per_step_hidden_delta"]),
                                 format_step_summary("h_delta", eval_metrics.get("per_step_h_hidden_delta", [])),
                                 format_step_summary("l_delta", eval_metrics.get("per_step_l_hidden_delta", [])),
-                                format_step_summary("q", eval_metrics.get("per_step_quality_score", [])),
+                                format_step_summary("halt", eval_metrics.get("per_step_halt_probability", [])),
                             ]
                         )
                     )

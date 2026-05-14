@@ -348,6 +348,12 @@ def _trm_step_loss_weights(model: GridReasoningModel, num_steps: int) -> jax.Arr
     return _normalized_step_loss_weights(getattr(trm_config, "step_loss_weights", None), num_steps)
 
 
+def _trm_halt_selected_step(halt_logits: jax.Array) -> jax.Array:
+    step_halted = halt_logits > 0.0
+    step_halted = step_halted.at[-1, :].set(True)
+    return jnp.argmax(step_halted.astype(jnp.int32), axis=0)
+
+
 def brc_loss_and_metrics(
     model: BRCSudokuModel,
     batch: dict[str, jax.Array],
@@ -530,11 +536,11 @@ def loss_and_metrics(
     batch: dict[str, jax.Array],
     train: bool,
     dropout_key: jax.Array | None,
-    q_loss_weight: float = 0.0,
+    halt_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     if isinstance(model, BRCSudokuModel):
-        del q_loss_weight, terminal_residual_weight
+        del halt_loss_weight, terminal_residual_weight
         return brc_loss_and_metrics(
             model,
             batch,
@@ -581,26 +587,22 @@ def loss_and_metrics(
     blanks_per_example = jnp.sum(loss_mask, axis=-1)
     step_predictions = jnp.argmax(effective_step_logits, axis=-1)
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask
-    per_step_example_accuracy = jnp.sum(step_correct, axis=-1) / per_example_normalizer[None, :]
     step_correct_per_example = jnp.sum(step_correct, axis=-1)
     per_step_example_solved = jnp.where(
         blanks_per_example[None, :] > 0,
         step_correct_per_example == blanks_per_example[None, :],
         True,
     )
-    quality_logits = diagnostics.get("quality_logits")
-    q_loss = jnp.asarray(0.0, dtype=jnp.float32)
-    q_selected_logits = effective_step_logits[-1]
-    q_selected_step = jnp.full((inputs.shape[0],), effective_step_logits.shape[0] - 1, dtype=jnp.int32)
-    if quality_logits is not None and q_loss_weight != 0.0:
-        if "quality_target_solved" in diagnostics:
-            q_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
-        else:
-            q_targets = jax.lax.stop_gradient(per_step_example_accuracy)
-        q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(quality_logits, q_targets))
-        q_selected_step = jnp.argmax(quality_logits, axis=0)
-        gather_index = q_selected_step[None, :, None, None]
-        q_selected_logits = jnp.take_along_axis(
+    halt_logits = diagnostics.get("halt_logits")
+    halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    halt_selected_logits = effective_step_logits[-1]
+    halt_selected_step = jnp.full((inputs.shape[0],), effective_step_logits.shape[0] - 1, dtype=jnp.int32)
+    if halt_logits is not None and halt_loss_weight != 0.0:
+        halt_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
+        halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(halt_logits, halt_targets))
+        halt_selected_step = _trm_halt_selected_step(halt_logits)
+        gather_index = halt_selected_step[None, :, None, None]
+        halt_selected_logits = jnp.take_along_axis(
             effective_step_logits,
             jnp.broadcast_to(gather_index, (1, inputs.shape[0], effective_step_logits.shape[2], effective_step_logits.shape[3])),
             axis=0,
@@ -611,7 +613,7 @@ def loss_and_metrics(
     )
     loss = (
         blank_ce_loss
-        + q_loss_weight * q_loss
+        + halt_loss_weight * halt_loss
         + terminal_residual_weight * terminal_residual
     )
 
@@ -631,45 +633,45 @@ def loss_and_metrics(
     )
     solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
     solved_count = jnp.sum(solved_examples.astype(jnp.float32))
-    if q_loss_weight != 0.0:
-        q_selected_token_loss = optax.softmax_cross_entropy_with_integer_labels(q_selected_logits, targets)
-        q_selected_ce_loss = jnp.sum(q_selected_token_loss * loss_mask) / normalizer
-        q_selected_predictions = jnp.argmax(q_selected_logits, axis=-1)
-        q_selected_correct = (q_selected_predictions == targets).astype(jnp.float32) * loss_mask
-        q_selected_accuracy = jnp.sum(q_selected_correct) / normalizer
-        q_selected_correct_per_example = jnp.sum(q_selected_correct, axis=-1)
-        q_selected_solved_examples = jnp.where(
+    if halt_loss_weight != 0.0:
+        halt_selected_token_loss = optax.softmax_cross_entropy_with_integer_labels(halt_selected_logits, targets)
+        halt_selected_ce_loss = jnp.sum(halt_selected_token_loss * loss_mask) / normalizer
+        halt_selected_predictions = jnp.argmax(halt_selected_logits, axis=-1)
+        halt_selected_correct = (halt_selected_predictions == targets).astype(jnp.float32) * loss_mask
+        halt_selected_accuracy = jnp.sum(halt_selected_correct) / normalizer
+        halt_selected_correct_per_example = jnp.sum(halt_selected_correct, axis=-1)
+        halt_selected_solved_examples = jnp.where(
             blanks_per_example > 0,
-            q_selected_correct_per_example == blanks_per_example,
+            halt_selected_correct_per_example == blanks_per_example,
             True,
         )
-        q_selected_solved_rate = jnp.mean(q_selected_solved_examples.astype(jnp.float32))
+        halt_selected_solved_rate = jnp.mean(halt_selected_solved_examples.astype(jnp.float32))
     else:
-        q_selected_ce_loss = per_step_loss[-1]
-        q_selected_accuracy = blank_cell_accuracy
-        q_selected_solved_rate = solved_rate
+        halt_selected_ce_loss = per_step_loss[-1]
+        halt_selected_accuracy = blank_cell_accuracy
+        halt_selected_solved_rate = solved_rate
     oracle_step = jnp.argmin(per_step_example_loss, axis=0)
 
     metrics = {
         "loss": loss,
         "blank_ce_loss": blank_ce_loss,
         "step_weighted_ce_loss": blank_ce_loss,
-        "q_loss": q_loss,
+        "halt_loss": halt_loss,
         "final_blank_ce_loss": per_step_loss[-1],
         "target_probability": target_probability,
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
-        "q_selected_blank_ce_loss": q_selected_ce_loss,
-        "q_selected_blank_cell_accuracy": q_selected_accuracy,
-        "q_selected_solved_rate": q_selected_solved_rate,
-        "q_selected_step": jnp.mean(q_selected_step.astype(jnp.float32) + 1.0),
+        "halt_selected_blank_ce_loss": halt_selected_ce_loss,
+        "halt_selected_blank_cell_accuracy": halt_selected_accuracy,
+        "halt_selected_solved_rate": halt_selected_solved_rate,
+        "halt_selected_step": jnp.mean(halt_selected_step.astype(jnp.float32) + 1.0),
         "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_weights,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
     }
-    if quality_logits is not None and q_loss_weight != 0.0:
-        metrics["per_step_quality_score"] = jax.nn.sigmoid(jnp.mean(quality_logits, axis=1))
+    if halt_logits is not None and halt_loss_weight != 0.0:
+        metrics["per_step_halt_probability"] = jax.nn.sigmoid(jnp.mean(halt_logits, axis=1))
     if "terminal_belief_delta" in diagnostics or terminal_residual_weight != 0.0:
         metrics["terminal_belief_delta"] = diagnostics.get("terminal_belief_delta", terminal_residual)
     if "terminal_belief_mse" in diagnostics or terminal_residual_weight != 0.0:
@@ -694,11 +696,11 @@ def loss_and_metrics(
         "attention_gate_low_saturation",
         "attention_gate_high_saturation",
         "attention_local_distance_scale",
-        "q_loss",
-        "q_selected_blank_ce_loss",
-        "q_selected_blank_cell_accuracy",
-        "q_selected_solved_rate",
-        "q_selected_step",
+        "halt_loss",
+        "halt_selected_blank_ce_loss",
+        "halt_selected_blank_cell_accuracy",
+        "halt_selected_solved_rate",
+        "halt_selected_step",
         "oracle_step",
     ):
         if key in diagnostics:
@@ -712,7 +714,7 @@ def trm_act_loss_and_metrics(
     batch: dict[str, jax.Array],
     train: bool,
     dropout_key: jax.Array | None,
-    q_loss_weight: float = 0.5,
+    halt_loss_weight: float = 0.5,
     puzzle_embeddings: jax.Array | None = None,
 ) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
     new_carry, logits, diagnostics = model.forward_act_step(
@@ -748,8 +750,8 @@ def trm_act_loss_and_metrics(
     solved_rate = jnp.mean(solved_targets)
     solved_count = jnp.sum(solved_targets)
 
-    q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(diagnostics["quality_logits"], solved_targets))
-    loss = blank_ce_loss + q_loss_weight * q_loss
+    halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(diagnostics["halt_logits"], solved_targets))
+    loss = blank_ce_loss + halt_loss_weight * halt_loss
 
     probs = jax.nn.softmax(logits, axis=-1)
     target_probability = jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
@@ -762,7 +764,7 @@ def trm_act_loss_and_metrics(
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
         "solved_count": solved_count,
-        "q_loss": q_loss,
+        "halt_loss": halt_loss,
         "act_step": diagnostics["act_step"],
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
@@ -781,7 +783,7 @@ def trm_dense_unroll_loss_and_metrics(
     train: bool,
     dropout_key: jax.Array | None,
     *,
-    q_loss_weight: float = 0.0,
+    halt_loss_weight: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     inputs = batch["inputs"]
     targets = batch["labels"]
@@ -836,13 +838,13 @@ def trm_dense_unroll_loss_and_metrics(
     solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
     solved_count = jnp.sum(solved_examples.astype(jnp.float32))
 
-    quality_logits = diagnostics.get("quality_logits")
-    q_loss = jnp.asarray(0.0, dtype=jnp.float32)
-    if quality_logits is not None and q_loss_weight != 0.0:
-        q_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
-        q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(quality_logits, q_targets))
+    halt_logits = diagnostics.get("halt_logits")
+    halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    if halt_logits is not None and halt_loss_weight != 0.0:
+        halt_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
+        halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(halt_logits, halt_targets))
 
-    loss = blank_ce_loss + q_loss_weight * q_loss
+    loss = blank_ce_loss + halt_loss_weight * halt_loss
     oracle_step = jnp.argmin(
         jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :],
         axis=0,
@@ -857,15 +859,15 @@ def trm_dense_unroll_loss_and_metrics(
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
         "solved_count": solved_count,
-        "q_loss": q_loss,
+        "halt_loss": halt_loss,
         "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_weights,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
         "unroll_steps": jnp.asarray(step_logits.shape[0], dtype=jnp.float32),
     }
-    if quality_logits is not None and q_loss_weight != 0.0:
-        metrics["per_step_quality_score"] = jax.nn.sigmoid(jnp.mean(quality_logits, axis=1))
+    if halt_logits is not None and halt_loss_weight != 0.0:
+        metrics["per_step_halt_probability"] = jax.nn.sigmoid(jnp.mean(halt_logits, axis=1))
     for key in (
         "attention_gate_mean",
         "attention_gate_std",
@@ -881,7 +883,7 @@ def trm_dense_unroll_loss_and_metrics(
 def trm_eval_loss_and_metrics(
     model: TinyRecursiveModel,
     batch: dict[str, jax.Array],
-    q_loss_weight: float = 0.5,
+    halt_loss_weight: float = 0.5,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     inputs = batch["inputs"]
     targets = batch["labels"]
@@ -932,14 +934,8 @@ def trm_eval_loss_and_metrics(
         l_predictions = jnp.argmax(l_logits, axis=-1)
         l_correct = (l_predictions == step_targets).astype(jnp.float32) * step_loss_mask
         l_per_step_accuracy = jnp.sum(l_correct, axis=(1, 2)) / normalizer
-    quality_logits = diagnostics["quality_logits"]
-    q_continue_logits = diagnostics.get("q_continue_logits")
-    if model.trm.no_act_continue or q_continue_logits is None:
-        step_halted = quality_logits > 0.0
-    else:
-        step_halted = quality_logits > q_continue_logits
-    step_halted = step_halted.at[-1, :].set(True)
-    selected_step = jnp.argmax(step_halted.astype(jnp.int32), axis=0)
+    halt_logits = diagnostics["halt_logits"]
+    selected_step = _trm_halt_selected_step(halt_logits)
     gather_index = selected_step[None, :, None, None]
     selected_logits = jnp.take_along_axis(
         step_logits,
@@ -954,8 +950,8 @@ def trm_eval_loss_and_metrics(
         axis=0,
     ).squeeze(0)
     selected_solved_count = jnp.sum(selected_solved_targets)
-    q_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(quality_logits, jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))))
-    loss = blank_ce_loss + q_loss_weight * q_loss
+    halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(halt_logits, jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))))
+    loss = blank_ce_loss + halt_loss_weight * halt_loss
 
     predictions = jnp.argmax(selected_logits, axis=-1)
     selected_probs = jax.nn.softmax(selected_logits, axis=-1)
@@ -981,7 +977,7 @@ def trm_eval_loss_and_metrics(
     metrics = {
         "loss": loss,
         "blank_ce_loss": blank_ce_loss,
-        "q_loss": q_loss,
+        "halt_loss": halt_loss,
         "final_blank_ce_loss": final_blank_ce_loss,
         "final_blank_cell_accuracy": final_blank_cell_accuracy,
         "final_solved_rate": jnp.mean(final_solved_examples.astype(jnp.float32)),
@@ -989,11 +985,11 @@ def trm_eval_loss_and_metrics(
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
         "solved_count": selected_solved_count,
-        "q_selected_blank_ce_loss": blank_ce_loss,
-        "q_selected_blank_cell_accuracy": blank_cell_accuracy,
-        "q_selected_solved_rate": solved_rate,
-        "q_selected_solved_count": selected_solved_count,
-        "q_selected_step": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
+        "halt_selected_blank_ce_loss": blank_ce_loss,
+        "halt_selected_blank_cell_accuracy": blank_cell_accuracy,
+        "halt_selected_solved_rate": solved_rate,
+        "halt_selected_solved_count": selected_solved_count,
+        "halt_selected_step": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
         "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
         "final_solved_count": final_solved_count,
         "per_step_loss": per_step_loss,
@@ -1004,7 +1000,7 @@ def trm_eval_loss_and_metrics(
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
         "per_step_h_hidden_delta": diagnostics.get("h_hidden_delta_mean", diagnostics["hidden_delta_mean"]),
         "per_step_l_hidden_delta": diagnostics.get("l_hidden_delta_mean", jnp.zeros_like(diagnostics["hidden_delta_mean"])),
-        "per_step_quality_score": jax.nn.sigmoid(jnp.mean(quality_logits, axis=1)),
+        "per_step_halt_probability": jax.nn.sigmoid(jnp.mean(halt_logits, axis=1)),
         "unroll_steps": jnp.asarray(step_logits.shape[0], dtype=jnp.int32),
     }
     for key in (
@@ -1020,7 +1016,7 @@ def trm_eval_loss_and_metrics(
 
 
 def build_train_step_runner(
-    q_loss_weight: float = 0.0,
+    halt_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
 ):
     def train_step_with_weight(
@@ -1035,7 +1031,7 @@ def build_train_step_runner(
                 batch,
                 train,
                 dropout_key,
-                q_loss_weight,
+                halt_loss_weight,
                 terminal_residual_weight,
             )
 
@@ -1047,7 +1043,7 @@ def build_train_step_runner(
     return nnx.jit(train_step_with_weight)
 
 
-def build_trm_act_train_step_runner(q_loss_weight: float = 0.5):
+def build_trm_act_train_step_runner(halt_loss_weight: float = 0.5):
     def train_step(
         model: TinyRecursiveModel,
         optimizer: nnx.Optimizer,
@@ -1062,7 +1058,7 @@ def build_trm_act_train_step_runner(q_loss_weight: float = 0.5):
                 batch,
                 train,
                 dropout_key,
-                q_loss_weight,
+                halt_loss_weight,
             )
 
         (_, (metrics, new_carry)), grads = nnx.value_and_grad(objective, has_aux=True)(
@@ -1080,7 +1076,7 @@ def build_trm_act_train_step_runner(q_loss_weight: float = 0.5):
 
 def build_trm_dense_unroll_train_step_runner(
     *,
-    q_loss_weight: float = 0.0,
+    halt_loss_weight: float = 0.0,
 ):
     def train_step(
         model: TinyRecursiveModel,
@@ -1094,7 +1090,7 @@ def build_trm_dense_unroll_train_step_runner(
                 batch,
                 train,
                 dropout_key,
-                q_loss_weight=q_loss_weight,
+                halt_loss_weight=halt_loss_weight,
             )
 
         (_, metrics), grads = nnx.value_and_grad(objective, has_aux=True)(
@@ -1110,7 +1106,7 @@ def build_trm_dense_unroll_train_step_runner(
 
 
 def build_eval_step_runner(
-    q_loss_weight: float = 0.0,
+    halt_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
 ):
     def eval_step_with_weight(
@@ -1122,7 +1118,7 @@ def build_eval_step_runner(
             batch,
             False,
             None,
-            q_loss_weight,
+            halt_loss_weight,
             terminal_residual_weight,
         )
         return metrics
@@ -1130,7 +1126,7 @@ def build_eval_step_runner(
     return nnx.jit(eval_step_with_weight)
 
 
-def build_trm_eval_step_runner(q_loss_weight: float = 0.5):
+def build_trm_eval_step_runner(halt_loss_weight: float = 0.5):
     def eval_step(
         model: TinyRecursiveModel,
         batch: dict[str, jax.Array],
@@ -1138,7 +1134,7 @@ def build_trm_eval_step_runner(q_loss_weight: float = 0.5):
         _, metrics = trm_eval_loss_and_metrics(
             model,
             batch,
-            q_loss_weight,
+            halt_loss_weight,
         )
         return metrics
 

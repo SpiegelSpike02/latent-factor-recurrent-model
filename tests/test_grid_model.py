@@ -152,12 +152,12 @@ class GridModelTests(unittest.TestCase):
             include_layer_diagnostics=True,
         )
         self.assertEqual(logits.shape, (2, 1, 9, 11))
-        self.assertEqual(diagnostics["quality_logits"].shape, (2, 1))
+        self.assertEqual(diagnostics["halt_logits"].shape, (2, 1))
         self.assertEqual(diagnostics["l_logits"].shape, (2, 1, 9, 11))
         self.assertEqual(diagnostics["h_hidden_delta_mean"].shape, (2,))
         self.assertEqual(diagnostics["l_hidden_delta_mean"].shape, (2,))
-        _, metrics = loss_and_metrics(model, batch, True, jax.random.key(2), q_loss_weight=0.1)
-        for key in ("loss", "q_loss", "q_selected_blank_ce_loss", "blank_cell_accuracy"):
+        _, metrics = loss_and_metrics(model, batch, True, jax.random.key(2), halt_loss_weight=0.1)
+        for key in ("loss", "halt_loss", "halt_selected_blank_ce_loss", "blank_cell_accuracy"):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
         dense_loss, dense_metrics = trm_dense_unroll_loss_and_metrics(
@@ -371,7 +371,7 @@ class GridModelTests(unittest.TestCase):
         )
         blank_digit_logits = logits[-1, 0, 1, 2:]
         self.assertGreater(float(jnp.std(blank_digit_logits)), 1e-6)
-        self.assertIn("quality_logits", diagnostics)
+        self.assertIn("halt_logits", diagnostics)
 
     def test_trm_rel2d_position_bias_forward_is_finite(self) -> None:
         model = TinyRecursiveModel(
@@ -409,7 +409,7 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(model.rel2d_col_bias[...].shape, (3, 5))
         self.assertEqual(attention_bias.shape, (3, 9, 9))
         self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
-        self.assertIn("quality_logits", diagnostics)
+        self.assertIn("halt_logits", diagnostics)
 
     def test_trm_local_mixing_forward_is_finite(self) -> None:
         model = TinyRecursiveModel(
@@ -447,7 +447,7 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
         self.assertIn("l_logits", diagnostics)
 
-    def test_trm_gated_dual_attention_forward_is_finite(self) -> None:
+    def test_trm_local_global_gate_attention_forward_is_finite(self) -> None:
         model = TinyRecursiveModel(
             ModelConfig(
                 vocab_size=11,
@@ -466,7 +466,7 @@ class GridModelTests(unittest.TestCase):
                     mlp_t=False,
                     puzzle_emb_len=0,
                     pos_encodings="rel2d",
-                    attention_type="gated_dual",
+                    attention_type="local_global_gate",
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -533,14 +533,14 @@ class GridModelTests(unittest.TestCase):
                 weight_decay=1.0,
                 warmup_steps=1,
             ),
-            train=TrainConfig(batch_size=2, max_steps=2, q_loss_weight=0.5),
+            train=TrainConfig(batch_size=2, max_steps=2, halt_loss_weight=0.5),
             data=DataConfig(),
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
         )
         model = create_model(config)
         optimizer = create_optimizer(model, config)
-        train_step = build_trm_act_train_step_runner(config.train.q_loss_weight)
+        train_step = build_trm_act_train_step_runner(config.train.halt_loss_weight)
         batch = {
             "inputs": jnp.asarray(
                 [[2, 1, 3, 1, 1, 4, 1, 5, 1], [3, 1, 2, 1, 1, 5, 1, 4, 1]],
@@ -602,8 +602,8 @@ class GridModelTests(unittest.TestCase):
         self.assertNotIn("h_init", str(params))
         self.assertNotIn("l_init", str(params))
 
-    def test_q_selected_metrics_use_quality_head_step(self) -> None:
-        class QualitySelectedModel:
+    def test_halt_selected_metrics_use_first_positive_halt_step(self) -> None:
+        class HaltSelectedModel:
             def forward_all_steps_with_diagnostics(self, inputs, train: bool, dropout_key=None):
                 del inputs, train, dropout_key
                 logits = jnp.full((2, 1, 4, 11), -10.0)
@@ -613,7 +613,7 @@ class GridModelTests(unittest.TestCase):
                 logits = logits.at[1, 0, 1, 3].set(10.0)
                 diagnostics = {
                     "hidden_delta_mean": jnp.asarray([0.0, 0.0], dtype=jnp.float32),
-                    "quality_logits": jnp.asarray([[0.0], [4.0]], dtype=jnp.float32),
+                    "halt_logits": jnp.asarray([[1.0], [4.0]], dtype=jnp.float32),
                 }
                 return logits, diagnostics
 
@@ -622,10 +622,10 @@ class GridModelTests(unittest.TestCase):
             "labels": jnp.asarray([[2, 3, 0, 0]], dtype=jnp.int32),
             "given_mask": jnp.asarray([[False, False, True, True]], dtype=bool),
         }
-        _, metrics = loss_and_metrics(QualitySelectedModel(), batch, False, None)
+        _, metrics = loss_and_metrics(HaltSelectedModel(), batch, False, None, halt_loss_weight=0.1)
         self.assertAlmostEqual(float(metrics["blank_cell_accuracy"]), 1.0, places=6)
-        self.assertAlmostEqual(float(metrics["q_selected_blank_cell_accuracy"]), 1.0, places=6)
-        self.assertAlmostEqual(float(metrics["q_selected_step"]), 2.0, places=6)
+        self.assertAlmostEqual(float(metrics["halt_selected_blank_cell_accuracy"]), 0.5, places=6)
+        self.assertAlmostEqual(float(metrics["halt_selected_step"]), 1.0, places=6)
 
     def test_clamp_logits_to_given_uses_given_mask_not_blank_id(self) -> None:
         logits = jnp.zeros((2, 1, 4, 6), dtype=jnp.float32)

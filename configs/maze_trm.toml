@@ -18,7 +18,7 @@ l_layers = 4
 num_heads = 8
 mlp_ratio = 4
 mlp_t = false
-attention_type = "gated_dual"
+attention_type = "local_global_gate"
 local_mixing = true
 local_mixing_kernel = 3
 puzzle_emb_ndim = 512
@@ -47,12 +47,12 @@ flatten_optimizer = true
 [train]
 batch_size = 64
 eval_batch_size = 128
-max_steps = 20000
+max_steps = 70000
 log_every = 10
 eval_every = 2000
 eval_batches = 32
 trm_train_mode = "act"
-q_loss_weight = 0.5
+halt_loss_weight = 0.5
 seed = 0
 checkpoint_dir = "checkpoints"
 
@@ -66,5 +66,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-trm-rope-gated-act-masked-aug"
+name = "maze-trm-rope-gated-act-masked-aug-70k"
 mode = "online"
