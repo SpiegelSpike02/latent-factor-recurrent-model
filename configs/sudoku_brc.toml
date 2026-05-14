@@ -6,14 +6,14 @@ model_type = "brc_sudoku"
 seq_len = 81
 grid_height = 9
 grid_width = 9
-d_model = 128
+d_model = 512
 num_steps = 24
 dropout_rate = 0.05
 
 [model.brc]
-latent_dim = 128
-num_heads = 4
-mlp_ratio = 2
+latent_dim = 512
+num_heads = 8
+mlp_ratio = 4
 # Relative CE weights for recurrent steps 1..24. The training code normalizes
 # this vector, so the values control schedule shape rather than total scale.
 step_loss_weights = [
@@ -33,7 +33,7 @@ latent_update_clip_norm = 0.5
 denoise_initial_prob = 0.4
 denoise_teacher_reveal_prob = 0.25
 denoise_mode_weights = [0.35, 0.20, 0.30, 0.15]
-verifier_loss_weight = 0.2
+verifier_loss_weight = 0.0
 meta_loss_weight = 0.0
 fit_given_weight = 0.2
 fit_energy_weight = 1.0
@@ -43,19 +43,19 @@ verifier_layers = 4
 verifier_margin = 1.0
 
 [optimizer]
-learning_rate = 3e-4
-lr_min_ratio = 0.1
+learning_rate = 1e-5
+lr_min_ratio = 0.35
 beta1 = 0.9
 beta2 = 0.95
-weight_decay = 0.05
-warmup_steps = 2000
+weight_decay = 0.1
+warmup_steps = 20000
 grad_clip_norm = 1.0
 flatten_optimizer = true
 
 [train]
-batch_size = 128
-eval_batch_size = 128
-max_steps = 100000
+batch_size = 64
+eval_batch_size = 256
+max_steps = 30000
 log_every = 10
 eval_every = 2500
 eval_batches = 32
@@ -72,5 +72,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-belief-first"
+name = "sudoku-brc-trm-capacity"
 mode = "online"

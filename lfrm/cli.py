@@ -680,6 +680,9 @@ CORE_SCALAR_METRICS = (
     "final_solved_rate",
     "final_solved_count",
 )
+WANDB_HISTORY_EXCLUDED_SCALAR_METRICS = {
+    "verifier_ranking_accuracy",
+}
 TERMINAL_DIAGNOSTIC_METRICS = (
     "terminal_belief_delta",
     "terminal_belief_mse",
@@ -831,7 +834,26 @@ def scalar_metric_names(config: ExperimentConfig) -> tuple[str, ...]:
     return tuple(names)
 
 
-def optional_scalar_log(prefix: str, metrics: dict[str, Any], names: tuple[str, ...]) -> dict[str, float]:
+def optional_scalar_log(
+    prefix: str,
+    metrics: dict[str, Any],
+    names: tuple[str, ...],
+    *,
+    exclude_history: set[str] | None = None,
+) -> dict[str, float]:
+    log: dict[str, float] = {}
+    excluded = exclude_history or set()
+    for name in names:
+        if name in excluded:
+            continue
+        if name in metrics:
+            value = metrics[name]
+            if np.ndim(np.asarray(value)) == 0:
+                log[f"{prefix}/{name}"] = float(value)
+    return log
+
+
+def optional_summary_log(prefix: str, metrics: dict[str, Any], names: set[str]) -> dict[str, float]:
     log: dict[str, float] = {}
     for name in names:
         if name in metrics:
@@ -1008,7 +1030,15 @@ def main() -> None:
                     "train/solved_rate": float(metrics["solved_rate"]),
                     "train/learning_rate": schedule_learning_rate(config, step),
                 }
-                train_log.update(optional_scalar_log("train", metrics, scalar_metrics))
+                train_log.update(
+                    optional_scalar_log(
+                        "train",
+                        metrics,
+                        scalar_metrics,
+                        exclude_history=WANDB_HISTORY_EXCLUDED_SCALAR_METRICS,
+                    )
+                )
+                train_summary = optional_summary_log("train", metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
                 if "per_step_loss" in metrics:
                     train_log.update(
                         flatten_step_metrics(
@@ -1030,6 +1060,8 @@ def main() -> None:
                         )
                 if wandb_run is not None:
                     wandb_run.log(train_log, step=step, commit=not is_eval_step)
+                    for key, value in train_summary.items():
+                        wandb_run.summary[key] = value
                 summary = grouped_scalar_summary(metrics, scalar_metrics)
                 print(f"[train] step={step} lr={schedule_learning_rate(config, step):.2e}")
                 if summary:
@@ -1055,7 +1087,15 @@ def main() -> None:
                         for metric_name in ("final_blank_cell_accuracy", "final_solved_rate"):
                             if metric_name in eval_metrics:
                                 eval_log[f"{prefix}/{metric_name}"] = eval_metrics[metric_name]
-                        eval_log.update(optional_scalar_log(prefix, eval_metrics, scalar_metrics))
+                        eval_log.update(
+                            optional_scalar_log(
+                                prefix,
+                                eval_metrics,
+                                scalar_metrics,
+                                exclude_history=WANDB_HISTORY_EXCLUDED_SCALAR_METRICS,
+                            )
+                        )
+                        eval_summary = optional_summary_log(prefix, eval_metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
                         eval_log.update(flatten_step_metrics(f"{prefix}/loss_by_step", eval_metrics["per_step_loss"]))
                         for metric_name, log_prefix in (
                             ("per_step_h_loss", "h_loss_by_step"),
@@ -1083,6 +1123,8 @@ def main() -> None:
                                 )
                             )
                         wandb_run.log(eval_log, step=step, commit=commit)
+                        for key, value in eval_summary.items():
+                            wandb_run.summary[key] = value
                     summary = grouped_scalar_summary(eval_metrics, scalar_metrics)
                     print(f"[{label}] step={step}")
                     if summary:
