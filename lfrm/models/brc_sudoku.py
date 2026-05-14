@@ -226,6 +226,16 @@ class BRCSudokuModel(nnx.Module):
                 raise ValueError("BRC step_loss_weights must contain a positive weight")
         if brc.inner_steps < 0:
             raise ValueError("BRC inner_steps must be non-negative")
+        if not 0.0 <= brc.denoise_initial_prob <= 1.0:
+            raise ValueError("BRC denoise_initial_prob must be in [0, 1]")
+        if not 0.0 <= brc.denoise_teacher_reveal_prob <= 1.0:
+            raise ValueError("BRC denoise_teacher_reveal_prob must be in [0, 1]")
+        if len(brc.denoise_mode_weights) != 4:
+            raise ValueError("BRC denoise_mode_weights must contain four weights")
+        if any(weight < 0.0 for weight in brc.denoise_mode_weights):
+            raise ValueError("BRC denoise_mode_weights must be non-negative")
+        if sum(brc.denoise_mode_weights) <= 0.0:
+            raise ValueError("BRC denoise_mode_weights must contain a positive weight")
         if brc.verifier_layers < 1:
             raise ValueError("BRC verifier_layers must be at least 1")
 
@@ -430,14 +440,12 @@ class BRCSudokuModel(nnx.Module):
         self,
         tokens: Array,
         belief_logits: Array,
-        step_index: Array,
+        base_embeddings: Array,
+        time_embedding: Array,
         *,
         train: bool,
         dropout_key: Array | None,
     ) -> Array:
-        given = self.condition_mask(tokens).astype(jnp.int32)
-        time_index = jnp.reshape(step_index.astype(jnp.int32), (1,))
-        time_embedding = self.time_embed(time_index)[0]
         belief_probs = jax.nn.softmax(self._clamp_belief_logits(belief_logits, tokens), axis=-1)
         digit_embedding_table = maybe_cast(self.draft_embed.embedding[1:10], self.dtype)
         belief_embedding = jnp.einsum(
@@ -447,20 +455,19 @@ class BRCSudokuModel(nnx.Module):
             preferred_element_type=jnp.float32,
         )
         x = (
-            self.puzzle_embed(tokens.astype(jnp.int32))
-            + self.given_embed(given)
+            base_embeddings
             + belief_embedding
-            + self._position_embeddings()[None, :, :]
             + time_embedding[None, None, :]
         ) * math.sqrt(1.0 / 5.0)
         return self.dropout(x, deterministic=not train, rngs=dropout_key).astype(self.dtype)
 
     def infer_latent(self, tokens: Array) -> Array:
         given = self.condition_mask(tokens).astype(jnp.int32)
+        position_embeddings = self._position_embeddings()
         x = (
             self.puzzle_embed(tokens.astype(jnp.int32))
             + self.given_embed(given)
-            + self._position_embeddings()[None, :, :]
+            + position_embeddings[None, :, :]
         ) * math.sqrt(1.0 / 3.0)
         pooled = jnp.mean(x.astype(jnp.float32), axis=1)
         latent = self.latent_out(jax.nn.silu(self.latent_pool(maybe_cast(pooled, self.dtype)))).astype(jnp.float32)
@@ -498,6 +505,7 @@ class BRCSudokuModel(nnx.Module):
         train: bool,
         dropout_key: Array | None = None,
         return_raw_final_logits: bool = False,
+        return_final_only: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
         if z is None:
             z = self.infer_latent(tokens)
@@ -510,9 +518,18 @@ class BRCSudokuModel(nnx.Module):
         latent_hidden = self.latent_to_hidden(maybe_cast(z, self.dtype)).astype(jnp.float32)
         h = self.h0[...][None, None, :].astype(jnp.float32) + latent_hidden[:, None, :]
         h = jnp.broadcast_to(h, (batch_size, self.config.seq_len, self.config.d_model)).astype(self.dtype)
+        position_embeddings = self._position_embeddings()
+        given = self.condition_mask(tokens)
+        unknown = (~given).astype(jnp.float32)
+        unknown_normalizer = jnp.maximum(jnp.sum(unknown), 1.0)
+        base_embeddings = (
+            self.puzzle_embed(tokens.astype(jnp.int32))
+            + self.given_embed(given.astype(jnp.int32))
+            + position_embeddings[None, :, :]
+        )
 
         def scan_step(carry, scan_inputs):
-            step_index, step_dropout_key = scan_inputs
+            step_index, step_dropout_key, time_embedding = scan_inputs
             if return_raw_final_logits:
                 h_prev, belief_logits, _raw_final_logits = carry
             else:
@@ -520,23 +537,25 @@ class BRCSudokuModel(nnx.Module):
             cell_input = self._cell_embeddings(
                 tokens,
                 belief_logits,
-                step_index,
+                base_embeddings,
+                time_embedding,
                 train=train,
                 dropout_key=step_dropout_key,
             )
             h_next, block_diagnostics = self.solver_block(h_prev, cell_input, z, self.relation_masks)
             raw_logits = self.lm_head(maybe_cast(h_next, self.dtype))
             next_belief = self._belief_update(tokens, belief_logits, raw_logits, step_index)
-            logits = self._belief_to_token_logits(next_belief, tokens, step_index)
-            unknown = (~self.condition_mask(tokens)).astype(jnp.float32)
-            hidden_delta = jnp.linalg.norm((h_next - h_prev).astype(jnp.float32), axis=-1)
-            hidden_delta = jnp.sum(hidden_delta * unknown) / jnp.maximum(jnp.sum(unknown), 1.0)
-            belief_probs = jax.nn.softmax(next_belief, axis=-1)
-            confidence = jnp.max(belief_probs, axis=-1)
-            filled_ratio = jnp.sum(confidence * unknown) / jnp.maximum(jnp.sum(unknown), 1.0)
             next_carry = (h_next, next_belief)
             if return_raw_final_logits:
                 next_carry = (h_next, next_belief, raw_logits.astype(jnp.float32))
+            if return_final_only:
+                return next_carry, None
+            logits = self._belief_to_token_logits(next_belief, tokens, step_index)
+            hidden_delta = jnp.linalg.norm((h_next - h_prev).astype(jnp.float32), axis=-1)
+            hidden_delta = jnp.sum(hidden_delta * unknown) / unknown_normalizer
+            belief_probs = jax.nn.softmax(next_belief, axis=-1)
+            confidence = jnp.max(belief_probs, axis=-1)
+            filled_ratio = jnp.sum(confidence * unknown) / unknown_normalizer
             return next_carry, (
                 logits,
                 hidden_delta,
@@ -550,6 +569,7 @@ class BRCSudokuModel(nnx.Module):
             step_dropout_keys = jax.random.split(jax.random.key(0), self.config.num_steps)
         else:
             step_dropout_keys = jax.random.split(dropout_key, self.config.num_steps)
+        time_embeddings = self.time_embed(step_indices)
         initial_carry = (h, initial_belief.astype(jnp.float32))
         if return_raw_final_logits:
             raw_final0 = jnp.zeros((*tokens.shape, self.config.vocab_size), dtype=jnp.float32)
@@ -557,12 +577,29 @@ class BRCSudokuModel(nnx.Module):
         final_carry, scan_outputs = jax.lax.scan(
             scan_step,
             initial_carry,
-            (step_indices, step_dropout_keys),
+            (step_indices, step_dropout_keys, time_embeddings),
         )
         if return_raw_final_logits:
             h_final, belief_final, raw_final_logits = final_carry
         else:
             h_final, belief_final = final_carry
+        if return_final_only:
+            final_step = jnp.asarray(self.config.num_steps - 1, dtype=jnp.int32)
+            logits = self._belief_to_token_logits(belief_final, tokens, final_step)
+            diagnostics = {
+                "hidden_delta_mean": jnp.zeros((self.config.num_steps,), dtype=jnp.float32),
+                "diffusion_filled_ratio": jnp.zeros((self.config.num_steps,), dtype=jnp.float32),
+                "brc_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
+                "brc_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
+                "unroll_steps": jnp.asarray(self.config.num_steps, dtype=jnp.float32),
+                "z": z,
+                "h": h_final,
+                "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
+                "belief_logits": belief_final,
+            }
+            if return_raw_final_logits:
+                diagnostics["raw_final_logits"] = raw_final_logits
+            return logits, diagnostics
         step_logits, hidden_delta, filled_ratio, gate_mean, gate_std = scan_outputs[:5]
         diagnostics = {
             "hidden_delta_mean": hidden_delta,

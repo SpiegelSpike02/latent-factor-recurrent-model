@@ -35,7 +35,9 @@ class BRCSudokuConfig:
     latent_lr: float = 0.1
     latent_grad_clip_norm: float = 1.0
     latent_update_clip_norm: float = 0.5
-    denoise_loss_weight: float = 1.0
+    denoise_initial_prob: float = 0.4
+    denoise_teacher_reveal_prob: float = 0.25
+    denoise_mode_weights: tuple[float, ...] = (0.3, 0.15, 0.25, 0.3)
     verifier_loss_weight: float = 0.2
     meta_loss_weight: float = 0.0
     fit_given_weight: float = 0.2

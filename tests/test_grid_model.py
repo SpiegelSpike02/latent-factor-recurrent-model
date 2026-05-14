@@ -204,11 +204,19 @@ class GridModelTests(unittest.TestCase):
         tokens = jnp.asarray([[int(ch) + 1 for ch in puzzle]], dtype=jnp.int32)
         labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
         logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
+        final_only_logits, final_only_diagnostics = model.run_diffusion(
+            tokens,
+            train=False,
+            return_final_only=True,
+        )
         self.assertEqual(logits.shape, (2, 1, 81, 11))
+        self.assertEqual(final_only_logits.shape, (1, 81, 11))
+        self.assertTrue(bool(jnp.allclose(final_only_logits, logits[-1], rtol=1e-5, atol=1e-5)))
         self.assertEqual(diagnostics["hidden_delta_mean"].shape, (2,))
         self.assertEqual(diagnostics["diffusion_filled_ratio"].shape, (2,))
         self.assertEqual(diagnostics["draft"].shape, (1, 81))
         self.assertEqual(diagnostics["belief_logits"].shape, (1, 81, 9))
+        self.assertEqual(final_only_diagnostics["belief_logits"].shape, (1, 81, 9))
         self.assertEqual(model.relation_masks.shape, (4, 81, 81))
         predictions = jnp.argmax(logits[-1], axis=-1)
         given_mask = tokens != 1
@@ -281,7 +289,6 @@ class GridModelTests(unittest.TestCase):
             "latent_grad_norm",
             "latent_step_norm",
             "meta_outer_loss",
-            "denoise_loss",
             "verifier_loss",
             "verifier_ranking_accuracy",
             "given_consistency",
@@ -676,7 +683,10 @@ class GridModelTests(unittest.TestCase):
                 "step_loss_weights = [1.0, 2.0]\n"
                 "inner_steps = 1\n"
                 "meta_loss_weight = 0.5\n"
-                "fit_energy_weight = 0.75\n",
+                "fit_energy_weight = 0.75\n"
+                "denoise_initial_prob = 0.4\n"
+                "denoise_teacher_reveal_prob = 0.25\n"
+                "denoise_mode_weights = [0.3, 0.15, 0.25, 0.3]\n",
                 encoding="utf-8",
             )
             loaded = load_toml_config(str(config_path))
@@ -687,6 +697,8 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_step_loss_weights"], [1.0, 2.0])
             self.assertEqual(loaded["brc_meta_loss_weight"], 0.5)
             self.assertEqual(loaded["brc_fit_energy_weight"], 0.75)
+            self.assertEqual(loaded["brc_denoise_initial_prob"], 0.4)
+            self.assertEqual(loaded["brc_denoise_mode_weights"], [0.3, 0.15, 0.25, 0.3])
 
             trm_config_path = Path(tmpdir) / "trm.toml"
             trm_config_path.write_text(

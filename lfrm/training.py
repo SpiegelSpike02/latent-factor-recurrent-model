@@ -133,18 +133,15 @@ def _mix_training_belief(
     given_mask: jax.Array,
     key: jax.Array,
     self_belief_logits: jax.Array,
-    *,
-    train: bool,
-) -> tuple[jax.Array, jax.Array]:
-    if not train:
-        masked = ~given_mask
-        return model.initial_belief_logits(inputs), masked
+) -> jax.Array:
     mode_key, mask_key, corrupt_key = jax.random.split(key, 3)
-    mode = jax.random.categorical(mode_key, jnp.log(jnp.asarray([0.3, 0.3, 0.3, 0.1], dtype=jnp.float32)), shape=(inputs.shape[0],))
+    brc = model.brc
+    mode_weights = jnp.asarray(brc.denoise_mode_weights, dtype=jnp.float32)
+    mode_logits = jnp.log(mode_weights / jnp.maximum(jnp.sum(mode_weights), 1e-6))
+    mode = jax.random.categorical(mode_key, mode_logits, shape=(inputs.shape[0],))
 
     unknown = ~given_mask
-    teacher_mask = unknown & (jax.random.uniform(mask_key, inputs.shape) < 0.5)
-    teacher_reveal = unknown & ~teacher_mask
+    teacher_reveal = unknown & (jax.random.uniform(mask_key, inputs.shape) < brc.denoise_teacher_reveal_prob)
     full_mask_belief = model.initial_belief_logits(inputs)
     teacher_belief = model.belief_logits_from_tokens(inputs, targets, teacher_reveal)
 
@@ -155,8 +152,7 @@ def _mix_training_belief(
     stacked = jnp.stack([full_mask_belief, teacher_belief, self_belief, corrupt_belief], axis=0)
     selector = jax.nn.one_hot(mode, 4, dtype=jnp.float32).T[:, :, None, None]
     mixed_belief = jnp.sum(stacked * selector, axis=0)
-    denoise_mask = jnp.where(mode[:, None] == 1, teacher_mask, unknown)
-    return mixed_belief.astype(jnp.float32), denoise_mask
+    return mixed_belief.astype(jnp.float32)
 
 
 def _corrupt_solution(
@@ -181,6 +177,19 @@ def _corrupt_solution(
     change = change | (forced & ~given_mask)
     corrupted = jnp.where(change, random_digits, targets)
     return jnp.where(given_mask, inputs, corrupted).astype(jnp.int32)
+
+
+def _zero_brc_fit_metrics(zero: jax.Array) -> dict[str, jax.Array]:
+    return {
+        "latent_fit_loss": zero,
+        "fit_given_loss": zero,
+        "fit_energy": zero,
+        "fit_consistency_loss": zero,
+        "fit_prior_loss": zero,
+        "latent_update_norm": zero,
+        "latent_grad_norm": zero,
+        "latent_step_norm": zero,
+    }
 
 
 def _sudoku_board_metrics(
@@ -231,16 +240,7 @@ def _verifier_guided_latent_fit(
     brc = model.brc
     zero = jnp.asarray(0.0, dtype=jnp.float32)
     if brc.inner_steps <= 0:
-        return z0, {
-            "latent_fit_loss": zero,
-            "fit_given_loss": zero,
-            "fit_energy": zero,
-            "fit_consistency_loss": zero,
-            "fit_prior_loss": zero,
-            "latent_update_norm": zero,
-            "latent_grad_norm": zero,
-            "latent_step_norm": zero,
-        }
+        return z0, _zero_brc_fit_metrics(zero)
 
     step_keys = jax.random.split(key, (brc.inner_steps, 2))
 
@@ -253,21 +253,22 @@ def _verifier_guided_latent_fit(
             train=train,
             dropout_key=key_a,
             return_raw_final_logits=True,
+            return_final_only=True,
         )
-        final_logits_a = logits_a[-1]
         raw_final_logits_a = diagnostics_a["raw_final_logits"]
-        probs_a = jax.nn.softmax(final_logits_a, axis=-1)
+        probs_a = jax.nn.softmax(logits_a, axis=-1)
         given_loss = _masked_token_ce(raw_final_logits_a, inputs, given_mask)
         energy = jnp.mean(model.verifier_energy_from_probs(inputs, probs_a))
 
-        logits_b, _ = model.run_diffusion(
+        final_logits_b, _ = model.run_diffusion(
             inputs,
             z=latent_z,
             initial_belief=model.initial_belief_logits(inputs),
             train=train,
             dropout_key=key_b,
+            return_final_only=True,
         )
-        probs_b = jax.nn.softmax(logits_b[-1], axis=-1)
+        probs_b = jax.nn.softmax(final_logits_b, axis=-1)
         unknown = (~given_mask).astype(jnp.float32)
         consistency = jnp.sum(jnp.square(probs_a - probs_b) * unknown[..., None])
         consistency = consistency / jnp.maximum(jnp.sum(unknown) * probs_a.shape[-1], 1.0)
@@ -369,6 +370,18 @@ def brc_loss_and_metrics(
 
     z0 = model.infer_latent(inputs)
     initial_belief = model.initial_belief_logits(inputs)
+    if train and brc.denoise_initial_prob > 0.0:
+        denoise_mix_key, denoise_active_key = jax.random.split(denoise_key, 2)
+        denoise_belief = _mix_training_belief(
+            model,
+            inputs,
+            targets,
+            given_mask,
+            denoise_mix_key,
+            initial_belief,
+        )
+        denoise_active = jax.random.uniform(denoise_active_key, (inputs.shape[0],)) < brc.denoise_initial_prob
+        initial_belief = jnp.where(denoise_active[:, None, None], denoise_belief, initial_belief)
     step_logits, diagnostics = model.run_diffusion(
         inputs,
         z=z0,
@@ -386,56 +399,34 @@ def brc_loss_and_metrics(
     solution_loss = per_step_loss[-1]
     blanks_per_example = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
 
-    denoise_loss = zero
-    if brc.denoise_loss_weight != 0.0:
-        denoise_belief, denoise_mask = _mix_training_belief(
-            model,
-            inputs,
-            targets,
-            given_mask,
-            denoise_key,
-            jax.lax.stop_gradient(diagnostics["belief_logits"]),
-            train=True,
-        )
-        denoise_logits, _ = model.run_diffusion(
-            inputs,
-            z=z0,
-            initial_belief=denoise_belief,
-            train=train,
-            dropout_key=denoise_key,
-        )
-        denoise_loss = _masked_token_ce(denoise_logits[-1], targets, denoise_mask)
-
     true_energy = zero
     fake_energy = zero
     verifier_loss = zero
     verifier_ranking_accuracy = zero
     if brc.verifier_loss_weight != 0.0:
-        true_energy_per_example = model.verifier_energy(inputs, targets)
-        corrupt_key, near_key = jax.random.split(verifier_key)
-        random_fake = _corrupt_solution(model, inputs, targets, given_mask, corrupt_key)
-        near_fake = _corrupt_solution(model, inputs, targets, given_mask, near_key)
+        random_fake = _corrupt_solution(model, inputs, targets, given_mask, verifier_key)
         early_fake = jax.lax.stop_gradient(jnp.argmax(step_logits[0], axis=-1).astype(jnp.int32))
+        mid_fake = jax.lax.stop_gradient(jnp.argmax(step_logits[step_logits.shape[0] // 2], axis=-1).astype(jnp.int32))
         final_fake = jax.lax.stop_gradient(jnp.argmax(step_logits[-1], axis=-1).astype(jnp.int32))
-        fake_candidates = jnp.stack([random_fake, near_fake, early_fake, final_fake], axis=1)
-        flat_fakes = fake_candidates.reshape(inputs.shape[0] * fake_candidates.shape[1], inputs.shape[1])
-        flat_inputs = jnp.repeat(inputs, fake_candidates.shape[1], axis=0)
-        fake_energy_all = model.verifier_energy(flat_inputs, flat_fakes).reshape(inputs.shape[0], fake_candidates.shape[1])
-        verifier_loss = jnp.mean(jax.nn.relu(brc.verifier_margin + true_energy_per_example[:, None] - fake_energy_all))
-        verifier_ranking_accuracy = jnp.mean((true_energy_per_example[:, None] < fake_energy_all).astype(jnp.float32))
+        candidates = jnp.stack([targets, random_fake, early_fake, mid_fake, final_fake], axis=1)
+        flat_candidates = candidates.reshape(inputs.shape[0] * candidates.shape[1], inputs.shape[1])
+        flat_inputs = jnp.repeat(inputs, candidates.shape[1], axis=0)
+        candidate_energy = model.verifier_energy(flat_inputs, flat_candidates).reshape(inputs.shape[0], candidates.shape[1])
+        true_energy_per_example = candidate_energy[:, 0]
+        fake_energy_all = candidate_energy[:, 1:]
+        fake_wrong = jnp.any(candidates[:, 1:] != targets[:, None, :], axis=-1)
+        fake_wrong_f32 = fake_wrong.astype(jnp.float32)
+        fake_normalizer = jnp.maximum(jnp.sum(fake_wrong_f32), 1.0)
+        verifier_margin_loss = jax.nn.relu(brc.verifier_margin + true_energy_per_example[:, None] - fake_energy_all)
+        verifier_loss = jnp.sum(verifier_margin_loss * fake_wrong_f32) / fake_normalizer
+        verifier_ranking_accuracy = (
+            jnp.sum((true_energy_per_example[:, None] < fake_energy_all).astype(jnp.float32) * fake_wrong_f32)
+            / fake_normalizer
+        )
         true_energy = jnp.mean(true_energy_per_example)
-        fake_energy = jnp.mean(fake_energy_all)
+        fake_energy = jnp.sum(fake_energy_all * fake_wrong_f32) / fake_normalizer
 
-    fit_metrics = {
-        "latent_fit_loss": zero,
-        "fit_given_loss": zero,
-        "fit_energy": zero,
-        "fit_consistency_loss": zero,
-        "fit_prior_loss": zero,
-        "latent_update_norm": zero,
-        "latent_grad_norm": zero,
-        "latent_step_norm": zero,
-    }
+    fit_metrics = _zero_brc_fit_metrics(zero)
     meta_outer_loss = zero
     if brc.meta_loss_weight != 0.0:
         z_fit, fit_metrics = _verifier_guided_latent_fit(
@@ -452,12 +443,12 @@ def brc_loss_and_metrics(
             initial_belief=model.initial_belief_logits(inputs),
             train=train,
             dropout_key=meta_key,
+            return_final_only=True,
         )
-        meta_outer_loss = _masked_token_ce(meta_logits[-1], targets, loss_mask)
+        meta_outer_loss = _masked_token_ce(meta_logits, targets, loss_mask)
 
     loss = (
         step_ce_loss
-        + brc.denoise_loss_weight * denoise_loss
         + brc.verifier_loss_weight * verifier_loss
         + brc.meta_loss_weight * meta_outer_loss
     )
@@ -497,17 +488,12 @@ def brc_loss_and_metrics(
         "latent_grad_norm": fit_metrics["latent_grad_norm"],
         "latent_step_norm": fit_metrics["latent_step_norm"],
         "meta_outer_loss": meta_outer_loss,
-        "denoise_loss": denoise_loss,
         "verifier_loss": verifier_loss,
         "verifier_ranking_accuracy": verifier_ranking_accuracy,
         "target_probability": target_probability,
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
         "solved_count": solved_count,
-        "q_selected_blank_ce_loss": solution_loss,
-        "q_selected_blank_cell_accuracy": blank_cell_accuracy,
-        "q_selected_solved_rate": solved_rate,
-        "q_selected_step": jnp.asarray(step_logits.shape[0], dtype=jnp.float32),
         "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
         "given_consistency": given_consistency,
         "invalid_board_rate": invalid_board_rate,

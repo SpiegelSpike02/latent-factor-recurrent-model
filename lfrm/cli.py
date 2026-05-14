@@ -117,7 +117,9 @@ ALLOWED_NESTED_KEYS = {
         "latent_lr",
         "latent_grad_clip_norm",
         "latent_update_clip_norm",
-        "denoise_loss_weight",
+        "denoise_initial_prob",
+        "denoise_teacher_reveal_prob",
+        "denoise_mode_weights",
         "verifier_loss_weight",
         "meta_loss_weight",
         "fit_given_weight",
@@ -224,7 +226,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-latent-lr", type=float, default=0.1)
     parser.add_argument("--brc-latent-grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--brc-latent-update-clip-norm", type=float, default=0.5)
-    parser.add_argument("--brc-denoise-loss-weight", type=float, default=1.0)
+    parser.add_argument("--brc-denoise-initial-prob", type=float, default=0.4)
+    parser.add_argument("--brc-denoise-teacher-reveal-prob", type=float, default=0.25)
+    parser.add_argument("--brc-denoise-mode-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-verifier-loss-weight", type=float, default=0.2)
     parser.add_argument("--brc-meta-loss-weight", type=float, default=0.0)
     parser.add_argument("--brc-fit-given-weight", type=float, default=0.2)
@@ -303,7 +307,13 @@ def build_config(
             latent_lr=args.brc_latent_lr,
             latent_grad_clip_norm=args.brc_latent_grad_clip_norm,
             latent_update_clip_norm=args.brc_latent_update_clip_norm,
-            denoise_loss_weight=args.brc_denoise_loss_weight,
+            denoise_initial_prob=args.brc_denoise_initial_prob,
+            denoise_teacher_reveal_prob=args.brc_denoise_teacher_reveal_prob,
+            denoise_mode_weights=(
+                tuple(args.brc_denoise_mode_weights)
+                if args.brc_denoise_mode_weights is not None
+                else BRCSudokuConfig().denoise_mode_weights
+            ),
             verifier_loss_weight=args.brc_verifier_loss_weight,
             meta_loss_weight=args.brc_meta_loss_weight,
             fit_given_weight=args.brc_fit_given_weight,
@@ -642,7 +652,6 @@ CORE_SCALAR_METRICS = (
     "latent_grad_norm",
     "latent_step_norm",
     "meta_outer_loss",
-    "denoise_loss",
     "verifier_loss",
     "verifier_ranking_accuracy",
     "given_consistency",
@@ -714,7 +723,6 @@ METRIC_GROUPS = (
             "blank_ce_loss",
             "final_blank_ce_loss",
             "mean_blank_ce_loss",
-            "denoise_loss",
             "verifier_loss",
             "meta_outer_loss",
             "q_loss",
