@@ -6,8 +6,8 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class TRMConfig:
-    recursion_steps: int = 18
-    num_layers: int = 2
+    recurrent_steps: int = 18
+    block_layers: int = 2
     num_heads: int = 8
     mlp_ratio: int = 4
     mlp_t: bool = False
@@ -15,7 +15,7 @@ class TRMConfig:
     local_mixing_kernel: int = 3
     puzzle_emb_ndim: int = 0
     puzzle_emb_len: int = 16
-    pos_encodings: str = "none"
+    position_encoding: str = "none"
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     halt_exploration_prob: float = 0.1
@@ -24,12 +24,12 @@ class TRMConfig:
 
 @dataclass(frozen=True)
 class BRCSudokuConfig:
-    recursion_steps: int = 6
-    num_layers: int = 1
+    recurrent_steps: int = 6
+    block_layers: int = 1
     latent_dim: int = 128
     num_heads: int = 4
     mlp_ratio: int = 2
-    pos_encodings: str = "learned"
+    position_encoding: str = "learned"
     step_loss_weights: tuple[float, ...] | None = None
     latent_fit_steps: int = 4
     latent_lr: float = 0.1
@@ -51,13 +51,14 @@ class BRCSudokuConfig:
 @dataclass(frozen=True)
 class ModelConfig:
     vocab_size: int
+    task_type: str = "sudoku"
     model_type: str = "brc_sudoku"
     num_puzzle_identifiers: int = 1
     seq_len: int = 81
     grid_height: int = 9
     grid_width: int = 9
     d_model: int = 256
-    num_steps: int = 6
+    rollout_steps: int = 6
     dropout_rate: float = 0.0
     clamp_given: bool = False
     path_loss_weight: float = 1.0

@@ -67,8 +67,9 @@ uv run lfrm-train --config configs/sudoku_brc.toml --learning-rate 1e-4 --batch-
 ```
 
 BRC-Sudoku and TRM dense-unroll recurrent supervision are controlled by
-`model.brc.step_loss_weights` and `model.trm.step_loss_weights`: one relative
-CE weight per recurrent step, normalized internally. BRC-Sudoku additionally
+`model.brc.step_loss_weights` and `model.trm.step_loss_weights`: BRC uses one
+relative CE weight per recurrent step, while TRM uses one relative CE weight per
+rollout/output step. The weights are normalized internally. BRC-Sudoku additionally
 reports given consistency, invalid-board rate, row/column/box conflict count,
 verifier ranking accuracy, and belief/refinement diagnostics.
 

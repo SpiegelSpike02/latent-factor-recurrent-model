@@ -252,8 +252,8 @@ class TRMBlock(nnx.Module):
 class TinyRecursiveModel(nnx.Module):
     """Official-style Tiny Recursive Model baseline.
 
-    The model keeps one recurrent token state. Each ACT step applies the same
-    recursive level several times, detaches the carry between ACT steps, and
+    The model keeps one recurrent token state. Each rollout step applies the same
+    recursive level several times, detaches the carry between rollout steps, and
     reads token logits plus a halt head from the recurrent state.
     """
 
@@ -268,13 +268,13 @@ class TinyRecursiveModel(nnx.Module):
             raise ValueError("TinyRecursiveModel requires model_type='trm'")
         if config.grid_height * config.grid_width != config.seq_len:
             raise ValueError("grid_height * grid_width must equal seq_len")
-        if config.num_steps < 1:
-            raise ValueError("TRM num_steps must be at least 1")
+        if config.rollout_steps < 1:
+            raise ValueError("TRM rollout_steps must be at least 1")
         trm = config.trm_config
-        if trm.recursion_steps < 1:
-            raise ValueError("TRM recursion_steps must be at least 1")
-        if trm.num_layers < 1:
-            raise ValueError("TRM num_layers must be at least 1")
+        if trm.recurrent_steps < 1:
+            raise ValueError("TRM recurrent_steps must be at least 1")
+        if trm.block_layers < 1:
+            raise ValueError("TRM block_layers must be at least 1")
         if trm.mlp_ratio < 1:
             raise ValueError("TRM mlp_ratio must be at least 1")
         if trm.local_mixing_kernel < 1 or trm.local_mixing_kernel % 2 == 0:
@@ -285,15 +285,15 @@ class TinyRecursiveModel(nnx.Module):
             raise ValueError("TRM puzzle_emb_len must be non-negative")
         if config.num_puzzle_identifiers < 1:
             raise ValueError("TRM num_puzzle_identifiers must be at least 1")
-        if trm.pos_encodings not in ("none", "learned", "rope", "grid", "rel2d"):
-            raise ValueError("TRM pos_encodings must be one of: none, learned, rope, grid, rel2d")
-        if trm.pos_encodings == "rope" and config.d_model % trm.num_heads != 0:
+        if trm.position_encoding not in ("none", "learned", "rope", "grid", "rel2d"):
+            raise ValueError("TRM position_encoding must be one of: none, learned, rope, grid, rel2d")
+        if trm.position_encoding == "rope" and config.d_model % trm.num_heads != 0:
             raise ValueError("TRM d_model must be divisible by trm.num_heads for RoPE")
-        if trm.pos_encodings == "rope" and (config.d_model // trm.num_heads) % 2 != 0:
+        if trm.position_encoding == "rope" and (config.d_model // trm.num_heads) % 2 != 0:
             raise ValueError("TRM RoPE head dimension must be even")
         if trm.step_loss_weights is not None:
-            if len(trm.step_loss_weights) != config.num_steps:
-                raise ValueError("TRM step_loss_weights length must equal num_steps")
+            if len(trm.step_loss_weights) != config.rollout_steps:
+                raise ValueError("TRM step_loss_weights length must equal rollout_steps")
             if any(weight < 0.0 for weight in trm.step_loss_weights):
                 raise ValueError("TRM step_loss_weights must be non-negative")
             if sum(trm.step_loss_weights) <= 0.0:
@@ -338,7 +338,7 @@ class TinyRecursiveModel(nnx.Module):
                 init_std=0.0,
                 rngs=rngs,
             )
-        if trm.pos_encodings == "learned":
+        if trm.position_encoding == "learned":
             self.position_embed = nnx.Embed(
                 self.total_seq_len,
                 config.d_model,
@@ -347,7 +347,7 @@ class TinyRecursiveModel(nnx.Module):
                 embedding_init=embed_init,
                 rngs=rngs,
             )
-        if trm.pos_encodings == "grid":
+        if trm.position_encoding == "grid":
             box_height, box_width = self._box_shape(config.grid_height, config.grid_width)
             rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
             cols = jnp.arange(config.seq_len, dtype=jnp.int32) % config.grid_width
@@ -379,7 +379,7 @@ class TinyRecursiveModel(nnx.Module):
                 embedding_init=embed_init,
                 rngs=rngs,
             )
-        if trm.pos_encodings == "rel2d":
+        if trm.position_encoding == "rel2d":
             rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
             cols = jnp.arange(config.seq_len, dtype=jnp.int32) % config.grid_width
             rel_rows = rows[:, None] - rows[None, :] + config.grid_height - 1
@@ -401,7 +401,7 @@ class TinyRecursiveModel(nnx.Module):
         self.blocks = nnx.List(
             [
                 TRMBlock(config, self.total_seq_len, self.prefix_len, dtype, rngs=rngs)
-                for _ in range(trm.num_layers)
+                for _ in range(trm.block_layers)
             ]
         )
         self.lm_head = nnx.Linear(
@@ -424,7 +424,7 @@ class TinyRecursiveModel(nnx.Module):
         )
         self.state_init = nnx.data(trunc_normal(rngs.params(), (config.d_model,), 1.0, dtype))
 
-        if trm.pos_encodings == "rope":
+        if trm.position_encoding == "rope":
             head_dim = config.d_model // trm.num_heads
             inv_freq = 1.0 / (trm.rope_theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
             freqs = jnp.outer(jnp.arange(self.total_seq_len, dtype=jnp.float32), inv_freq)
@@ -436,7 +436,7 @@ class TinyRecursiveModel(nnx.Module):
             self.rope_sin = None
 
     def _attention_bias(self) -> Array | None:
-        if self.trm.pos_encodings != "rel2d":
+        if self.trm.position_encoding != "rel2d":
             return None
         row_valid = self.rel2d_row_indices >= 0
         col_valid = self.rel2d_col_indices >= 0
@@ -483,9 +483,9 @@ class TinyRecursiveModel(nnx.Module):
                 prefix = jnp.pad(prefix, ((0, 0), (0, pad_count)))
             prefix = prefix.reshape(tokens.shape[0], self.prefix_len, self.config.d_model)
             embedding = jnp.concatenate([prefix.astype(embedding.dtype), embedding], axis=1)
-        if self.trm.pos_encodings == "learned":
+        if self.trm.position_encoding == "learned":
             embedding = (embedding + self.position_embed(self.position_ids)[None, :, :]) * math.sqrt(0.5)
-        elif self.trm.pos_encodings == "grid":
+        elif self.trm.position_encoding == "grid":
             grid_position = (
                 self.row_embed(self.row_ids)
                 + self.col_embed(self.col_ids)
@@ -551,7 +551,7 @@ class TinyRecursiveModel(nnx.Module):
         return hidden_states
 
     def _act_step(self, state: State, input_embeddings: Array) -> State:
-        for _ in range(self.trm.recursion_steps - 1):
+        for _ in range(self.trm.recurrent_steps - 1):
             state = self._recurrent_level(state, input_embeddings)
         return self._recurrent_level(state, input_embeddings)
 
@@ -597,16 +597,16 @@ class TinyRecursiveModel(nnx.Module):
         halt_logits = self._halt_logits(next_state)
 
         new_steps = jnp.where(carry["halted"], 0, carry["steps"]) + 1
-        is_last_step = new_steps >= self.config.num_steps
+        is_last_step = new_steps >= self.config.rollout_steps
         if train:
             halted = jnp.logical_or(is_last_step, halt_logits > 0.0)
-            if self.config.num_steps > 1 and self.trm.halt_exploration_prob > 0.0:
+            if self.config.rollout_steps > 1 and self.trm.halt_exploration_prob > 0.0:
                 explore = jax.random.uniform(exploration_key, halt_logits.shape) < self.trm.halt_exploration_prob
                 min_steps = jax.random.randint(
                     min_step_key,
                     new_steps.shape,
                     minval=2,
-                    maxval=self.config.num_steps + 1,
+                    maxval=self.config.rollout_steps + 1,
                     dtype=jnp.int32,
                 )
                 min_steps = jnp.where(explore, min_steps, 0)
@@ -674,12 +674,12 @@ class TinyRecursiveModel(nnx.Module):
         ) = jax.lax.scan(
             scan_step,
             state0,
-            jnp.arange(self.config.num_steps),
+            jnp.arange(self.config.rollout_steps),
         )
         diagnostics = {
             "hidden_delta_mean": step_hidden_delta,
             "halt_logits": halt_logits,
-            "unroll_steps": jnp.asarray(self.config.num_steps, dtype=jnp.float32),
+            "unroll_steps": jnp.asarray(self.config.rollout_steps, dtype=jnp.float32),
             "state": final_state[:, self.prefix_len :],
         }
         if compute_terminal_residual:

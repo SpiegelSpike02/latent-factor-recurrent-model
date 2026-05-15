@@ -1,6 +1,9 @@
 [data]
 dataset_path = "data/sudoku-extreme-1k-aug-1000"
 
+[task]
+type = "sudoku"
+
 [model]
 model_type = "brc_sudoku"
 seq_len = 81
@@ -10,12 +13,12 @@ d_model = 512
 dropout_rate = 0.05
 
 [model.brc]
-recursion_steps = 24
-num_layers = 1
+recurrent_steps = 24
+block_layers = 1
 latent_dim = 512
 num_heads = 8
 mlp_ratio = 4
-pos_encodings = "rel2d"
+position_encoding = "rel2d"
 # Relative CE weights for recurrent steps 1..24. The training code normalizes
 # this vector, so the values control schedule shape rather than total scale.
 step_loss_weights = [

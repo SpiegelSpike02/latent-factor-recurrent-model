@@ -1,18 +1,21 @@
 [data]
 dataset_path = "data/sudoku-extreme-1k-aug-1000"
 
+[task]
+type = "sudoku"
+
 [model]
 model_type = "trm"
 seq_len = 81
 grid_height = 9
 grid_width = 9
 d_model = 512
-num_steps = 16
+rollout_steps = 16
 dropout_rate = 0.05
 
 [model.trm]
-recursion_steps = 18
-num_layers = 2
+recurrent_steps = 18
+block_layers = 2
 num_heads = 8
 mlp_ratio = 4
 mlp_t = false
@@ -20,7 +23,7 @@ local_mixing = true
 local_mixing_kernel = 3
 puzzle_emb_ndim = 0
 puzzle_emb_len = 0
-pos_encodings = "rel2d"
+position_encoding = "rel2d"
 rms_norm_eps = 1e-5
 halt_exploration_prob = 0.1
 step_loss_weights = [

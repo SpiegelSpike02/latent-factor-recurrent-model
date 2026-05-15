@@ -87,7 +87,11 @@ def _masked_token_ce(logits: jax.Array, targets: jax.Array, mask: jax.Array) -> 
 
 
 def _target_loss_weights(model: GridReasoningModel, targets: jax.Array) -> jax.Array:
+    if getattr(getattr(model, "config", None), "task_type", "sudoku") != "maze":
+        return jnp.asarray(1.0, dtype=jnp.float32)
     path_weight = getattr(getattr(model, "config", None), "path_loss_weight", 1.0)
+    if path_weight == 1.0:
+        return jnp.asarray(1.0, dtype=jnp.float32)
     return jnp.where(targets == 5, jnp.asarray(path_weight, dtype=jnp.float32), 1.0)
 
 
@@ -117,6 +121,17 @@ def _path_metrics(predictions: jax.Array, targets: jax.Array, loss_mask: jax.Arr
         "path_positive_rate": predicted_positive / mask_total,
         "target_path_rate": target_positive / mask_total,
     }
+
+
+def _maybe_path_metrics(
+    model: GridReasoningModel,
+    predictions: jax.Array,
+    targets: jax.Array,
+    loss_mask: jax.Array,
+) -> dict[str, jax.Array]:
+    if getattr(getattr(model, "config", None), "task_type", "sudoku") != "maze":
+        return {}
+    return _path_metrics(predictions, targets, loss_mask)
 
 
 def _clamp_logits_to_given(
@@ -384,16 +399,16 @@ def _verifier_guided_latent_fit(
     }
 
 
-def _normalized_step_loss_weights(configured: tuple[float, ...] | None, num_steps: int) -> jax.Array:
+def _normalized_step_loss_weights(configured: tuple[float, ...] | None, rollout_steps: int) -> jax.Array:
     if configured is None:
-        weights = jnp.arange(1, num_steps + 1, dtype=jnp.float32)
+        weights = jnp.arange(1, rollout_steps + 1, dtype=jnp.float32)
     else:
         weights = jnp.asarray(configured, dtype=jnp.float32)
     return weights / jnp.maximum(jnp.sum(weights), 1e-6)
 
 
-def _brc_step_loss_weights(model: BRCSudokuModel, num_steps: int) -> jax.Array:
-    return _normalized_step_loss_weights(model.brc.step_loss_weights, num_steps)
+def _brc_step_loss_weights(model: BRCSudokuModel, rollout_steps: int) -> jax.Array:
+    return _normalized_step_loss_weights(model.brc.step_loss_weights, rollout_steps)
 
 
 def _brc_compact_training_rollout(
@@ -413,7 +428,7 @@ def _brc_compact_training_rollout(
     loss_normalizer = jnp.maximum(jnp.sum(loss_mask_f32), 1.0)
     candidate_init = jnp.zeros_like(inputs)
     early_index = jnp.asarray(0, dtype=jnp.int32)
-    mid_index = jnp.asarray(model.recursion_steps // 2, dtype=jnp.int32)
+    mid_index = jnp.asarray(model.recurrent_steps // 2, dtype=jnp.int32)
 
     def scan_step(carry, scan_inputs):
         h_prev, belief_logits, early_candidate, mid_candidate = carry
@@ -449,8 +464,8 @@ def _brc_compact_training_rollout(
             block_diagnostics["brc_gate_std"],
         )
 
-    step_indices = jnp.arange(model.recursion_steps, dtype=jnp.int32)
-    step_dropout_keys = jax.random.split(dropout_key, model.recursion_steps)
+    step_indices = jnp.arange(model.recurrent_steps, dtype=jnp.int32)
+    step_dropout_keys = jax.random.split(dropout_key, model.recurrent_steps)
     time_embeddings = model.time_embed(step_indices)
     initial_carry = (h, initial_belief.astype(jnp.float32), candidate_init, candidate_init)
     (h_final, belief_final, early_candidate, mid_candidate), scan_outputs = jax.lax.scan(
@@ -459,7 +474,7 @@ def _brc_compact_training_rollout(
         (step_indices, step_dropout_keys, time_embeddings),
     )
     per_step_loss, hidden_delta, filled_ratio, gate_mean, gate_std = scan_outputs
-    final_step = jnp.asarray(model.recursion_steps - 1, dtype=jnp.int32)
+    final_step = jnp.asarray(model.recurrent_steps - 1, dtype=jnp.int32)
     final_logits = model._belief_to_token_logits(belief_final, inputs, final_step)
     final_candidate = jnp.argmax(final_logits, axis=-1).astype(jnp.int32)
     diagnostics = {
@@ -467,7 +482,7 @@ def _brc_compact_training_rollout(
         "diffusion_filled_ratio": filled_ratio,
         "brc_gate_mean": jnp.mean(gate_mean),
         "brc_gate_std": jnp.mean(gate_std),
-        "unroll_steps": jnp.asarray(model.recursion_steps, dtype=jnp.float32),
+        "unroll_steps": jnp.asarray(model.recurrent_steps, dtype=jnp.float32),
         "z": z,
         "h": h_final,
         "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
@@ -479,9 +494,9 @@ def _brc_compact_training_rollout(
     return final_logits, per_step_loss, diagnostics
 
 
-def _trm_step_loss_weights(model: GridReasoningModel, num_steps: int) -> jax.Array:
+def _trm_step_loss_weights(model: GridReasoningModel, rollout_steps: int) -> jax.Array:
     trm_config = getattr(model, "trm", None)
-    return _normalized_step_loss_weights(getattr(trm_config, "step_loss_weights", None), num_steps)
+    return _normalized_step_loss_weights(getattr(trm_config, "step_loss_weights", None), rollout_steps)
 
 
 def _trm_halt_selected_step(halt_logits: jax.Array) -> jax.Array:
@@ -756,8 +771,8 @@ def loss_and_metrics(
     per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
     per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
 
-    num_steps = effective_step_logits.shape[0]
-    step_weights = _trm_step_loss_weights(model, num_steps)
+    rollout_steps = effective_step_logits.shape[0]
+    step_weights = _trm_step_loss_weights(model, rollout_steps)
     blank_ce_loss = jnp.sum(step_weights * per_step_loss)
     blanks_per_example = jnp.sum(loss_mask, axis=-1)
     step_predictions = jnp.argmax(effective_step_logits, axis=-1)
@@ -845,9 +860,9 @@ def loss_and_metrics(
         "step_loss_weights": step_weights,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
     }
-    metrics.update(_path_metrics(predictions, targets, loss_mask))
+    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
     if halt_loss_weight != 0.0:
-        halt_path_metrics = _path_metrics(halt_selected_predictions, targets, loss_mask)
+        halt_path_metrics = _maybe_path_metrics(model, halt_selected_predictions, targets, loss_mask)
         metrics.update(
             {
                 f"halt_selected_{key}": value
@@ -947,7 +962,7 @@ def trm_act_loss_and_metrics(
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
     }
-    metrics.update(_path_metrics(predictions, targets, loss_mask))
+    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
     return loss, (metrics, new_carry)
 
 
@@ -983,8 +998,8 @@ def trm_dense_unroll_loss_and_metrics(
     metric_step_loss_mask = loss_mask[None, :, :]
     token_loss = optax.softmax_cross_entropy_with_integer_labels(step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
-    num_steps = per_step_loss.shape[0]
-    step_weights = _trm_step_loss_weights(model, num_steps)
+    rollout_steps = per_step_loss.shape[0]
+    step_weights = _trm_step_loss_weights(model, rollout_steps)
     blank_ce_loss = jnp.sum(step_weights * per_step_loss)
     mean_blank_ce_loss = jnp.mean(per_step_loss)
     final_blank_ce_loss = per_step_loss[-1]
@@ -1043,7 +1058,7 @@ def trm_dense_unroll_loss_and_metrics(
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
         "unroll_steps": jnp.asarray(step_logits.shape[0], dtype=jnp.float32),
     }
-    metrics.update(_path_metrics(predictions, targets, loss_mask))
+    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
     if halt_logits is not None and halt_loss_weight != 0.0:
         metrics["per_step_halt_probability"] = jax.nn.sigmoid(jnp.mean(halt_logits, axis=1))
     return loss, metrics
@@ -1154,18 +1169,20 @@ def trm_eval_loss_and_metrics(
         "per_step_halt_probability": jax.nn.sigmoid(jnp.mean(halt_logits, axis=1)),
         "unroll_steps": jnp.asarray(step_logits.shape[0], dtype=jnp.int32),
     }
-    metrics.update(_path_metrics(predictions, targets, loss_mask))
+    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
+    selected_path_metrics = _maybe_path_metrics(model, predictions, targets, loss_mask)
     metrics.update(
         {
             f"halt_selected_{key}": value
-            for key, value in _path_metrics(predictions, targets, loss_mask).items()
+            for key, value in selected_path_metrics.items()
             if key in ("path_precision", "path_recall", "path_f1")
         }
     )
+    final_path_metrics = _maybe_path_metrics(model, final_predictions, targets, loss_mask)
     metrics.update(
         {
             f"final_{key}": value
-            for key, value in _path_metrics(final_predictions, targets, loss_mask).items()
+            for key, value in final_path_metrics.items()
             if key in ("path_precision", "path_recall", "path_f1")
         }
     )

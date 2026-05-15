@@ -41,23 +41,22 @@ from lfrm.training import (
 )
 
 
-CONFIG_SECTIONS = ("data", "model", "optimizer", "train", "runtime", "wandb")
+CONFIG_SECTIONS = ("data", "task", "model", "optimizer", "train", "runtime", "wandb")
 NESTED_SECTIONS = {
     "model": {"trm", "brc"},
     "train": {"ema"},
 }
 ALLOWED_SECTION_KEYS = {
     "data": {"dataset_path"},
+    "task": {"type", "clamp_given", "path_loss_weight"},
     "model": {
         "model_type",
         "seq_len",
         "grid_height",
         "grid_width",
         "d_model",
-        "num_steps",
+        "rollout_steps",
         "dropout_rate",
-        "clamp_given",
-        "path_loss_weight",
         "trm",
         "brc",
     },
@@ -91,8 +90,8 @@ ALLOWED_SECTION_KEYS = {
 ALLOWED_NESTED_KEYS = {
     "ema": {"enabled", "decay"},
     "trm": {
-        "recursion_steps",
-        "num_layers",
+        "recurrent_steps",
+        "block_layers",
         "num_heads",
         "mlp_ratio",
         "mlp_t",
@@ -100,19 +99,19 @@ ALLOWED_NESTED_KEYS = {
         "local_mixing_kernel",
         "puzzle_emb_ndim",
         "puzzle_emb_len",
-        "pos_encodings",
+        "position_encoding",
         "rms_norm_eps",
         "rope_theta",
         "halt_exploration_prob",
         "step_loss_weights",
     },
     "brc": {
-        "recursion_steps",
-        "num_layers",
+        "recurrent_steps",
+        "block_layers",
         "latent_dim",
         "num_heads",
         "mlp_ratio",
-        "pos_encodings",
+        "position_encoding",
         "step_loss_weights",
         "latent_fit_steps",
         "latent_lr",
@@ -140,6 +139,10 @@ def load_toml_config(path: str | None) -> dict[str, object]:
     with config_path.open("rb") as f:
         loaded = tomllib.load(f)
 
+    for section in loaded:
+        if section not in CONFIG_SECTIONS:
+            raise ValueError(f"Unsupported grid reasoning config section: [{section}]")
+
     flat: dict[str, object] = {}
     for section in CONFIG_SECTIONS:
         section_values = loaded.get(section, {})
@@ -161,10 +164,14 @@ def load_toml_config(path: str | None) -> dict[str, object]:
                 continue
             if section == "wandb":
                 normalized_key = f"wandb_{normalized_key}"
+            if section == "task" and normalized_key == "type":
+                normalized_key = "task_type"
             flat[normalized_key] = value
 
     if flat.get("model_type", "brc_sudoku") not in ("trm", "brc_sudoku"):
         raise ValueError("Only model_type='trm' or model_type='brc_sudoku' is supported")
+    if flat.get("task_type", "sudoku") not in ("sudoku", "maze", "arc"):
+        raise ValueError("Only task_type='sudoku', 'maze', or 'arc' is supported")
     return flat
 
 
@@ -198,13 +205,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--model-type", choices=("trm", "brc_sudoku"), default="brc_sudoku")
+    parser.add_argument("--task-type", choices=("sudoku", "maze", "arc"), default="sudoku")
     parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--num-steps", type=int, default=6)
+    parser.add_argument("--rollout-steps", type=int, default=6)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
     parser.add_argument("--clamp-given", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--path-loss-weight", type=float, default=1.0)
-    parser.add_argument("--trm-recursion-steps", type=int, default=18)
-    parser.add_argument("--trm-num-layers", type=int, default=2)
+    parser.add_argument("--trm-recurrent-steps", type=int, default=18)
+    parser.add_argument("--trm-block-layers", type=int, default=2)
     parser.add_argument("--trm-num-heads", type=int, default=8)
     parser.add_argument("--trm-mlp-ratio", type=int, default=4)
     parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=False)
@@ -212,17 +220,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-local-mixing-kernel", type=int, default=3)
     parser.add_argument("--trm-puzzle-emb-ndim", type=int, default=0)
     parser.add_argument("--trm-puzzle-emb-len", type=int, default=16)
-    parser.add_argument("--trm-pos-encodings", choices=("none", "learned", "rope", "grid", "rel2d"), default="none")
+    parser.add_argument("--trm-position-encoding", choices=("none", "learned", "rope", "grid", "rel2d"), default="none")
     parser.add_argument("--trm-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--trm-rope-theta", type=float, default=10000.0)
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-latent-dim", type=int, default=128)
-    parser.add_argument("--brc-recursion-steps", type=int, default=6)
-    parser.add_argument("--brc-num-layers", type=int, default=1)
+    parser.add_argument("--brc-recurrent-steps", type=int, default=6)
+    parser.add_argument("--brc-block-layers", type=int, default=1)
     parser.add_argument("--brc-num-heads", type=int, default=4)
     parser.add_argument("--brc-mlp-ratio", type=int, default=2)
-    parser.add_argument("--brc-pos-encodings", choices=("learned", "rel2d", "none"), default="learned")
+    parser.add_argument("--brc-position-encoding", choices=("learned", "rel2d", "none"), default="learned")
     parser.add_argument("--brc-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-latent-fit-steps", type=int, default=4)
     parser.add_argument("--brc-latent-lr", type=float, default=0.1)
@@ -272,19 +280,20 @@ def build_config(
 ) -> ExperimentConfig:
     model = ModelConfig(
         vocab_size=vocab_size,
+        task_type=args.task_type,
         num_puzzle_identifiers=num_puzzle_identifiers,
         model_type=args.model_type,
         seq_len=seq_len,
         grid_height=args.grid_height,
         grid_width=args.grid_width,
         d_model=args.d_model,
-        num_steps=args.num_steps,
+        rollout_steps=args.rollout_steps,
         dropout_rate=args.dropout_rate,
         clamp_given=args.clamp_given,
         path_loss_weight=args.path_loss_weight,
         trm=TRMConfig(
-            recursion_steps=args.trm_recursion_steps,
-            num_layers=args.trm_num_layers,
+            recurrent_steps=args.trm_recurrent_steps,
+            block_layers=args.trm_block_layers,
             num_heads=args.trm_num_heads,
             mlp_ratio=args.trm_mlp_ratio,
             mlp_t=args.trm_mlp_t,
@@ -292,19 +301,19 @@ def build_config(
             local_mixing_kernel=args.trm_local_mixing_kernel,
             puzzle_emb_ndim=args.trm_puzzle_emb_ndim,
             puzzle_emb_len=args.trm_puzzle_emb_len,
-            pos_encodings=args.trm_pos_encodings,
+            position_encoding=args.trm_position_encoding,
             rms_norm_eps=args.trm_rms_norm_eps,
             rope_theta=args.trm_rope_theta,
             halt_exploration_prob=args.trm_halt_exploration_prob,
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
         brc=BRCSudokuConfig(
-            recursion_steps=args.brc_recursion_steps,
-            num_layers=args.brc_num_layers,
+            recurrent_steps=args.brc_recurrent_steps,
+            block_layers=args.brc_block_layers,
             latent_dim=args.brc_latent_dim,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,
-            pos_encodings=args.brc_pos_encodings,
+            position_encoding=args.brc_position_encoding,
             step_loss_weights=tuple(args.brc_step_loss_weights) if args.brc_step_loss_weights is not None else None,
             latent_fit_steps=args.brc_latent_fit_steps,
             latent_lr=args.brc_latent_lr,
@@ -1120,6 +1129,7 @@ def main() -> None:
         "device=", device,
         "dataset_kind=", overview["kind"],
         "task_type=", overview["task_type"],
+        "config_task_type=", config.model.task_type,
         "vocab_size=", overview["vocab_size"],
         "num_puzzle_identifiers=", overview["num_puzzle_identifiers"],
         "train_examples=", overview["train_examples"],

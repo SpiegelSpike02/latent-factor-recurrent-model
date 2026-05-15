@@ -85,7 +85,7 @@ class GridModelTests(unittest.TestCase):
                 grid_height=3,
                 grid_width=3,
                 d_model=12,
-                num_steps=1,
+                rollout_steps=1,
                 trm=TRMConfig(num_heads=3),
             ),
             optimizer=OptimizerConfig(),
@@ -103,8 +103,8 @@ class GridModelTests(unittest.TestCase):
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
-                num_steps=1,
-                brc=BRCSudokuConfig(recursion_steps=1, latent_dim=16, num_heads=4, verifier_layers=1),
+                rollout_steps=1,
+                brc=BRCSudokuConfig(recurrent_steps=1, latent_dim=16, num_heads=4, verifier_layers=1),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),
@@ -133,8 +133,8 @@ class GridModelTests(unittest.TestCase):
                 grid_height=3,
                 grid_width=3,
                 d_model=12,
-                num_steps=2,
-                trm=TRMConfig(recursion_steps=1, num_layers=1, num_heads=3, mlp_ratio=2),
+                rollout_steps=2,
+                trm=TRMConfig(recurrent_steps=1, block_layers=1, num_heads=3, mlp_ratio=2),
             ),
             RuntimeConfig(compute_dtype="float32"),
             rngs=nnx.Rngs(21),
@@ -182,9 +182,9 @@ class GridModelTests(unittest.TestCase):
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
-                num_steps=2,
+                rollout_steps=2,
                 brc=BRCSudokuConfig(
-                    recursion_steps=2,
+                    recurrent_steps=2,
                     latent_dim=16,
                     num_heads=4,
                     mlp_ratio=1,
@@ -241,9 +241,9 @@ class GridModelTests(unittest.TestCase):
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
-                num_steps=2,
+                rollout_steps=2,
                 brc=BRCSudokuConfig(
-                    recursion_steps=2,
+                    recurrent_steps=2,
                     latent_dim=16,
                     num_heads=4,
                     mlp_ratio=1,
@@ -311,9 +311,9 @@ class GridModelTests(unittest.TestCase):
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
-                num_steps=1,
+                rollout_steps=1,
                 brc=BRCSudokuConfig(
-                    recursion_steps=1,
+                    recurrent_steps=1,
                     latent_dim=16,
                     num_heads=4,
                     mlp_ratio=1,
@@ -359,8 +359,8 @@ class GridModelTests(unittest.TestCase):
                 grid_height=3,
                 grid_width=3,
                 d_model=12,
-                num_steps=2,
-                trm=TRMConfig(recursion_steps=1, num_layers=1, num_heads=3, mlp_ratio=2),
+                rollout_steps=2,
+                trm=TRMConfig(recurrent_steps=1, block_layers=1, num_heads=3, mlp_ratio=2),
             ),
             RuntimeConfig(compute_dtype="float32"),
             rngs=nnx.Rngs(21),
@@ -384,14 +384,14 @@ class GridModelTests(unittest.TestCase):
                 grid_height=3,
                 grid_width=3,
                 d_model=12,
-                num_steps=2,
+                rollout_steps=2,
                 trm=TRMConfig(
-                    recursion_steps=1,
-                    num_layers=1,
+                    recurrent_steps=1,
+                    block_layers=1,
                     num_heads=3,
                     mlp_ratio=2,
                     puzzle_emb_len=0,
-                    pos_encodings="rel2d",
+                    position_encoding="rel2d",
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -420,14 +420,14 @@ class GridModelTests(unittest.TestCase):
                 grid_height=3,
                 grid_width=3,
                 d_model=12,
-                num_steps=2,
+                rollout_steps=2,
                 trm=TRMConfig(
-                    recursion_steps=1,
-                    num_layers=1,
+                    recurrent_steps=1,
+                    block_layers=1,
                     num_heads=3,
                     mlp_ratio=2,
                     puzzle_emb_len=0,
-                    pos_encodings="rel2d",
+                    position_encoding="rel2d",
                     local_mixing=True,
                     local_mixing_kernel=3,
                 ),
@@ -455,10 +455,10 @@ class GridModelTests(unittest.TestCase):
                     grid_height=3,
                     grid_width=3,
                     d_model=12,
-                    num_steps=1,
+                    rollout_steps=1,
                     trm=TRMConfig(
-                        recursion_steps=1,
-                        num_layers=1,
+                        recurrent_steps=1,
+                        block_layers=1,
                         num_heads=3,
                         mlp_ratio=2,
                         local_mixing=True,
@@ -479,8 +479,8 @@ class GridModelTests(unittest.TestCase):
                 grid_height=3,
                 grid_width=3,
                 d_model=12,
-                num_steps=2,
-                trm=TRMConfig(recursion_steps=1, num_layers=1, num_heads=3, mlp_ratio=2, puzzle_emb_len=2),
+                rollout_steps=2,
+                trm=TRMConfig(recurrent_steps=1, block_layers=1, num_heads=3, mlp_ratio=2, puzzle_emb_len=2),
             ),
             optimizer=OptimizerConfig(
                 learning_rate=1e-4,
@@ -537,10 +537,10 @@ class GridModelTests(unittest.TestCase):
                 grid_height=3,
                 grid_width=3,
                 d_model=12,
-                num_steps=2,
+                rollout_steps=2,
                 trm=TRMConfig(
-                    recursion_steps=1,
-                    num_layers=1,
+                    recurrent_steps=1,
+                    block_layers=1,
                     num_heads=3,
                     mlp_ratio=2,
                     puzzle_emb_ndim=12,
@@ -602,8 +602,8 @@ class GridModelTests(unittest.TestCase):
                     grid_height=9,
                     grid_width=9,
                     d_model=10,
-                    num_steps=1,
-                    brc=BRCSudokuConfig(recursion_steps=1, latent_dim=16, num_heads=4),
+                    rollout_steps=1,
+                    brc=BRCSudokuConfig(recurrent_steps=1, latent_dim=16, num_heads=4),
                 ),
                 RuntimeConfig(compute_dtype="float32"),
                 rngs=nnx.Rngs(0),
@@ -625,14 +625,17 @@ class GridModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "brc.toml"
             config_path.write_text(
+                "[task]\n"
+                "type = \"sudoku\"\n"
+                "clamp_given = true\n"
+                "\n"
                 "[model]\n"
                 "model_type = \"brc_sudoku\"\n"
                 "d_model = 16\n"
-                "clamp_given = true\n"
                 "\n"
                 "[model.brc]\n"
-                "recursion_steps = 2\n"
-                "num_layers = 1\n"
+                "recurrent_steps = 2\n"
+                "block_layers = 1\n"
                 "latent_dim = 16\n"
                 "num_heads = 4\n"
                 "step_loss_weights = [1.0, 2.0]\n"
@@ -646,9 +649,10 @@ class GridModelTests(unittest.TestCase):
             )
             loaded = load_toml_config(str(config_path))
             self.assertEqual(loaded["model_type"], "brc_sudoku")
+            self.assertEqual(loaded["task_type"], "sudoku")
             self.assertTrue(loaded["clamp_given"])
-            self.assertEqual(loaded["brc_recursion_steps"], 2)
-            self.assertEqual(loaded["brc_num_layers"], 1)
+            self.assertEqual(loaded["brc_recurrent_steps"], 2)
+            self.assertEqual(loaded["brc_block_layers"], 1)
             self.assertEqual(loaded["brc_latent_dim"], 16)
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_step_loss_weights"], [1.0, 2.0])
@@ -659,9 +663,13 @@ class GridModelTests(unittest.TestCase):
 
             trm_config_path = Path(tmpdir) / "trm.toml"
             trm_config_path.write_text(
+                "[task]\n"
+                "type = \"maze\"\n"
+                "\n"
                 "[model]\n"
                 "model_type = \"trm\"\n"
                 "d_model = 16\n"
+                "rollout_steps = 3\n"
                 "\n"
                 "[model.trm]\n"
                 "num_heads = 4\n"
@@ -669,6 +677,8 @@ class GridModelTests(unittest.TestCase):
                 encoding="utf-8",
             )
             trm_loaded = load_toml_config(str(trm_config_path))
+            self.assertEqual(trm_loaded["task_type"], "maze")
+            self.assertEqual(trm_loaded["rollout_steps"], 3)
             self.assertEqual(trm_loaded["trm_step_loss_weights"], [1.0, 2.0, 3.0])
 
     def test_checkpoint_round_trip_restores_step(self) -> None:
@@ -680,8 +690,8 @@ class GridModelTests(unittest.TestCase):
                 grid_height=3,
                 grid_width=3,
                 d_model=12,
-                num_steps=1,
-                trm=TRMConfig(recursion_steps=1, num_layers=1, num_heads=3, mlp_ratio=2),
+                rollout_steps=1,
+                trm=TRMConfig(recurrent_steps=1, block_layers=1, num_heads=3, mlp_ratio=2),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),
