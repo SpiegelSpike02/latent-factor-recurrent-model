@@ -850,6 +850,137 @@ METRIC_GROUPS = (
         ),
     ),
 )
+BRC_CONSOLE_GROUPS = (
+    (
+        "loss",
+        (
+            "loss",
+            "blank_ce_loss",
+            "final_blank_ce_loss",
+            "mean_blank_ce_loss",
+        ),
+    ),
+    (
+        "output",
+        (
+            "blank_cell_accuracy",
+            "final_blank_cell_accuracy",
+            "target_probability",
+            "solved_rate",
+            "final_solved_rate",
+            "solved_count",
+            "final_solved_count",
+        ),
+    ),
+    (
+        "sudoku",
+        (
+            "given_consistency",
+            "invalid_board_rate",
+            "conflict_count",
+            "verifier_ranking_accuracy",
+            "true_energy",
+            "fake_energy",
+            "verifier_loss",
+            "meta_outer_loss",
+        ),
+    ),
+    (
+        "latent",
+        (
+            "latent_fit_loss",
+            "fit_given_loss",
+            "fit_energy",
+            "fit_consistency_loss",
+            "fit_prior_loss",
+            "latent_update_norm",
+            "latent_grad_norm",
+            "latent_step_norm",
+        ),
+    ),
+    (
+        "belief",
+        (
+            "unroll_steps",
+            "diffusion_filled_ratio",
+            "brc_gate_mean",
+            "brc_gate_std",
+            "belief_init_noise_rate",
+            "belief_init_uniform_rate",
+            "belief_init_teacher_rate",
+            "belief_init_corrupt_rate",
+            "belief_init_soft_rate",
+        ),
+    ),
+)
+TRM_CONSOLE_GROUPS = (
+    (
+        "loss",
+        (
+            "loss",
+            "blank_ce_loss",
+            "final_blank_ce_loss",
+            "halt_loss",
+        ),
+    ),
+    (
+        "output",
+        (
+            "blank_cell_accuracy",
+            "final_blank_cell_accuracy",
+            "target_probability",
+            "solved_rate",
+            "final_solved_rate",
+            "solved_count",
+            "final_solved_count",
+        ),
+    ),
+    (
+        "path",
+        (
+            "path_precision",
+            "path_recall",
+            "path_f1",
+            "path_positive_rate",
+            "target_path_rate",
+            "final_path_precision",
+            "final_path_recall",
+            "final_path_f1",
+        ),
+    ),
+    (
+        "halt",
+        (
+            "halt_selected_step",
+            "oracle_step",
+            "act_step",
+            "halt_selected_blank_ce_loss",
+            "halt_selected_blank_cell_accuracy",
+            "halt_selected_solved_rate",
+            "halt_selected_solved_count",
+            "halt_selected_path_precision",
+            "halt_selected_path_recall",
+            "halt_selected_path_f1",
+        ),
+    ),
+    (
+        "attention",
+        (
+            "unroll_steps",
+            "attention_gate_mean",
+            "attention_gate_std",
+            "attention_gate_low_saturation",
+            "attention_gate_high_saturation",
+            "attention_local_distance_scale",
+            "terminal_belief_delta",
+            "terminal_belief_mse",
+        ),
+    ),
+)
+CONSOLE_GROUPS_BY_MODEL = {
+    "brc_sudoku": BRC_CONSOLE_GROUPS,
+    "trm": TRM_CONSOLE_GROUPS,
+}
 
 
 def format_scalar_metric(name: str, value: Any) -> str:
@@ -905,11 +1036,12 @@ def optional_summary_log(prefix: str, metrics: dict[str, Any], names: set[str]) 
     return log
 
 
-def grouped_scalar_summary(metrics: dict[str, Any], names: tuple[str, ...]) -> str:
+def grouped_scalar_summary(metrics: dict[str, Any], names: tuple[str, ...], model_type: str | None = None) -> str:
     allowed = set(names)
+    groups = CONSOLE_GROUPS_BY_MODEL.get(model_type or "", METRIC_GROUPS)
     lines: list[str] = []
     emitted: set[str] = set()
-    for group_name, group_metrics in METRIC_GROUPS:
+    for group_name, group_metrics in groups:
         parts = []
         for name in group_metrics:
             if name not in allowed or name not in metrics:
@@ -1037,6 +1169,7 @@ def main() -> None:
 
     current_batch = prefetcher.next()
     use_trm_act = config.model.model_type == "trm" and config.train.trm_train_mode == "act"
+    console_model_label = "brc" if config.model.model_type == "brc_sudoku" else config.model.model_type
     train_carry = model.initial_carry(current_batch) if use_trm_act else None
 
     try:
@@ -1099,8 +1232,8 @@ def main() -> None:
                     wandb_run.log(train_log, step=step, commit=not is_eval_step)
                     for key, value in train_summary.items():
                         wandb_run.summary[key] = value
-                summary = grouped_scalar_summary(metrics, scalar_metrics)
-                print(f"[train] step={step} lr={schedule_learning_rate(config, step):.2e}")
+                summary = grouped_scalar_summary(metrics, scalar_metrics, config.model.model_type)
+                print(f"[train/{console_model_label}] step={step} lr={schedule_learning_rate(config, step):.2e}")
                 if summary:
                     print(summary)
 
@@ -1154,8 +1287,8 @@ def main() -> None:
                         wandb_run.log(eval_log, step=step, commit=commit)
                         for key, value in eval_summary.items():
                             wandb_run.summary[key] = value
-                    summary = grouped_scalar_summary(eval_metrics, scalar_metrics)
-                    print(f"[{label}] step={step}")
+                    summary = grouped_scalar_summary(eval_metrics, scalar_metrics, config.model.model_type)
+                    print(f"[{label}/{console_model_label}] step={step}")
                     if summary:
                         print(summary)
                     print(
