@@ -95,6 +95,15 @@ def _target_loss_weights(model: GridReasoningModel, targets: jax.Array) -> jax.A
     return jnp.where(targets == 5, jnp.asarray(path_weight, dtype=jnp.float32), 1.0)
 
 
+def _loss_mask_from_given(model: object, given_mask: jax.Array) -> jax.Array:
+    supervision = getattr(getattr(model, "config", None), "supervision", "unknown_only")
+    if supervision == "unknown_only":
+        return (~given_mask).astype(jnp.float32)
+    if supervision == "full_grid":
+        return jnp.ones_like(given_mask, dtype=jnp.float32)
+    raise ValueError(f"Unsupported supervision mode: {supervision}")
+
+
 def _weighted_mask_normalizer(mask: jax.Array, weights: jax.Array) -> jax.Array:
     return jnp.maximum(jnp.sum(mask.astype(jnp.float32) * weights.astype(jnp.float32)), 1.0)
 
@@ -521,7 +530,7 @@ def brc_loss_and_metrics(
         train=train,
     )
     given_mask = inputs != 1
-    loss_mask = ~given_mask
+    loss_mask = _loss_mask_from_given(model, given_mask)
     brc = model.brc
     zero = jnp.asarray(0.0, dtype=jnp.float32)
 
@@ -737,7 +746,7 @@ def loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = (~given_mask).astype(jnp.float32)
+    loss_mask = _loss_mask_from_given(model, given_mask)
     loss_weights = _target_loss_weights(model, targets)
     weighted_loss_mask = loss_mask * loss_weights
     normalizer = _weighted_mask_normalizer(loss_mask, loss_weights)
@@ -916,7 +925,7 @@ def trm_act_loss_and_metrics(
     )
     targets = new_carry["current_labels"]
     given_mask = new_carry["current_given_mask"]
-    loss_mask = (~given_mask).astype(jnp.float32)
+    loss_mask = _loss_mask_from_given(model, given_mask)
     loss_weights = _target_loss_weights(model, targets)
     weighted_loss_mask = loss_mask * loss_weights
     normalizer = _weighted_mask_normalizer(loss_mask, loss_weights)
@@ -977,7 +986,7 @@ def trm_dense_unroll_loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = (~given_mask).astype(jnp.float32)
+    loss_mask = _loss_mask_from_given(model, given_mask)
     loss_weights = _target_loss_weights(model, targets)
     weighted_loss_mask = loss_mask * loss_weights
     normalizer = _weighted_mask_normalizer(loss_mask, loss_weights)
@@ -1072,7 +1081,7 @@ def trm_eval_loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = (~given_mask).astype(jnp.float32)
+    loss_mask = _loss_mask_from_given(model, given_mask)
     loss_weights = _target_loss_weights(model, targets)
     weighted_loss_mask = loss_mask * loss_weights
     normalizer = _weighted_mask_normalizer(loss_mask, loss_weights)

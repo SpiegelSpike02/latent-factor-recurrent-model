@@ -48,7 +48,7 @@ NESTED_SECTIONS = {
 }
 ALLOWED_SECTION_KEYS = {
     "data": {"dataset_path"},
-    "task": {"type", "clamp_given", "path_loss_weight"},
+    "task": {"type", "supervision", "clamp_given", "path_loss_weight"},
     "model": {
         "model_type",
         "seq_len",
@@ -90,7 +90,8 @@ ALLOWED_SECTION_KEYS = {
 ALLOWED_NESTED_KEYS = {
     "ema": {"enabled", "decay"},
     "trm": {
-        "recurrent_steps",
+        "deep_recursion",
+        "latent_recursion",
         "block_layers",
         "num_heads",
         "mlp_ratio",
@@ -103,6 +104,7 @@ ALLOWED_NESTED_KEYS = {
         "rms_norm_eps",
         "rope_theta",
         "halt_exploration_prob",
+        "no_act_continue",
         "step_loss_weights",
     },
     "brc": {
@@ -172,6 +174,8 @@ def load_toml_config(path: str | None) -> dict[str, object]:
         raise ValueError("Only model_type='trm' or model_type='brc_sudoku' is supported")
     if flat.get("task_type", "sudoku") not in ("sudoku", "maze", "arc"):
         raise ValueError("Only task_type='sudoku', 'maze', or 'arc' is supported")
+    if flat.get("supervision", "unknown_only") not in ("unknown_only", "full_grid"):
+        raise ValueError("Only supervision='unknown_only' or 'full_grid' is supported")
     return flat
 
 
@@ -206,12 +210,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--model-type", choices=("trm", "brc_sudoku"), default="brc_sudoku")
     parser.add_argument("--task-type", choices=("sudoku", "maze", "arc"), default="sudoku")
+    parser.add_argument("--supervision", choices=("unknown_only", "full_grid"), default="unknown_only")
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--rollout-steps", type=int, default=6)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
     parser.add_argument("--clamp-given", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--path-loss-weight", type=float, default=1.0)
-    parser.add_argument("--trm-recurrent-steps", type=int, default=18)
+    parser.add_argument("--trm-deep-recursion", type=int, default=3)
+    parser.add_argument("--trm-latent-recursion", type=int, default=6)
     parser.add_argument("--trm-block-layers", type=int, default=2)
     parser.add_argument("--trm-num-heads", type=int, default=8)
     parser.add_argument("--trm-mlp-ratio", type=int, default=4)
@@ -224,6 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--trm-rope-theta", type=float, default=10000.0)
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
+    parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-latent-dim", type=int, default=128)
     parser.add_argument("--brc-recurrent-steps", type=int, default=6)
@@ -281,6 +288,7 @@ def build_config(
     model = ModelConfig(
         vocab_size=vocab_size,
         task_type=args.task_type,
+        supervision=args.supervision,
         num_puzzle_identifiers=num_puzzle_identifiers,
         model_type=args.model_type,
         seq_len=seq_len,
@@ -292,7 +300,8 @@ def build_config(
         clamp_given=args.clamp_given,
         path_loss_weight=args.path_loss_weight,
         trm=TRMConfig(
-            recurrent_steps=args.trm_recurrent_steps,
+            deep_recursion=args.trm_deep_recursion,
+            latent_recursion=args.trm_latent_recursion,
             block_layers=args.trm_block_layers,
             num_heads=args.trm_num_heads,
             mlp_ratio=args.trm_mlp_ratio,
@@ -305,6 +314,7 @@ def build_config(
             rms_norm_eps=args.trm_rms_norm_eps,
             rope_theta=args.trm_rope_theta,
             halt_exploration_prob=args.trm_halt_exploration_prob,
+            no_act_continue=args.trm_no_act_continue,
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
         brc=BRCSudokuConfig(

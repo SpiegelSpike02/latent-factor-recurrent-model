@@ -3,6 +3,7 @@ dataset_path = "data/maze-30x30-hard-1k-aug"
 
 [task]
 type = "maze"
+supervision = "unknown_only"
 clamp_given = true
 path_loss_weight = 8.0
 
@@ -16,19 +17,26 @@ rollout_steps = 16
 dropout_rate = 0.05
 
 [model.trm]
-recurrent_steps = 12
+# Official TRM naming: deep_recursion = H_cycles, latent_recursion = L_cycles,
+# block_layers = L_layers. Official Maze attention config uses 3/4/2.
+deep_recursion = 3
+latent_recursion = 4
 block_layers = 2
 num_heads = 8
 mlp_ratio = 4
 mlp_t = false
+# Local deviation. Set false for official TRM.
 local_mixing = true
 local_mixing_kernel = 3
 puzzle_emb_ndim = 512
-puzzle_emb_len = 1
-position_encoding = "rope"
+puzzle_emb_len = 16
+# Official TRM attention config defaults to "rope"; this config intentionally
+# uses 2D relative bias.
+position_encoding = "rel2d"
 rms_norm_eps = 1e-5
-rope_theta = 10000.0
 halt_exploration_prob = 0.1
+# Matches official no_ACT_continue=True: halt uses one sigmoid logit, no continue Q loss.
+no_act_continue = true
 step_loss_weights = [
   1, 2, 3, 4,
   5, 6, 7, 8,
@@ -68,5 +76,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-trm-rope-standard-conv-act-masked-aug-70k"
+name = "maze-trm-rel2d-standard-conv-act-masked-aug-70k"
 mode = "online"

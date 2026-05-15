@@ -6,7 +6,8 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class TRMConfig:
-    recurrent_steps: int = 18
+    deep_recursion: int = 3
+    latent_recursion: int = 6
     block_layers: int = 2
     num_heads: int = 8
     mlp_ratio: int = 4
@@ -19,6 +20,7 @@ class TRMConfig:
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     halt_exploration_prob: float = 0.1
+    no_act_continue: bool = True
     step_loss_weights: tuple[float, ...] | None = None
 
 
@@ -52,6 +54,7 @@ class BRCSudokuConfig:
 class ModelConfig:
     vocab_size: int
     task_type: str = "sudoku"
+    supervision: str = "unknown_only"
     model_type: str = "brc_sudoku"
     num_puzzle_identifiers: int = 1
     seq_len: int = 81

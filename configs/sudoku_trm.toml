@@ -3,6 +3,7 @@ dataset_path = "data/sudoku-extreme-1k-aug-1000"
 
 [task]
 type = "sudoku"
+supervision = "unknown_only"
 
 [model]
 model_type = "trm"
@@ -14,18 +15,27 @@ rollout_steps = 16
 dropout_rate = 0.05
 
 [model.trm]
-recurrent_steps = 18
+# Official TRM naming: deep_recursion = H_cycles, latent_recursion = L_cycles,
+# block_layers = L_layers. Official Sudoku attention config uses 3/6/2.
+deep_recursion = 3
+latent_recursion = 6
 block_layers = 2
 num_heads = 8
 mlp_ratio = 4
 mlp_t = false
+# Local deviation. Set false for official TRM.
 local_mixing = true
 local_mixing_kernel = 3
-puzzle_emb_ndim = 0
-puzzle_emb_len = 0
+puzzle_emb_ndim = 512
+puzzle_emb_len = 16
+# Official TRM attention config defaults to "rope"; this config intentionally
+# uses 2D relative bias. Official Sudoku MLP-T config uses mlp_t=true and
+# position_encoding="none".
 position_encoding = "rel2d"
 rms_norm_eps = 1e-5
 halt_exploration_prob = 0.1
+# Matches official no_ACT_continue=True: halt uses one sigmoid logit, no continue Q loss.
+no_act_continue = true
 step_loss_weights = [
   1, 2, 3, 4,
   5, 6, 7, 8,
