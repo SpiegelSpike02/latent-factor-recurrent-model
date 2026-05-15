@@ -534,25 +534,7 @@ def eval_device_batch(
     return jax.device_put(batch, device=device)
 
 
-def eval_device_index_batch(
-    dataset,
-    *,
-    config: ExperimentConfig,
-    indices: np.ndarray,
-    device: jax.Device,
-) -> dict[str, jax.Array]:
-    if dataset.spec.seq_len != config.model.seq_len:
-        raise ValueError(f"Requested seq_len={config.model.seq_len}, but dataset seq_len={dataset.spec.seq_len}")
-    batch = {
-        "inputs": np.asarray(dataset.eval_inputs[indices], dtype=np.int32),
-        "labels": np.asarray(dataset.eval_labels[indices], dtype=np.int32),
-        "given_mask": np.asarray(dataset.eval_given_mask[indices], dtype=bool),
-        "puzzle_identifiers": np.asarray(dataset.eval_puzzle_identifiers[indices], dtype=np.int32),
-    }
-    return jax.device_put(batch, device=device)
-
-
-def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, rng: np.random.Generator) -> dict[str, Any]:
+def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[str, Any]:
     device = jax.devices()[0]
     reduced: dict[str, Any] | None = None
     total = dataset.eval_inputs.shape[0]
@@ -562,33 +544,23 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, rng: np.
     if batch_size <= 0:
         raise ValueError("eval_batch_size must be at least 1 when set")
     total_weight = 0.0
-    batches = [
-        ("slice", start, min(start + batch_size, total))
-        for start in range(0, total, batch_size)
-    ]
+    num_batches = (total + batch_size - 1) // batch_size
 
     print(
-        f"[eval] running {len(batches)} batches "
+        f"[eval] running {num_batches} batches "
         f"x batch_size={batch_size} "
-        f"({sum(stop - start for _mode, start, stop in batches)} examples)",
+        f"({total} examples)",
         flush=True,
     )
-    for batch_index, (mode, start, stop) in enumerate(batches, start=1):
-        if mode == "slice":
-            batch = eval_device_batch(
-                dataset,
-                config=config,
-                start=start,
-                stop=stop,
-                device=device,
-            )
-        else:
-            batch = eval_device_index_batch(
-                dataset,
-                config=config,
-                indices=indices[start:stop],
-                device=device,
-            )
+    for batch_index, start in enumerate(range(0, total, batch_size), start=1):
+        stop = min(start + batch_size, total)
+        batch = eval_device_batch(
+            dataset,
+            config=config,
+            start=start,
+            stop=stop,
+            device=device,
+        )
         metrics = eval_step_fn(model, batch)
         weight = float(stop - start)
         if reduced is None:
@@ -603,8 +575,8 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, rng: np.
             else:
                 reduced[key] += value_array * weight
         total_weight += weight
-        if batch_index == 1 or batch_index == len(batches) or batch_index % 10 == 0:
-            print(f"[eval] batch {batch_index}/{len(batches)}", flush=True)
+        if batch_index == 1 or batch_index == num_batches or batch_index % 10 == 0:
+            print(f"[eval] batch {batch_index}/{num_batches}", flush=True)
     if reduced is None:
         raise ValueError("No eval batches were produced")
     scale = 1.0 / total_weight
@@ -1118,7 +1090,6 @@ def main() -> None:
             resume_step = restored_step
 
     train_rng = np.random.default_rng(config.train.seed + resume_step)
-    eval_rng = np.random.default_rng(config.train.seed + 1 + resume_step)
     train_key = jax.random.fold_in(jax.random.key(config.train.seed), resume_step)
     scalar_metrics = scalar_metric_names(config)
 
@@ -1232,7 +1203,6 @@ def main() -> None:
                         eval_model,
                         dataset,
                         config=config,
-                        rng=eval_rng,
                     )
                     if wandb_run is not None:
                         eval_log = {
