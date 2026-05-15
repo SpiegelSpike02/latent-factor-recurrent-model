@@ -23,7 +23,7 @@ puzzle_emb_len = 0
 pos_encodings = "rel2d"
 rms_norm_eps = 1e-5
 rope_theta = 10000.0
-halt_exploration_prob = 0.0
+halt_exploration_prob = 0.1
 step_loss_weights = [
   1, 2, 3, 4,
   5, 6, 7, 8,
@@ -42,14 +42,13 @@ grad_clip_norm = 1.0
 flatten_optimizer = true
 
 [train]
-# Dense unroll backprops through all recurrent steps, so it needs a much smaller batch than ACT training.
 batch_size = 64
 eval_batch_size = 256
 max_steps = 100000
 log_every = 10
 eval_every = 2500
 eval_batches = 32
-trm_train_mode = "dense_unroll"
+trm_train_mode = "act"
 halt_loss_weight = 0.5
 seed = 0
 checkpoint_dir = "checkpoints"
@@ -64,5 +63,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-trm-rel2d-gated-dual-dense-b64-resume-100k"
+name = "sudoku-trm-rel2d-standard-conv-act-b64-100k"
 mode = "online"
