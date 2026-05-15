@@ -91,9 +91,8 @@ ALLOWED_SECTION_KEYS = {
 ALLOWED_NESTED_KEYS = {
     "ema": {"enabled", "decay"},
     "trm": {
-        "h_cycles",
-        "l_cycles",
-        "l_layers",
+        "recursion_steps",
+        "num_layers",
         "num_heads",
         "mlp_ratio",
         "mlp_t",
@@ -109,11 +108,14 @@ ALLOWED_NESTED_KEYS = {
         "step_loss_weights",
     },
     "brc": {
+        "recursion_steps",
+        "num_layers",
         "latent_dim",
         "num_heads",
         "mlp_ratio",
+        "pos_encodings",
         "step_loss_weights",
-        "inner_steps",
+        "latent_fit_steps",
         "latent_lr",
         "latent_grad_clip_norm",
         "latent_update_clip_norm",
@@ -202,9 +204,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout-rate", type=float, default=0.0)
     parser.add_argument("--clamp-given", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--path-loss-weight", type=float, default=1.0)
-    parser.add_argument("--trm-h-cycles", type=int, default=3)
-    parser.add_argument("--trm-l-cycles", type=int, default=6)
-    parser.add_argument("--trm-l-layers", type=int, default=2)
+    parser.add_argument("--trm-recursion-steps", type=int, default=18)
+    parser.add_argument("--trm-num-layers", type=int, default=2)
     parser.add_argument("--trm-num-heads", type=int, default=8)
     parser.add_argument("--trm-mlp-ratio", type=int, default=4)
     parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=False)
@@ -219,10 +220,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-latent-dim", type=int, default=128)
+    parser.add_argument("--brc-recursion-steps", type=int, default=6)
+    parser.add_argument("--brc-num-layers", type=int, default=1)
     parser.add_argument("--brc-num-heads", type=int, default=4)
     parser.add_argument("--brc-mlp-ratio", type=int, default=2)
+    parser.add_argument("--brc-pos-encodings", choices=("learned", "rel2d", "none"), default="learned")
     parser.add_argument("--brc-step-loss-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--brc-inner-steps", type=int, default=4)
+    parser.add_argument("--brc-latent-fit-steps", type=int, default=4)
     parser.add_argument("--brc-latent-lr", type=float, default=0.1)
     parser.add_argument("--brc-latent-grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--brc-latent-update-clip-norm", type=float, default=0.5)
@@ -281,9 +285,8 @@ def build_config(
         clamp_given=args.clamp_given,
         path_loss_weight=args.path_loss_weight,
         trm=TRMConfig(
-            h_cycles=args.trm_h_cycles,
-            l_cycles=args.trm_l_cycles,
-            l_layers=args.trm_l_layers,
+            recursion_steps=args.trm_recursion_steps,
+            num_layers=args.trm_num_layers,
             num_heads=args.trm_num_heads,
             mlp_ratio=args.trm_mlp_ratio,
             mlp_t=args.trm_mlp_t,
@@ -299,11 +302,14 @@ def build_config(
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
         brc=BRCSudokuConfig(
+            recursion_steps=args.brc_recursion_steps,
+            num_layers=args.brc_num_layers,
             latent_dim=args.brc_latent_dim,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,
+            pos_encodings=args.brc_pos_encodings,
             step_loss_weights=tuple(args.brc_step_loss_weights) if args.brc_step_loss_weights is not None else None,
-            inner_steps=args.brc_inner_steps,
+            latent_fit_steps=args.brc_latent_fit_steps,
             latent_lr=args.brc_latent_lr,
             latent_grad_clip_norm=args.brc_latent_grad_clip_norm,
             latent_update_clip_norm=args.brc_latent_update_clip_norm,
@@ -1082,18 +1088,13 @@ def main() -> None:
                             list(jax.device_get(metrics["per_step_loss"])),
                         )
                     )
-                for metric_name, log_prefix in (
-                    ("per_step_h_loss", "train/h_loss_by_step"),
-                    ("per_step_l_loss", "train/l_loss_by_step"),
-                    ("per_step_h_accuracy", "train/h_accuracy_by_step"),
-                    ("per_step_l_accuracy", "train/l_accuracy_by_step"),
-                    ("per_step_h_hidden_delta", "train/h_hidden_delta_by_step"),
-                    ("per_step_l_hidden_delta", "train/l_hidden_delta_by_step"),
-                ):
-                    if metric_name in metrics:
-                        train_log.update(
-                            flatten_step_metrics(log_prefix, list(jax.device_get(metrics[metric_name])))
+                if "per_step_accuracy" in metrics:
+                    train_log.update(
+                        flatten_step_metrics(
+                            "train/accuracy_by_step",
+                            list(jax.device_get(metrics["per_step_accuracy"])),
                         )
+                    )
                 if wandb_run is not None:
                     wandb_run.log(train_log, step=step, commit=not is_eval_step)
                     for key, value in train_summary.items():
@@ -1133,18 +1134,10 @@ def main() -> None:
                         )
                         eval_summary = optional_summary_log(prefix, eval_metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
                         eval_log.update(flatten_step_metrics(f"{prefix}/loss_by_step", eval_metrics["per_step_loss"]))
-                        for metric_name, log_prefix in (
-                            ("per_step_h_loss", "h_loss_by_step"),
-                            ("per_step_l_loss", "l_loss_by_step"),
-                            ("per_step_h_accuracy", "h_accuracy_by_step"),
-                            ("per_step_l_accuracy", "l_accuracy_by_step"),
-                            ("per_step_h_hidden_delta", "h_hidden_delta_by_step"),
-                            ("per_step_l_hidden_delta", "l_hidden_delta_by_step"),
-                        ):
-                            if metric_name in eval_metrics:
-                                eval_log.update(
-                                    flatten_step_metrics(f"{prefix}/{log_prefix}", eval_metrics[metric_name])
-                                )
+                        if "per_step_accuracy" in eval_metrics:
+                            eval_log.update(
+                                flatten_step_metrics(f"{prefix}/accuracy_by_step", eval_metrics["per_step_accuracy"])
+                            )
                         eval_log.update(
                             flatten_step_metrics(
                                 f"{prefix}/hidden_delta_by_step",
@@ -1170,13 +1163,8 @@ def main() -> None:
                         + " ".join(
                             [
                                 format_step_summary("loss", eval_metrics["per_step_loss"]),
-                                format_step_summary("h_loss", eval_metrics.get("per_step_h_loss", [])),
-                                format_step_summary("l_loss", eval_metrics.get("per_step_l_loss", [])),
-                                format_step_summary("h_acc", eval_metrics.get("per_step_h_accuracy", [])),
-                                format_step_summary("l_acc", eval_metrics.get("per_step_l_accuracy", [])),
+                                format_step_summary("acc", eval_metrics.get("per_step_accuracy", [])),
                                 format_step_summary("delta", eval_metrics["per_step_hidden_delta"]),
-                                format_step_summary("h_delta", eval_metrics.get("per_step_h_hidden_delta", [])),
-                                format_step_summary("l_delta", eval_metrics.get("per_step_l_hidden_delta", [])),
                                 format_step_summary("halt", eval_metrics.get("per_step_halt_probability", [])),
                             ]
                         )

@@ -11,9 +11,8 @@ num_steps = 16
 dropout_rate = 0.05
 
 [model.trm]
-h_cycles = 3
-l_cycles = 6
-l_layers = 2
+recursion_steps = 18
+num_layers = 2
 num_heads = 8
 mlp_ratio = 4
 mlp_t = false

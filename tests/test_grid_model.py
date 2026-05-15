@@ -104,7 +104,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=9,
                 d_model=16,
                 num_steps=1,
-                brc=BRCSudokuConfig(latent_dim=16, num_heads=4, verifier_layers=1),
+                brc=BRCSudokuConfig(recursion_steps=1, latent_dim=16, num_heads=4, verifier_layers=1),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),
@@ -134,7 +134,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=3,
                 d_model=12,
                 num_steps=2,
-                trm=TRMConfig(h_cycles=1, l_cycles=1, l_layers=1, num_heads=3, mlp_ratio=2),
+                trm=TRMConfig(recursion_steps=1, num_layers=1, num_heads=3, mlp_ratio=2),
             ),
             RuntimeConfig(compute_dtype="float32"),
             rngs=nnx.Rngs(21),
@@ -149,13 +149,10 @@ class GridModelTests(unittest.TestCase):
             batch["inputs"],
             puzzle_identifiers=batch["puzzle_identifiers"],
             train=False,
-            include_layer_diagnostics=True,
         )
         self.assertEqual(logits.shape, (2, 1, 9, 11))
         self.assertEqual(diagnostics["halt_logits"].shape, (2, 1))
-        self.assertEqual(diagnostics["l_logits"].shape, (2, 1, 9, 11))
-        self.assertEqual(diagnostics["h_hidden_delta_mean"].shape, (2,))
-        self.assertEqual(diagnostics["l_hidden_delta_mean"].shape, (2,))
+        self.assertEqual(diagnostics["hidden_delta_mean"].shape, (2,))
         _, metrics = loss_and_metrics(model, batch, True, jax.random.key(2), halt_loss_weight=0.1)
         for key in ("loss", "halt_loss", "halt_selected_blank_ce_loss", "blank_cell_accuracy"):
             self.assertIn(key, metrics)
@@ -168,8 +165,6 @@ class GridModelTests(unittest.TestCase):
         )
         self.assertIn("step_weighted_ce_loss", dense_metrics)
         self.assertIn("step_loss_weights", dense_metrics)
-        self.assertNotIn("per_step_h_loss", dense_metrics)
-        self.assertNotIn("per_step_l_loss", dense_metrics)
         self.assertEqual(dense_metrics["step_loss_weights"].shape, (2,))
         self.assertTrue(bool(jnp.isfinite(dense_metrics["step_weighted_ce_loss"])))
         self.assertAlmostEqual(
@@ -189,10 +184,11 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 num_steps=2,
                 brc=BRCSudokuConfig(
+                    recursion_steps=2,
                     latent_dim=16,
                     num_heads=4,
                     mlp_ratio=1,
-                    inner_steps=1,
+                    latent_fit_steps=1,
                     verifier_layers=1,
                 ),
             ),
@@ -247,10 +243,11 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 num_steps=2,
                 brc=BRCSudokuConfig(
+                    recursion_steps=2,
                     latent_dim=16,
                     num_heads=4,
                     mlp_ratio=1,
-                    inner_steps=1,
+                    latent_fit_steps=1,
                     latent_lr=0.05,
                     verifier_layers=1,
                 ),
@@ -316,10 +313,11 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 num_steps=1,
                 brc=BRCSudokuConfig(
+                    recursion_steps=1,
                     latent_dim=16,
                     num_heads=4,
                     mlp_ratio=1,
-                    inner_steps=1,
+                    latent_fit_steps=1,
                     latent_lr=0.05,
                     meta_loss_weight=0.5,
                     verifier_layers=1,
@@ -362,7 +360,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=3,
                 d_model=12,
                 num_steps=2,
-                trm=TRMConfig(h_cycles=1, l_cycles=1, l_layers=1, num_heads=3, mlp_ratio=2),
+                trm=TRMConfig(recursion_steps=1, num_layers=1, num_heads=3, mlp_ratio=2),
             ),
             RuntimeConfig(compute_dtype="float32"),
             rngs=nnx.Rngs(21),
@@ -372,7 +370,6 @@ class GridModelTests(unittest.TestCase):
             tokens,
             puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
             train=False,
-            include_layer_diagnostics=True,
         )
         blank_digit_logits = logits[-1, 0, 1, 2:]
         self.assertGreater(float(jnp.std(blank_digit_logits)), 1e-6)
@@ -389,9 +386,8 @@ class GridModelTests(unittest.TestCase):
                 d_model=12,
                 num_steps=2,
                 trm=TRMConfig(
-                    h_cycles=1,
-                    l_cycles=1,
-                    l_layers=1,
+                    recursion_steps=1,
+                    num_layers=1,
                     num_heads=3,
                     mlp_ratio=2,
                     puzzle_emb_len=0,
@@ -406,7 +402,6 @@ class GridModelTests(unittest.TestCase):
             tokens,
             puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
             train=False,
-            include_layer_diagnostics=True,
         )
         attention_bias = model._attention_bias()
         self.assertEqual(logits.shape, (2, 1, 9, 11))
@@ -427,9 +422,8 @@ class GridModelTests(unittest.TestCase):
                 d_model=12,
                 num_steps=2,
                 trm=TRMConfig(
-                    h_cycles=1,
-                    l_cycles=1,
-                    l_layers=1,
+                    recursion_steps=1,
+                    num_layers=1,
                     num_heads=3,
                     mlp_ratio=2,
                     puzzle_emb_len=0,
@@ -446,11 +440,10 @@ class GridModelTests(unittest.TestCase):
             tokens,
             puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
             train=False,
-            include_layer_diagnostics=True,
         )
         self.assertEqual(logits.shape, (2, 1, 9, 11))
         self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
-        self.assertIn("l_logits", diagnostics)
+        self.assertIn("halt_logits", diagnostics)
 
     def test_trm_local_global_gate_attention_forward_is_finite(self) -> None:
         model = TinyRecursiveModel(
@@ -463,9 +456,8 @@ class GridModelTests(unittest.TestCase):
                 d_model=12,
                 num_steps=2,
                 trm=TRMConfig(
-                    h_cycles=1,
-                    l_cycles=1,
-                    l_layers=1,
+                    recursion_steps=1,
+                    num_layers=1,
                     num_heads=3,
                     mlp_ratio=2,
                     mlp_t=False,
@@ -482,14 +474,12 @@ class GridModelTests(unittest.TestCase):
             tokens,
             puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
             train=False,
-            include_layer_diagnostics=True,
         )
         attention = model.blocks[0].attention
         self.assertEqual(logits.shape, (2, 1, 9, 11))
         self.assertEqual(attention.local_distance.shape, (9, 9))
         self.assertEqual(attention.local_distance_logit[...].shape, (3,))
         self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
-        self.assertIn("l_logits", diagnostics)
         self.assertIn("attention_gate_mean", diagnostics)
         self.assertIn("attention_local_distance_scale", diagnostics)
         self.assertTrue(bool(jnp.isfinite(diagnostics["attention_gate_mean"])))
@@ -506,9 +496,8 @@ class GridModelTests(unittest.TestCase):
                     d_model=12,
                     num_steps=1,
                     trm=TRMConfig(
-                        h_cycles=1,
-                        l_cycles=1,
-                        l_layers=1,
+                        recursion_steps=1,
+                        num_layers=1,
                         num_heads=3,
                         mlp_ratio=2,
                         local_mixing=True,
@@ -530,7 +519,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=3,
                 d_model=12,
                 num_steps=2,
-                trm=TRMConfig(h_cycles=1, l_cycles=1, l_layers=1, num_heads=3, mlp_ratio=2, puzzle_emb_len=2),
+                trm=TRMConfig(recursion_steps=1, num_layers=1, num_heads=3, mlp_ratio=2, puzzle_emb_len=2),
             ),
             optimizer=OptimizerConfig(
                 learning_rate=1e-4,
@@ -589,9 +578,8 @@ class GridModelTests(unittest.TestCase):
                 d_model=12,
                 num_steps=2,
                 trm=TRMConfig(
-                    h_cycles=1,
-                    l_cycles=1,
-                    l_layers=1,
+                    recursion_steps=1,
+                    num_layers=1,
                     num_heads=3,
                     mlp_ratio=2,
                     puzzle_emb_ndim=12,
@@ -604,8 +592,7 @@ class GridModelTests(unittest.TestCase):
         params = nnx.state(model, nnx.Param)
         self.assertEqual(model.prefix_len, 2)
         self.assertEqual(model.puzzle_emb.weights[...].shape, (5, 12))
-        self.assertNotIn("h_init", str(params))
-        self.assertNotIn("l_init", str(params))
+        self.assertNotIn("state_init", str(params))
 
     def test_halt_selected_metrics_use_first_positive_halt_step(self) -> None:
         class HaltSelectedModel:
@@ -655,7 +642,7 @@ class GridModelTests(unittest.TestCase):
                     grid_width=9,
                     d_model=10,
                     num_steps=1,
-                    brc=BRCSudokuConfig(latent_dim=16, num_heads=4),
+                    brc=BRCSudokuConfig(recursion_steps=1, latent_dim=16, num_heads=4),
                 ),
                 RuntimeConfig(compute_dtype="float32"),
                 rngs=nnx.Rngs(0),
@@ -683,10 +670,12 @@ class GridModelTests(unittest.TestCase):
                 "clamp_given = true\n"
                 "\n"
                 "[model.brc]\n"
+                "recursion_steps = 2\n"
+                "num_layers = 1\n"
                 "latent_dim = 16\n"
                 "num_heads = 4\n"
                 "step_loss_weights = [1.0, 2.0]\n"
-                "inner_steps = 1\n"
+                "latent_fit_steps = 1\n"
                 "meta_loss_weight = 0.5\n"
                 "fit_energy_weight = 0.75\n"
                 "denoise_initial_prob = 0.4\n"
@@ -697,6 +686,8 @@ class GridModelTests(unittest.TestCase):
             loaded = load_toml_config(str(config_path))
             self.assertEqual(loaded["model_type"], "brc_sudoku")
             self.assertTrue(loaded["clamp_given"])
+            self.assertEqual(loaded["brc_recursion_steps"], 2)
+            self.assertEqual(loaded["brc_num_layers"], 1)
             self.assertEqual(loaded["brc_latent_dim"], 16)
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_step_loss_weights"], [1.0, 2.0])
@@ -729,7 +720,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=3,
                 d_model=12,
                 num_steps=1,
-                trm=TRMConfig(h_cycles=1, l_cycles=1, l_layers=1, num_heads=3, mlp_ratio=2),
+                trm=TRMConfig(recursion_steps=1, num_layers=1, num_heads=3, mlp_ratio=2),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),

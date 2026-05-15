@@ -6,9 +6,8 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class TRMConfig:
-    h_cycles: int = 3
-    l_cycles: int = 6
-    l_layers: int = 2
+    recursion_steps: int = 18
+    num_layers: int = 2
     num_heads: int = 8
     mlp_ratio: int = 4
     mlp_t: bool = False
@@ -26,11 +25,14 @@ class TRMConfig:
 
 @dataclass(frozen=True)
 class BRCSudokuConfig:
+    recursion_steps: int = 6
+    num_layers: int = 1
     latent_dim: int = 128
     num_heads: int = 4
     mlp_ratio: int = 2
+    pos_encodings: str = "learned"
     step_loss_weights: tuple[float, ...] | None = None
-    inner_steps: int = 4
+    latent_fit_steps: int = 4
     latent_lr: float = 0.1
     latent_grad_clip_norm: float = 1.0
     latent_update_clip_norm: float = 0.5

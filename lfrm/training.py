@@ -292,10 +292,10 @@ def _verifier_guided_latent_fit(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     brc = model.brc
     zero = jnp.asarray(0.0, dtype=jnp.float32)
-    if brc.inner_steps <= 0:
+    if brc.latent_fit_steps <= 0:
         return z0, _zero_brc_fit_metrics(zero)
 
-    step_keys = jax.random.split(key, (brc.inner_steps, 2))
+    step_keys = jax.random.split(key, (brc.latent_fit_steps, 2))
 
     def fit_components(latent_z: jax.Array, step_key_pair: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         key_a, key_b = step_key_pair
@@ -413,7 +413,7 @@ def _brc_compact_training_rollout(
     loss_normalizer = jnp.maximum(jnp.sum(loss_mask_f32), 1.0)
     candidate_init = jnp.zeros_like(inputs)
     early_index = jnp.asarray(0, dtype=jnp.int32)
-    mid_index = jnp.asarray(model.config.num_steps // 2, dtype=jnp.int32)
+    mid_index = jnp.asarray(model.recursion_steps // 2, dtype=jnp.int32)
 
     def scan_step(carry, scan_inputs):
         h_prev, belief_logits, early_candidate, mid_candidate = carry
@@ -426,7 +426,7 @@ def _brc_compact_training_rollout(
             train=True,
             dropout_key=step_dropout_key,
         )
-        h_next, block_diagnostics = model.solver_block(h_prev, cell_input, z, model.relation_masks)
+        h_next, block_diagnostics = model._solver_update(h_prev, cell_input, z)
         raw_logits = model.lm_head(h_next.astype(model.dtype))
         next_belief = model._belief_update(inputs, belief_logits, raw_logits, step_index)
         logits = model._belief_to_token_logits(next_belief, inputs, step_index)
@@ -449,8 +449,8 @@ def _brc_compact_training_rollout(
             block_diagnostics["brc_gate_std"],
         )
 
-    step_indices = jnp.arange(model.config.num_steps, dtype=jnp.int32)
-    step_dropout_keys = jax.random.split(dropout_key, model.config.num_steps)
+    step_indices = jnp.arange(model.recursion_steps, dtype=jnp.int32)
+    step_dropout_keys = jax.random.split(dropout_key, model.recursion_steps)
     time_embeddings = model.time_embed(step_indices)
     initial_carry = (h, initial_belief.astype(jnp.float32), candidate_init, candidate_init)
     (h_final, belief_final, early_candidate, mid_candidate), scan_outputs = jax.lax.scan(
@@ -459,7 +459,7 @@ def _brc_compact_training_rollout(
         (step_indices, step_dropout_keys, time_embeddings),
     )
     per_step_loss, hidden_delta, filled_ratio, gate_mean, gate_std = scan_outputs
-    final_step = jnp.asarray(model.config.num_steps - 1, dtype=jnp.int32)
+    final_step = jnp.asarray(model.recursion_steps - 1, dtype=jnp.int32)
     final_logits = model._belief_to_token_logits(belief_final, inputs, final_step)
     final_candidate = jnp.argmax(final_logits, axis=-1).astype(jnp.int32)
     diagnostics = {
@@ -467,7 +467,7 @@ def _brc_compact_training_rollout(
         "diffusion_filled_ratio": filled_ratio,
         "brc_gate_mean": jnp.mean(gate_mean),
         "brc_gate_std": jnp.mean(gate_std),
-        "unroll_steps": jnp.asarray(model.config.num_steps, dtype=jnp.float32),
+        "unroll_steps": jnp.asarray(model.recursion_steps, dtype=jnp.float32),
         "z": z,
         "h": h_final,
         "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
@@ -990,7 +990,6 @@ def trm_dense_unroll_loss_and_metrics(
         train=train,
         dropout_key=dropout_key,
         compute_terminal_residual=False,
-        include_layer_diagnostics=False,
     )
     if _should_clamp_given(model):
         step_logits = _clamp_logits_to_given(step_logits, inputs, given_mask, model.config.vocab_size)
@@ -1095,17 +1094,9 @@ def trm_eval_loss_and_metrics(
         train=False,
         dropout_key=None,
         compute_terminal_residual=False,
-        include_layer_diagnostics=True,
     )
     if _should_clamp_given(model):
         step_logits = _clamp_logits_to_given(step_logits, inputs, given_mask, model.config.vocab_size)
-        if "l_logits" in diagnostics:
-            diagnostics["l_logits"] = _clamp_logits_to_given(
-                diagnostics["l_logits"],
-                inputs,
-                given_mask,
-                model.config.vocab_size,
-            )
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = weighted_loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
@@ -1123,15 +1114,6 @@ def trm_eval_loss_and_metrics(
         step_correct_per_example == blanks_per_example[None, :],
         True,
     )
-    l_logits = diagnostics.get("l_logits")
-    l_per_step_loss = jnp.zeros_like(per_step_loss)
-    l_per_step_accuracy = jnp.zeros_like(per_step_loss)
-    if l_logits is not None:
-        l_token_loss = optax.softmax_cross_entropy_with_integer_labels(l_logits, step_targets)
-        l_per_step_loss = jnp.sum(l_token_loss * step_loss_mask, axis=(1, 2)) / normalizer
-        l_predictions = jnp.argmax(l_logits, axis=-1)
-        l_correct = (l_predictions == step_targets).astype(jnp.float32) * metric_step_loss_mask
-        l_per_step_accuracy = jnp.sum(l_correct, axis=(1, 2)) / metric_normalizer
     halt_logits = diagnostics["halt_logits"]
     selected_step = _trm_halt_selected_step(halt_logits)
     gather_index = selected_step[None, :, None, None]
@@ -1191,13 +1173,8 @@ def trm_eval_loss_and_metrics(
         "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
         "final_solved_count": final_solved_count,
         "per_step_loss": per_step_loss,
-        "per_step_h_loss": per_step_loss,
-        "per_step_l_loss": l_per_step_loss,
-        "per_step_h_accuracy": per_step_accuracy,
-        "per_step_l_accuracy": l_per_step_accuracy,
+        "per_step_accuracy": per_step_accuracy,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
-        "per_step_h_hidden_delta": diagnostics.get("h_hidden_delta_mean", diagnostics["hidden_delta_mean"]),
-        "per_step_l_hidden_delta": diagnostics.get("l_hidden_delta_mean", jnp.zeros_like(diagnostics["hidden_delta_mean"])),
         "per_step_halt_probability": jax.nn.sigmoid(jnp.mean(halt_logits, axis=1)),
         "unroll_steps": jnp.asarray(step_logits.shape[0], dtype=jnp.int32),
     }

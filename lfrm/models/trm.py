@@ -10,7 +10,7 @@ from lfrm.config import ModelConfig, RuntimeConfig
 from .common import Array, CastedEmbedding, casted_linear_init, compute_dtype, maybe_cast, trunc_normal, trunc_normal_init
 
 
-State = tuple[Array, Array]
+State = Array
 Carry = dict[str, Array]
 
 
@@ -317,9 +317,9 @@ class TRMBlock(nnx.Module):
 class TinyRecursiveModel(nnx.Module):
     """Official-style Tiny Recursive Model baseline.
 
-    The model keeps two recurrent token states, z_H and z_L. Each ACT step runs
-    several H/L cycles with a shared low-level block, detaches the carry between
-    ACT steps, and reads token logits plus a halt head from z_H.
+    The model keeps one recurrent token state. Each ACT step applies the same
+    recursive level several times, detaches the carry between ACT steps, and
+    reads token logits plus a halt head from the recurrent state.
     """
 
     def __init__(
@@ -336,12 +336,10 @@ class TinyRecursiveModel(nnx.Module):
         if config.num_steps < 1:
             raise ValueError("TRM num_steps must be at least 1")
         trm = config.trm_config
-        if trm.l_layers < 1:
-            raise ValueError("TRM l_layers must be at least 1")
-        if trm.h_cycles < 1:
-            raise ValueError("TRM h_cycles must be at least 1")
-        if trm.l_cycles < 1:
-            raise ValueError("TRM l_cycles must be at least 1")
+        if trm.recursion_steps < 1:
+            raise ValueError("TRM recursion_steps must be at least 1")
+        if trm.num_layers < 1:
+            raise ValueError("TRM num_layers must be at least 1")
         if trm.mlp_ratio < 1:
             raise ValueError("TRM mlp_ratio must be at least 1")
         if trm.attention_type not in ("standard", "local_global_gate"):
@@ -470,7 +468,7 @@ class TinyRecursiveModel(nnx.Module):
         self.blocks = nnx.List(
             [
                 TRMBlock(config, self.total_seq_len, self.prefix_len, dtype, rngs=rngs)
-                for _ in range(trm.l_layers)
+                for _ in range(trm.num_layers)
             ]
         )
         self.lm_head = nnx.Linear(
@@ -491,8 +489,7 @@ class TinyRecursiveModel(nnx.Module):
             bias_init=nnx.initializers.constant(-5.0),
             rngs=rngs,
         )
-        self.h_init = nnx.data(trunc_normal(rngs.params(), (config.d_model,), 1.0, dtype))
-        self.l_init = nnx.data(trunc_normal(rngs.params(), (config.d_model,), 1.0, dtype))
+        self.state_init = nnx.data(trunc_normal(rngs.params(), (config.d_model,), 1.0, dtype))
 
         if trm.pos_encodings == "rope":
             head_dim = config.d_model // trm.num_heads
@@ -571,17 +568,17 @@ class TinyRecursiveModel(nnx.Module):
         return self.dropout(embedding, deterministic=not train, rngs=dropout_key).astype(self.dtype)
 
     def _initial_state(self, batch_size: int) -> State:
-        h_init = jnp.broadcast_to(self.h_init.astype(self.dtype), (batch_size, self.total_seq_len, self.config.d_model))
-        l_init = jnp.broadcast_to(self.l_init.astype(self.dtype), (batch_size, self.total_seq_len, self.config.d_model))
-        return h_init, l_init
+        return jnp.broadcast_to(
+            self.state_init.astype(self.dtype),
+            (batch_size, self.total_seq_len, self.config.d_model),
+        )
 
     def initial_carry(self, batch: dict[str, Array]) -> Carry:
         batch_size = batch["inputs"].shape[0]
-        z_h, z_l = self._initial_state(batch_size)
+        state = self._initial_state(batch_size)
         puzzle_identifiers = self._batch_puzzle_identifiers(batch)
         return {
-            "z_h": z_h,
-            "z_l": z_l,
+            "state": state,
             "steps": jnp.zeros((batch_size,), dtype=jnp.int32),
             "halted": jnp.ones((batch_size,), dtype=bool),
             "current_inputs": jnp.zeros_like(batch["inputs"]),
@@ -591,11 +588,9 @@ class TinyRecursiveModel(nnx.Module):
         }
 
     def _reset_carry_state(self, carry: Carry) -> State:
-        z_h_init, z_l_init = self._initial_state(carry["steps"].shape[0])
+        state_init = self._initial_state(carry["steps"].shape[0])
         reset = carry["halted"][:, None, None]
-        z_h = jnp.where(reset, z_h_init, carry["z_h"])
-        z_l = jnp.where(reset, z_l_init, carry["z_l"])
-        return z_h, z_l
+        return jnp.where(reset, state_init, carry["state"])
 
     def _current_batch(self, carry: Carry, batch: dict[str, Array]) -> dict[str, Array]:
         reset = carry["halted"]
@@ -627,7 +622,7 @@ class TinyRecursiveModel(nnx.Module):
     def _scale_attention_diagnostics(diagnostics: dict[str, Array], normalizer: float | Array) -> dict[str, Array]:
         return {key: value / normalizer for key, value in diagnostics.items()}
 
-    def _l_level(self, hidden_states: Array, input_injection: Array) -> tuple[Array, dict[str, Array]]:
+    def _recurrent_level(self, hidden_states: Array, input_injection: Array) -> tuple[Array, dict[str, Array]]:
         hidden_states = hidden_states + input_injection
         attention_bias = self._attention_bias()
         diagnostics = self._empty_attention_diagnostics()
@@ -642,29 +637,15 @@ class TinyRecursiveModel(nnx.Module):
         normalizer = jnp.maximum(jnp.asarray(len(self.blocks), dtype=jnp.float32), 1.0)
         return hidden_states, self._scale_attention_diagnostics(diagnostics, normalizer)
 
-    def _h_cycle(self, state: State, input_embeddings: Array) -> tuple[State, dict[str, Array]]:
-        z_h, z_l = state
-        diagnostics = self._empty_attention_diagnostics()
-        for _ in range(self.trm.l_cycles):
-            z_l, l_diagnostics = self._l_level(z_l, z_h + input_embeddings)
-            z_h, h_diagnostics = self._l_level(z_h, z_l)
-            diagnostics = self._add_attention_diagnostics(diagnostics, l_diagnostics)
-            diagnostics = self._add_attention_diagnostics(diagnostics, h_diagnostics)
-        normalizer = jnp.asarray(2 * self.trm.l_cycles, dtype=jnp.float32)
-        return (z_h, z_l), self._scale_attention_diagnostics(diagnostics, normalizer)
-
     def _act_step(self, state: State, input_embeddings: Array) -> tuple[State, dict[str, Array]]:
-        z_h, z_l = state
         diagnostics = self._empty_attention_diagnostics()
-        for _ in range(self.trm.h_cycles - 1):
-            (z_h, z_l), cycle_diagnostics = self._h_cycle((z_h, z_l), input_embeddings)
-            diagnostics = self._add_attention_diagnostics(diagnostics, cycle_diagnostics)
-            z_h = jax.lax.stop_gradient(z_h)
-            z_l = jax.lax.stop_gradient(z_l)
-        (z_h, z_l), cycle_diagnostics = self._h_cycle((z_h, z_l), input_embeddings)
-        diagnostics = self._add_attention_diagnostics(diagnostics, cycle_diagnostics)
-        normalizer = jnp.asarray(self.trm.h_cycles, dtype=jnp.float32)
-        return (z_h, z_l), self._scale_attention_diagnostics(diagnostics, normalizer)
+        for _ in range(self.trm.recursion_steps - 1):
+            state, step_diagnostics = self._recurrent_level(state, input_embeddings)
+            diagnostics = self._add_attention_diagnostics(diagnostics, step_diagnostics)
+        state, step_diagnostics = self._recurrent_level(state, input_embeddings)
+        diagnostics = self._add_attention_diagnostics(diagnostics, step_diagnostics)
+        normalizer = jnp.asarray(self.trm.recursion_steps, dtype=jnp.float32)
+        return state, self._scale_attention_diagnostics(diagnostics, normalizer)
 
     def _blank_mean(self, values: Array, condition_mask: Array) -> Array:
         mask = (~condition_mask).astype(jnp.float32)[..., None]
@@ -672,11 +653,11 @@ class TinyRecursiveModel(nnx.Module):
         normalizer = jnp.maximum(jnp.sum(mask) * trailing_size, 1.0)
         return jnp.sum(values * mask) / normalizer
 
-    def _halt_logits(self, z_h: Array) -> Array:
-        return self.halt_head(maybe_cast(z_h[:, 0], self.dtype)).astype(jnp.float32)[..., 0]
+    def _halt_logits(self, state: Array) -> Array:
+        return self.halt_head(maybe_cast(state[:, 0], self.dtype)).astype(jnp.float32)[..., 0]
 
-    def _logits_from_state(self, z_h: Array) -> Array:
-        return self.lm_head(maybe_cast(z_h, self.dtype)).astype(jnp.float32)
+    def _logits_from_state(self, state: Array) -> Array:
+        return self.lm_head(maybe_cast(state, self.dtype)).astype(jnp.float32)
 
     def forward_act_step(
         self,
@@ -701,14 +682,11 @@ class TinyRecursiveModel(nnx.Module):
             puzzle_embeddings=puzzle_embeddings,
         )
         state = self._reset_carry_state(carry)
-        z_h_prev = state[0][:, self.prefix_len :]
-        z_l_prev = state[1][:, self.prefix_len :]
+        prev_data = state[:, self.prefix_len :]
         next_state, attention_diagnostics = self._act_step(state, input_embeddings)
-        z_h_next, z_l_next = next_state
-        z_h_data = z_h_next[:, self.prefix_len :]
-        z_l_data = z_l_next[:, self.prefix_len :]
-        logits = self._logits_from_state(z_h_data)
-        halt_logits = self._halt_logits(z_h_next)
+        state_data = next_state[:, self.prefix_len :]
+        logits = self._logits_from_state(state_data)
+        halt_logits = self._halt_logits(next_state)
 
         new_steps = jnp.where(carry["halted"], 0, carry["steps"]) + 1
         is_last_step = new_steps >= self.config.num_steps
@@ -728,13 +706,10 @@ class TinyRecursiveModel(nnx.Module):
         else:
             halted = is_last_step
 
-        h_delta = jnp.linalg.norm((z_h_data - z_h_prev).astype(jnp.float32), axis=-1, keepdims=True)
-        l_delta = jnp.linalg.norm((z_l_data - z_l_prev).astype(jnp.float32), axis=-1, keepdims=True)
-        hidden_delta = self._blank_mean(h_delta, condition_mask)
-        low_hidden_delta = self._blank_mean(l_delta, condition_mask)
+        delta = jnp.linalg.norm((state_data - prev_data).astype(jnp.float32), axis=-1, keepdims=True)
+        hidden_delta = self._blank_mean(delta, condition_mask)
         new_carry = {
-            "z_h": jax.lax.stop_gradient(z_h_next),
-            "z_l": jax.lax.stop_gradient(z_l_next),
+            "state": jax.lax.stop_gradient(next_state),
             "steps": jax.lax.stop_gradient(new_steps),
             "halted": jax.lax.stop_gradient(halted),
             "current_inputs": current_batch["inputs"],
@@ -744,8 +719,6 @@ class TinyRecursiveModel(nnx.Module):
         }
         diagnostics = {
             "hidden_delta_mean": hidden_delta,
-            "h_hidden_delta_mean": hidden_delta,
-            "l_hidden_delta_mean": low_hidden_delta,
             "halt_logits": halt_logits,
             "act_step": jnp.mean(new_steps.astype(jnp.float32)),
             "halted_rate": jnp.mean(halted.astype(jnp.float32)),
@@ -762,7 +735,6 @@ class TinyRecursiveModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
         compute_terminal_residual: bool = True,
-        include_layer_diagnostics: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
         condition_mask = self._condition_mask(tokens)
         input_embeddings = self._input_embeddings(
@@ -774,30 +746,17 @@ class TinyRecursiveModel(nnx.Module):
         state0 = self._initial_state(tokens.shape[0])
 
         def scan_step(state: State, _step_index):
-            z_h_prev, z_l_prev = state
+            prev_data = state[:, self.prefix_len :]
             next_state, attention_diagnostics = self._act_step(state, input_embeddings)
-            z_h_next, z_l_next = next_state
-            z_h_data = z_h_next[:, self.prefix_len :]
-            z_h_prev_data = z_h_prev[:, self.prefix_len :]
-            h_delta = jnp.linalg.norm((z_h_data - z_h_prev_data).astype(jnp.float32), axis=-1, keepdims=True)
-            hidden_delta = self._blank_mean(h_delta, condition_mask)
-            step_logits = self._logits_from_state(z_h_data)
-            halt_logits = self._halt_logits(z_h_next)
-            carry_state = jax.tree.map(jax.lax.stop_gradient, next_state)
-            if include_layer_diagnostics:
-                z_l_data = z_l_next[:, self.prefix_len :]
-                z_l_prev_data = z_l_prev[:, self.prefix_len :]
-                l_delta = jnp.linalg.norm((z_l_data - z_l_prev_data).astype(jnp.float32), axis=-1, keepdims=True)
-                low_hidden_delta = self._blank_mean(l_delta, condition_mask)
-                low_step_logits = jax.lax.stop_gradient(self._logits_from_state(z_l_data))
-            else:
-                low_hidden_delta = jnp.zeros_like(hidden_delta)
-                low_step_logits = jnp.zeros_like(step_logits)
+            state_data = next_state[:, self.prefix_len :]
+            delta = jnp.linalg.norm((state_data - prev_data).astype(jnp.float32), axis=-1, keepdims=True)
+            hidden_delta = self._blank_mean(delta, condition_mask)
+            step_logits = self._logits_from_state(state_data)
+            halt_logits = self._halt_logits(next_state)
+            carry_state = jax.lax.stop_gradient(next_state)
             return carry_state, (
                 step_logits,
-                low_step_logits,
                 hidden_delta,
-                low_hidden_delta,
                 halt_logits,
                 jnp.stack(
                     [
@@ -812,9 +771,7 @@ class TinyRecursiveModel(nnx.Module):
 
         final_state, (
             step_logits,
-            low_step_logits,
             step_hidden_delta,
-            low_step_hidden_delta,
             halt_logits,
             step_attention_diagnostics,
         ) = jax.lax.scan(
@@ -826,22 +783,17 @@ class TinyRecursiveModel(nnx.Module):
             "hidden_delta_mean": step_hidden_delta,
             "halt_logits": halt_logits,
             "unroll_steps": jnp.asarray(self.config.num_steps, dtype=jnp.float32),
-            "h": final_state[0][:, self.prefix_len :],
-            "l": final_state[1][:, self.prefix_len :],
+            "state": final_state[:, self.prefix_len :],
             "attention_gate_mean": jnp.mean(step_attention_diagnostics[:, 0]),
             "attention_gate_std": jnp.mean(step_attention_diagnostics[:, 1]),
             "attention_gate_low_saturation": jnp.mean(step_attention_diagnostics[:, 2]),
             "attention_gate_high_saturation": jnp.mean(step_attention_diagnostics[:, 3]),
             "attention_local_distance_scale": jnp.mean(step_attention_diagnostics[:, 4]),
         }
-        if include_layer_diagnostics:
-            diagnostics["h_hidden_delta_mean"] = step_hidden_delta
-            diagnostics["l_hidden_delta_mean"] = low_step_hidden_delta
-            diagnostics["l_logits"] = low_step_logits
         if compute_terminal_residual:
             final_logits = step_logits[-1]
             next_state, _ = self._act_step(final_state, input_embeddings)
-            next_logits = self._logits_from_state(next_state[0][:, self.prefix_len :])
+            next_logits = self._logits_from_state(next_state[:, self.prefix_len :])
             probs = jax.nn.softmax(final_logits, axis=-1)
             next_probs = jax.nn.softmax(next_logits, axis=-1)
             prob_delta = next_probs - probs
@@ -858,7 +810,6 @@ class TinyRecursiveModel(nnx.Module):
         train: bool,
         dropout_key: Array | None = None,
         compute_terminal_residual: bool = True,
-        include_layer_diagnostics: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
         return self._run_unroll(
             tokens,
@@ -866,7 +817,6 @@ class TinyRecursiveModel(nnx.Module):
             train=train,
             dropout_key=dropout_key,
             compute_terminal_residual=compute_terminal_residual,
-            include_layer_diagnostics=include_layer_diagnostics,
         )
 
     def forward_final_with_diagnostics(

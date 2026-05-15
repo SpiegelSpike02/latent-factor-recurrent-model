@@ -17,14 +17,44 @@ def _rms_norm(x: Array, eps: float = 1e-5) -> Array:
 
 
 class RelationTypedAttention(nnx.Module):
-    def __init__(self, d_model: int, num_heads: int, num_relations: int, dtype: jnp.dtype, *, rngs: nnx.Rngs) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        num_relations: int,
+        grid_height: int,
+        grid_width: int,
+        pos_encodings: str,
+        dtype: jnp.dtype,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
         if d_model % num_heads != 0:
             raise ValueError("BRC-Sudoku d_model must be divisible by num_heads")
+        if pos_encodings not in ("learned", "rel2d", "none"):
+            raise ValueError("BRC-Sudoku pos_encodings must be 'learned', 'rel2d', or 'none'")
         self.d_model = d_model
         self.num_heads = num_heads
         self.num_relations = num_relations
         self.head_dim = d_model // num_heads
+        self.pos_encodings = pos_encodings
         self.dtype = dtype
+        if pos_encodings == "rel2d":
+            seq_len = grid_height * grid_width
+            rows = jnp.arange(seq_len, dtype=jnp.int32) // grid_width
+            cols = jnp.arange(seq_len, dtype=jnp.int32) % grid_width
+            rel_row = rows[None, :] - rows[:, None] + (grid_height - 1)
+            rel_col = cols[None, :] - cols[:, None] + (grid_width - 1)
+            rel2d_indices = rel_row * (2 * grid_width - 1) + rel_col
+            self.rel2d_indices = nnx.data(rel2d_indices.astype(jnp.int32))
+            self.rel2d_bias = nnx.Embed(
+                (2 * grid_height - 1) * (2 * grid_width - 1),
+                num_heads,
+                dtype=dtype,
+                param_dtype=jnp.float32,
+                embedding_init=nnx.initializers.zeros,
+                rngs=rngs,
+            )
         self.qkv = nnx.Linear(
             d_model,
             3 * d_model,
@@ -74,6 +104,9 @@ class RelationTypedAttention(nnx.Module):
         v = jnp.swapaxes(v, 1, 2)
         scores = jnp.einsum("bhnd,bhmd->bhnm", q, k, preferred_element_type=jnp.float32)
         scores = scores / math.sqrt(self.head_dim)
+        if self.pos_encodings == "rel2d":
+            rel2d_bias = self.rel2d_bias(self.rel2d_indices).astype(jnp.float32)
+            scores = scores + jnp.moveaxis(rel2d_bias, -1, 0)[None, :, :, :]
         relation_scores = scores[:, None, :, :, :] + self.relation_bias[...][None, :, :, None, None]
         relation_scores = jnp.where(relation_masks[None, :, None, :, :], relation_scores, -1.0e9)
         weights = jax.nn.softmax(relation_scores.astype(jnp.float32), axis=-1).astype(h.dtype)
@@ -101,7 +134,16 @@ class RelationTypedSolverBlock(nnx.Module):
         self.dtype = dtype
         d_model = config.d_model
         hidden_dim = max(d_model, mlp_ratio * d_model)
-        self.relation_attention = RelationTypedAttention(d_model, num_heads, num_relations, dtype, rngs=rngs)
+        self.relation_attention = RelationTypedAttention(
+            d_model,
+            num_heads,
+            num_relations,
+            config.grid_height,
+            config.grid_width,
+            config.brc_config.pos_encodings,
+            dtype,
+            rngs=rngs,
+        )
         self.msg_in = nnx.Linear(
             2 * d_model,
             hidden_dim,
@@ -160,7 +202,16 @@ class RelationTypedVerifierBlock(nnx.Module):
         self.dtype = dtype
         d_model = config.d_model
         hidden_dim = max(d_model, mlp_ratio * d_model)
-        self.relation_attention = RelationTypedAttention(d_model, num_heads, num_relations, dtype, rngs=rngs)
+        self.relation_attention = RelationTypedAttention(
+            d_model,
+            num_heads,
+            num_relations,
+            config.grid_height,
+            config.grid_width,
+            config.brc_config.pos_encodings,
+            dtype,
+            rngs=rngs,
+        )
         self.msg_in = nnx.Linear(
             2 * d_model,
             hidden_dim,
@@ -206,9 +257,11 @@ class BRCSudokuModel(nnx.Module):
             raise ValueError("grid_height * grid_width must equal seq_len")
         if config.vocab_size < 11:
             raise ValueError("BRC Sudoku expects vocab_size >= 11")
-        if config.num_steps < 1:
-            raise ValueError("BRC num_steps must be at least 1")
         brc = config.brc_config
+        if brc.recursion_steps < 1:
+            raise ValueError("BRC recursion_steps must be at least 1")
+        if brc.num_layers < 1:
+            raise ValueError("BRC num_layers must be at least 1")
         if brc.latent_dim < 1:
             raise ValueError("BRC latent_dim must be at least 1")
         if brc.num_heads < 1:
@@ -217,15 +270,17 @@ class BRCSudokuModel(nnx.Module):
             raise ValueError("BRC d_model must be divisible by num_heads")
         if brc.mlp_ratio < 1:
             raise ValueError("BRC mlp_ratio must be at least 1")
+        if brc.pos_encodings not in ("learned", "rel2d", "none"):
+            raise ValueError("BRC pos_encodings must be 'learned', 'rel2d', or 'none'")
         if brc.step_loss_weights is not None:
-            if len(brc.step_loss_weights) != config.num_steps:
-                raise ValueError("BRC step_loss_weights length must equal num_steps")
+            if len(brc.step_loss_weights) != brc.recursion_steps:
+                raise ValueError("BRC step_loss_weights length must equal recursion_steps")
             if any(weight < 0.0 for weight in brc.step_loss_weights):
                 raise ValueError("BRC step_loss_weights must be non-negative")
             if sum(brc.step_loss_weights) <= 0.0:
                 raise ValueError("BRC step_loss_weights must contain a positive weight")
-        if brc.inner_steps < 0:
-            raise ValueError("BRC inner_steps must be non-negative")
+        if brc.latent_fit_steps < 0:
+            raise ValueError("BRC latent_fit_steps must be non-negative")
         if not 0.0 <= brc.denoise_initial_prob <= 1.0:
             raise ValueError("BRC denoise_initial_prob must be in [0, 1]")
         if not 0.0 <= brc.denoise_teacher_reveal_prob <= 1.0:
@@ -242,6 +297,7 @@ class BRCSudokuModel(nnx.Module):
         self.config = config
         self.runtime = runtime
         self.brc = brc
+        self.recursion_steps = int(brc.recursion_steps)
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
         self.box_height, self.box_width = self._box_shape(config.grid_height, config.grid_width)
@@ -270,10 +326,11 @@ class BRCSudokuModel(nnx.Module):
         )
         self.given_embed = nnx.Embed(2, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.draft_embed = nnx.Embed(10, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.row_embed = nnx.Embed(config.grid_height, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.col_embed = nnx.Embed(config.grid_width, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.box_embed = nnx.Embed(self.num_boxes, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.time_embed = nnx.Embed(config.num_steps, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
+        if brc.pos_encodings == "learned":
+            self.row_embed = nnx.Embed(config.grid_height, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
+            self.col_embed = nnx.Embed(config.grid_width, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
+            self.box_embed = nnx.Embed(self.num_boxes, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
+        self.time_embed = nnx.Embed(self.recursion_steps, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
 
         self.latent_pool = nnx.Linear(
@@ -310,14 +367,19 @@ class BRCSudokuModel(nnx.Module):
             rngs=rngs,
         )
         self.h0 = nnx.Param(trunc_normal(rngs.params(), (config.d_model,), 1.0 / math.sqrt(config.d_model)))
-        self.solver_block = RelationTypedSolverBlock(
-            config,
-            brc.num_heads,
-            brc.mlp_ratio,
-            brc.latent_dim,
-            self.num_relations,
-            self.dtype,
-            rngs=rngs,
+        self.solver_blocks = nnx.List(
+            [
+                RelationTypedSolverBlock(
+                    config,
+                    brc.num_heads,
+                    brc.mlp_ratio,
+                    brc.latent_dim,
+                    self.num_relations,
+                    self.dtype,
+                    rngs=rngs,
+                )
+                for _ in range(brc.num_layers)
+            ]
         )
         self.lm_head = nnx.Linear(
             config.d_model,
@@ -438,6 +500,8 @@ class BRCSudokuModel(nnx.Module):
         return self._clamp_belief_logits(hard_logits, tokens)
 
     def _position_embeddings(self) -> Array:
+        if self.brc.pos_encodings != "learned":
+            return jnp.zeros((self.config.seq_len, self.config.d_model), dtype=self.dtype)
         return (
             self.row_embed(self.row_ids)
             + self.col_embed(self.col_ids)
@@ -493,9 +557,9 @@ class BRCSudokuModel(nnx.Module):
         return jnp.where(given[..., None], given_logits, logits)
 
     def _belief_to_token_logits(self, belief_logits: Array, tokens: Array, step_index: Array) -> Array:
-        total_steps = jnp.maximum(jnp.asarray(self.config.num_steps - 1, dtype=jnp.float32), 1.0)
+        total_steps = jnp.maximum(jnp.asarray(self.recursion_steps - 1, dtype=jnp.float32), 1.0)
         progress = step_index.astype(jnp.float32) / total_steps
-        sharpen = jnp.where(step_index >= jnp.maximum(self.config.num_steps - 4, 0), 1.0 + 2.0 * progress, 1.0)
+        sharpen = jnp.where(step_index >= jnp.maximum(self.recursion_steps - 4, 0), 1.0 + 2.0 * progress, 1.0)
         digit_logits = self._clamp_belief_logits(belief_logits, tokens) * sharpen
         logits = jnp.full((*tokens.shape, self.config.vocab_size), -1.0e4, dtype=jnp.float32)
         return logits.at[..., 2:11].set(digit_logits)
@@ -505,6 +569,19 @@ class BRCSudokuModel(nnx.Module):
         delta = raw_logits[..., 2:11].astype(jnp.float32)
         next_belief = 0.5 * belief_logits.astype(jnp.float32) + delta
         return self._clamp_belief_logits(next_belief, tokens)
+
+    def _solver_update(self, h: Array, cell_input: Array, z: Array) -> tuple[Array, dict[str, Array]]:
+        gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
+        gate_std = jnp.asarray(0.0, dtype=jnp.float32)
+        for block in self.solver_blocks:
+            h, block_diagnostics = block(h, cell_input, z, self.relation_masks)
+            gate_mean = gate_mean + block_diagnostics["brc_gate_mean"]
+            gate_std = gate_std + block_diagnostics["brc_gate_std"]
+        normalizer = jnp.asarray(len(self.solver_blocks), dtype=jnp.float32)
+        return h, {
+            "brc_gate_mean": gate_mean / normalizer,
+            "brc_gate_std": gate_std / normalizer,
+        }
 
     def initial_recurrent_state(
         self,
@@ -564,7 +641,7 @@ class BRCSudokuModel(nnx.Module):
                 train=train,
                 dropout_key=step_dropout_key,
             )
-            h_next, block_diagnostics = self.solver_block(h_prev, cell_input, z, self.relation_masks)
+            h_next, block_diagnostics = self._solver_update(h_prev, cell_input, z)
             raw_logits = self.lm_head(maybe_cast(h_next, self.dtype))
             next_belief = self._belief_update(tokens, belief_logits, raw_logits, step_index)
             next_carry = (h_next, next_belief)
@@ -586,11 +663,11 @@ class BRCSudokuModel(nnx.Module):
                 block_diagnostics["brc_gate_std"],
             )
 
-        step_indices = jnp.arange(self.config.num_steps, dtype=jnp.int32)
+        step_indices = jnp.arange(self.recursion_steps, dtype=jnp.int32)
         if dropout_key is None:
-            step_dropout_keys = jax.random.split(jax.random.key(0), self.config.num_steps)
+            step_dropout_keys = jax.random.split(jax.random.key(0), self.recursion_steps)
         else:
-            step_dropout_keys = jax.random.split(dropout_key, self.config.num_steps)
+            step_dropout_keys = jax.random.split(dropout_key, self.recursion_steps)
         time_embeddings = self.time_embed(step_indices)
         initial_carry = (h, initial_belief.astype(jnp.float32))
         if return_raw_final_logits:
@@ -606,14 +683,14 @@ class BRCSudokuModel(nnx.Module):
         else:
             h_final, belief_final = final_carry
         if return_final_only:
-            final_step = jnp.asarray(self.config.num_steps - 1, dtype=jnp.int32)
+            final_step = jnp.asarray(self.recursion_steps - 1, dtype=jnp.int32)
             logits = self._belief_to_token_logits(belief_final, tokens, final_step)
             diagnostics = {
-                "hidden_delta_mean": jnp.zeros((self.config.num_steps,), dtype=jnp.float32),
-                "diffusion_filled_ratio": jnp.zeros((self.config.num_steps,), dtype=jnp.float32),
+                "hidden_delta_mean": jnp.zeros((self.recursion_steps,), dtype=jnp.float32),
+                "diffusion_filled_ratio": jnp.zeros((self.recursion_steps,), dtype=jnp.float32),
                 "brc_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
                 "brc_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
-                "unroll_steps": jnp.asarray(self.config.num_steps, dtype=jnp.float32),
+                "unroll_steps": jnp.asarray(self.recursion_steps, dtype=jnp.float32),
                 "z": z,
                 "h": h_final,
                 "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
@@ -628,7 +705,7 @@ class BRCSudokuModel(nnx.Module):
             "diffusion_filled_ratio": filled_ratio,
             "brc_gate_mean": jnp.mean(gate_mean),
             "brc_gate_std": jnp.mean(gate_std),
-            "unroll_steps": jnp.asarray(self.config.num_steps, dtype=jnp.float32),
+            "unroll_steps": jnp.asarray(self.recursion_steps, dtype=jnp.float32),
             "z": z,
             "h": h_final,
             "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
@@ -751,7 +828,7 @@ class BRCSudokuModel(nnx.Module):
             clamped = self._clamp_belief_logits(belief, puzzle)
             candidate_probs = candidate_probs_from_belief(clamped)
             energy = jnp.mean(self.verifier_energy_from_probs(puzzle, candidate_probs))
-            given_logits = self._belief_to_token_logits(clamped, puzzle, jnp.asarray(self.config.num_steps - 1))
+            given_logits = self._belief_to_token_logits(clamped, puzzle, jnp.asarray(self.recursion_steps - 1))
             given_mask = self.condition_mask(puzzle).astype(jnp.float32)
             log_probs = jax.nn.log_softmax(given_logits, axis=-1)
             target_log_prob = jnp.take_along_axis(log_probs, puzzle[..., None], axis=-1).squeeze(-1)
