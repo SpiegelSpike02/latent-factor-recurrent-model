@@ -44,11 +44,11 @@ step_loss_weights = [
 ]
 
 [optimizer]
-learning_rate = 1e-5
+learning_rate = 1e-4
 lr_min_ratio = 0.35
 beta1 = 0.9
 beta2 = 0.95
-weight_decay = 0.1
+weight_decay = 1.0
 warmup_steps = 70000
 grad_clip_norm = 1.0
 flatten_optimizer = true
