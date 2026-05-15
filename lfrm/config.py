@@ -59,6 +59,7 @@ class ModelConfig:
     num_steps: int = 6
     dropout_rate: float = 0.0
     clamp_given: bool = False
+    path_loss_weight: float = 1.0
     trm: TRMConfig | None = None
     brc: BRCSudokuConfig | None = None
 

@@ -57,6 +57,7 @@ ALLOWED_SECTION_KEYS = {
         "num_steps",
         "dropout_rate",
         "clamp_given",
+        "path_loss_weight",
         "trm",
         "brc",
     },
@@ -200,6 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-steps", type=int, default=6)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
     parser.add_argument("--clamp-given", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--path-loss-weight", type=float, default=1.0)
     parser.add_argument("--trm-h-cycles", type=int, default=3)
     parser.add_argument("--trm-l-cycles", type=int, default=6)
     parser.add_argument("--trm-l-layers", type=int, default=2)
@@ -277,6 +279,7 @@ def build_config(
         num_steps=args.num_steps,
         dropout_rate=args.dropout_rate,
         clamp_given=args.clamp_given,
+        path_loss_weight=args.path_loss_weight,
         trm=TRMConfig(
             h_cycles=args.trm_h_cycles,
             l_cycles=args.trm_l_cycles,
@@ -679,6 +682,17 @@ CORE_SCALAR_METRICS = (
     "final_blank_cell_accuracy",
     "final_solved_rate",
     "final_solved_count",
+    "path_precision",
+    "path_recall",
+    "path_f1",
+    "path_positive_rate",
+    "target_path_rate",
+    "halt_selected_path_precision",
+    "halt_selected_path_recall",
+    "halt_selected_path_f1",
+    "final_path_precision",
+    "final_path_recall",
+    "final_path_f1",
 )
 WANDB_HISTORY_EXCLUDED_SCALAR_METRICS = {
     "verifier_ranking_accuracy",
@@ -719,6 +733,17 @@ METRIC_DISPLAY_NAMES = {
     "conflict_count": "conflicts",
     "verifier_ranking_accuracy": "verifier_acc",
     "fit_energy": "energy_fit",
+    "path_precision": "path_p",
+    "path_recall": "path_r",
+    "path_f1": "path_f1",
+    "path_positive_rate": "path_pos",
+    "target_path_rate": "target_path",
+    "halt_selected_path_precision": "halt_path_p",
+    "halt_selected_path_recall": "halt_path_r",
+    "halt_selected_path_f1": "halt_path_f1",
+    "final_path_precision": "final_path_p",
+    "final_path_recall": "final_path_r",
+    "final_path_f1": "final_path_f1",
     "belief_init_noise_rate": "belief_init_noise",
     "belief_init_uniform_rate": "belief_init_uniform",
     "belief_init_teacher_rate": "belief_init_teacher",
@@ -748,6 +773,14 @@ METRIC_GROUPS = (
             "final_solved_rate",
             "solved_count",
             "final_solved_count",
+            "path_precision",
+            "path_recall",
+            "path_f1",
+            "path_positive_rate",
+            "target_path_rate",
+            "final_path_precision",
+            "final_path_recall",
+            "final_path_f1",
         ),
     ),
     (
@@ -760,6 +793,9 @@ METRIC_GROUPS = (
             "halt_selected_blank_cell_accuracy",
             "halt_selected_solved_rate",
             "halt_selected_solved_count",
+            "halt_selected_path_precision",
+            "halt_selected_path_recall",
+            "halt_selected_path_f1",
         ),
     ),
     (

@@ -10,6 +10,7 @@ d_model = 512
 num_steps = 16
 dropout_rate = 0.05
 clamp_given = true
+path_loss_weight = 8.0
 
 [model.trm]
 h_cycles = 2
