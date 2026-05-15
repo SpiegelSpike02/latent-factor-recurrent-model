@@ -96,7 +96,6 @@ ALLOWED_NESTED_KEYS = {
         "num_heads",
         "mlp_ratio",
         "mlp_t",
-        "attention_type",
         "local_mixing",
         "local_mixing_kernel",
         "puzzle_emb_ndim",
@@ -209,7 +208,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-num-heads", type=int, default=8)
     parser.add_argument("--trm-mlp-ratio", type=int, default=4)
     parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--trm-attention-type", choices=("standard", "local_global_gate"), default="standard")
     parser.add_argument("--trm-local-mixing", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trm-local-mixing-kernel", type=int, default=3)
     parser.add_argument("--trm-puzzle-emb-ndim", type=int, default=0)
@@ -290,7 +288,6 @@ def build_config(
             num_heads=args.trm_num_heads,
             mlp_ratio=args.trm_mlp_ratio,
             mlp_t=args.trm_mlp_t,
-            attention_type=args.trm_attention_type,
             local_mixing=args.trm_local_mixing,
             local_mixing_kernel=args.trm_local_mixing_kernel,
             puzzle_emb_ndim=args.trm_puzzle_emb_ndim,
@@ -636,16 +633,6 @@ CORE_SCALAR_METRICS = (
     "unroll_steps",
     "belief_entropy",
     "belief_confidence",
-    "cell_attention_gate_mean",
-    "cell_attention_gate_std",
-    "cell_attention_gate_low_saturation",
-    "cell_attention_gate_high_saturation",
-    "cell_attention_local_distance_scale",
-    "attention_gate_mean",
-    "attention_gate_std",
-    "attention_gate_low_saturation",
-    "attention_gate_high_saturation",
-    "attention_local_distance_scale",
     "target_probability",
     "mean_blank_ce_loss",
     "step_weighted_ce_loss",
@@ -842,9 +829,6 @@ METRIC_GROUPS = (
             "belief_init_teacher_rate",
             "belief_init_corrupt_rate",
             "belief_init_soft_rate",
-            "attention_gate_mean",
-            "attention_gate_std",
-            "attention_local_distance_scale",
             "terminal_belief_delta",
             "terminal_belief_mse",
         ),
@@ -964,14 +948,9 @@ TRM_CONSOLE_GROUPS = (
         ),
     ),
     (
-        "attention",
+        "dynamics",
         (
             "unroll_steps",
-            "attention_gate_mean",
-            "attention_gate_std",
-            "attention_gate_low_saturation",
-            "attention_gate_high_saturation",
-            "attention_local_distance_scale",
             "terminal_belief_delta",
             "terminal_belief_mse",
         ),

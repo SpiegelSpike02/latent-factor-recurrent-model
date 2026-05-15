@@ -445,45 +445,6 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
         self.assertIn("halt_logits", diagnostics)
 
-    def test_trm_local_global_gate_attention_forward_is_finite(self) -> None:
-        model = TinyRecursiveModel(
-            ModelConfig(
-                vocab_size=11,
-                model_type="trm",
-                seq_len=9,
-                grid_height=3,
-                grid_width=3,
-                d_model=12,
-                num_steps=2,
-                trm=TRMConfig(
-                    recursion_steps=1,
-                    num_layers=1,
-                    num_heads=3,
-                    mlp_ratio=2,
-                    mlp_t=False,
-                    puzzle_emb_len=0,
-                    pos_encodings="rel2d",
-                    attention_type="local_global_gate",
-                ),
-            ),
-            RuntimeConfig(compute_dtype="float32"),
-            rngs=nnx.Rngs(26),
-        )
-        tokens = jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32)
-        logits, diagnostics = model.forward_all_steps_with_diagnostics(
-            tokens,
-            puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
-            train=False,
-        )
-        attention = model.blocks[0].attention
-        self.assertEqual(logits.shape, (2, 1, 9, 11))
-        self.assertEqual(attention.local_distance.shape, (9, 9))
-        self.assertEqual(attention.local_distance_logit[...].shape, (3,))
-        self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
-        self.assertIn("attention_gate_mean", diagnostics)
-        self.assertIn("attention_local_distance_scale", diagnostics)
-        self.assertTrue(bool(jnp.isfinite(diagnostics["attention_gate_mean"])))
-
     def test_trm_local_mixing_requires_odd_kernel(self) -> None:
         with self.assertRaisesRegex(ValueError, "local_mixing_kernel"):
             TinyRecursiveModel(

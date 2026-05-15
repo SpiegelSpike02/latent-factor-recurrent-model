@@ -11,7 +11,6 @@ class TRMConfig:
     num_heads: int = 8
     mlp_ratio: int = 4
     mlp_t: bool = False
-    attention_type: str = "standard"
     local_mixing: bool = False
     local_mixing_kernel: int = 3
     puzzle_emb_ndim: int = 0

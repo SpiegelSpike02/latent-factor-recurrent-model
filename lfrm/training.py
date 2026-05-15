@@ -871,16 +871,6 @@ def loss_and_metrics(
         "terminal_belief_mse",
         "belief_entropy",
         "belief_confidence",
-        "cell_attention_gate_mean",
-        "cell_attention_gate_std",
-        "cell_attention_gate_low_saturation",
-        "cell_attention_gate_high_saturation",
-        "cell_attention_local_distance_scale",
-        "attention_gate_mean",
-        "attention_gate_std",
-        "attention_gate_low_saturation",
-        "attention_gate_high_saturation",
-        "attention_local_distance_scale",
         "halt_loss",
         "halt_selected_blank_ce_loss",
         "halt_selected_blank_cell_accuracy",
@@ -956,11 +946,6 @@ def trm_act_loss_and_metrics(
         "act_step": diagnostics["act_step"],
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
-        "attention_gate_mean": diagnostics["attention_gate_mean"],
-        "attention_gate_std": diagnostics["attention_gate_std"],
-        "attention_gate_low_saturation": diagnostics["attention_gate_low_saturation"],
-        "attention_gate_high_saturation": diagnostics["attention_gate_high_saturation"],
-        "attention_local_distance_scale": diagnostics["attention_local_distance_scale"],
     }
     metrics.update(_path_metrics(predictions, targets, loss_mask))
     return loss, (metrics, new_carry)
@@ -1061,15 +1046,6 @@ def trm_dense_unroll_loss_and_metrics(
     metrics.update(_path_metrics(predictions, targets, loss_mask))
     if halt_logits is not None and halt_loss_weight != 0.0:
         metrics["per_step_halt_probability"] = jax.nn.sigmoid(jnp.mean(halt_logits, axis=1))
-    for key in (
-        "attention_gate_mean",
-        "attention_gate_std",
-        "attention_gate_low_saturation",
-        "attention_gate_high_saturation",
-        "attention_local_distance_scale",
-    ):
-        if key in diagnostics:
-            metrics[key] = diagnostics[key]
     return loss, metrics
 
 
@@ -1193,15 +1169,6 @@ def trm_eval_loss_and_metrics(
             if key in ("path_precision", "path_recall", "path_f1")
         }
     )
-    for key in (
-        "attention_gate_mean",
-        "attention_gate_std",
-        "attention_gate_low_saturation",
-        "attention_gate_high_saturation",
-        "attention_local_distance_scale",
-    ):
-        if key in diagnostics:
-            metrics[key] = diagnostics[key]
     return loss, metrics
 
 
