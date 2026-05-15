@@ -75,5 +75,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-trm-rel2d-standard-conv-act-masked-aug-70k"
+name = "maze-trm-rel2d-standard-conv-act-masked-aug-b768-70k"
 mode = "online"

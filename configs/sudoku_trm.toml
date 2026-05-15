@@ -74,5 +74,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-trm-rel2d-standard-conv-act-b64-100k"
+name = "sudoku-trm-rel2d-standard-conv-act-b768-100k"
 mode = "online"
