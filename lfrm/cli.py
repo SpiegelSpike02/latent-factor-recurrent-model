@@ -76,7 +76,6 @@ ALLOWED_SECTION_KEYS = {
         "max_steps",
         "log_every",
         "eval_every",
-        "eval_batches",
         "trm_train_mode",
         "halt_loss_weight",
         "terminal_residual_weight",
@@ -195,7 +194,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--eval-every", type=int, default=100)
-    parser.add_argument("--eval-batches", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument(
         "--trm-train-mode",
@@ -362,7 +360,6 @@ def build_config(
         max_steps=args.max_steps,
         log_every=args.log_every,
         eval_every=args.eval_every,
-        eval_batches=args.eval_batches,
         trm_train_mode=args.trm_train_mode,
         halt_loss_weight=args.halt_loss_weight,
         terminal_residual_weight=args.terminal_residual_weight,
@@ -565,18 +562,10 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, rng: np.
     if batch_size <= 0:
         raise ValueError("eval_batch_size must be at least 1 when set")
     total_weight = 0.0
-    if config.train.eval_batches <= 0:
-        batches = [
-            ("slice", start, min(start + batch_size, total))
-            for start in range(0, total, batch_size)
-        ]
-    else:
-        sample_count = min(total, config.train.eval_batches * batch_size)
-        indices = rng.choice(total, size=sample_count, replace=False)
-        batches = [
-            ("indices", start, min(start + batch_size, sample_count))
-            for start in range(0, sample_count, batch_size)
-        ]
+    batches = [
+        ("slice", start, min(start + batch_size, total))
+        for start in range(0, total, batch_size)
+    ]
 
     print(
         f"[eval] running {len(batches)} batches "

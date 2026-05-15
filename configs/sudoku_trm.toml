@@ -54,12 +54,11 @@ grad_clip_norm = 1.0
 flatten_optimizer = true
 
 [train]
-batch_size = 64
+batch_size = 768
 eval_batch_size = 256
 max_steps = 100000
 log_every = 10
 eval_every = 2500
-eval_batches = 32
 trm_train_mode = "act"
 halt_loss_weight = 0.5
 seed = 0

@@ -102,7 +102,6 @@ class TrainConfig:
     max_steps: int = 500
     log_every: int = 10
     eval_every: int = 100
-    eval_batches: int = 20
     trm_train_mode: str = "act"
     halt_loss_weight: float = 0.0
     terminal_residual_weight: float = 0.0
