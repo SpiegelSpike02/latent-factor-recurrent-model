@@ -76,6 +76,7 @@ ALLOWED_SECTION_KEYS = {
         "max_steps",
         "log_every",
         "eval_every",
+        "eval_count",
         "trm_train_mode",
         "halt_loss_weight",
         "terminal_residual_weight",
@@ -194,6 +195,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--eval-every", type=int, default=100)
+    parser.add_argument(
+        "--eval-count",
+        type=int,
+        default=0,
+        help="When >0, automatically evaluate this many times over max_steps.",
+    )
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument(
         "--trm-train-mode",
@@ -360,6 +367,7 @@ def build_config(
         max_steps=args.max_steps,
         log_every=args.log_every,
         eval_every=args.eval_every,
+        eval_count=args.eval_count,
         trm_train_mode=args.trm_train_mode,
         halt_loss_weight=args.halt_loss_weight,
         terminal_residual_weight=args.terminal_residual_weight,
@@ -446,6 +454,12 @@ def schedule_learning_rate(config: ExperimentConfig, step: int) -> float:
     progress = min(max((optimizer_step - warmup_steps) / max(decay_steps - warmup_steps, 1), 0.0), 1.0)
     cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
     return float(end + (peak - end) * cosine)
+
+
+def eval_interval_steps(config: ExperimentConfig) -> int:
+    if config.train.eval_count > 0:
+        return max(1, math.ceil(config.train.max_steps / config.train.eval_count))
+    return max(1, config.train.eval_every)
 
 
 def config_to_dict(config: ExperimentConfig) -> dict[str, Any]:
@@ -1044,6 +1058,8 @@ def main() -> None:
         raise ValueError("batch_size must be at least 1")
     if config.train.eval_batch_size < 0:
         raise ValueError("eval_batch_size must be non-negative")
+    if config.train.eval_count < 0:
+        raise ValueError("eval_count must be non-negative")
     if config.model.model_type != "trm" and config.train.trm_train_mode != "act":
         raise ValueError("trm_train_mode is only supported for model_type='trm'")
 
@@ -1106,6 +1122,8 @@ def main() -> None:
         "eval_examples=", overview["eval_examples"],
         "batch_size=", config.train.batch_size,
         "eval_batch_size=", config.train.eval_batch_size or config.train.batch_size,
+        "eval_interval=", eval_interval_steps(config),
+        "eval_count=", config.train.eval_count,
         "trm_train_mode=", config.train.trm_train_mode,
         "seq_len=", config.model.seq_len,
         "grid_height=", config.model.grid_height,
@@ -1130,10 +1148,11 @@ def main() -> None:
     use_trm_act = config.model.model_type == "trm" and config.train.trm_train_mode == "act"
     console_model_label = "brc" if config.model.model_type == "brc_sudoku" else config.model.model_type
     train_carry = model.initial_carry(current_batch) if use_trm_act else None
+    eval_interval = eval_interval_steps(config)
 
     try:
         for step in range(resume_step + 1, config.train.max_steps + 1):
-            is_eval_step = step % config.train.eval_every == 0 or step == config.train.max_steps
+            is_eval_step = step % eval_interval == 0 or step == config.train.max_steps
             train_key, step_key = jax.random.split(train_key)
             if use_trm_act:
                 metrics, train_carry = train_step_fn(
