@@ -30,7 +30,7 @@ latent_update_clip_norm = 0.5
 # an extra side trajectory or token-level puzzle corruption. Modes are:
 # uniform/full-mask, teacher-partial belief, corrupt-solution belief,
 # soft candidate belief.
-denoise_initial_prob = 0.4
+denoise_initial_prob = 0.0
 denoise_teacher_reveal_prob = 0.25
 denoise_mode_weights = [0.35, 0.20, 0.30, 0.15]
 verifier_loss_weight = 0.0
@@ -43,12 +43,12 @@ verifier_layers = 4
 verifier_margin = 1.0
 
 [optimizer]
-learning_rate = 1e-5
-lr_min_ratio = 0.35
+learning_rate = 1e-4
+lr_min_ratio = 0.2
 beta1 = 0.9
 beta2 = 0.95
 weight_decay = 0.1
-warmup_steps = 20000
+warmup_steps = 3000
 grad_clip_norm = 1.0
 flatten_optimizer = true
 
