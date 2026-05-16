@@ -940,7 +940,7 @@ def trm_act_loss_and_metrics(
 
     predictions = jnp.argmax(logits, axis=-1)
     correct = (predictions == targets).astype(jnp.float32) * loss_mask
-    blank_cell_accuracy = jnp.sum(correct) / metric_normalizer
+    current_blank_cell_accuracy = jnp.sum(correct) / metric_normalizer
     correct_per_example = jnp.sum(correct, axis=-1)
     blanks_per_example = jnp.sum(loss_mask, axis=-1)
     solved_examples = jnp.where(
@@ -949,15 +949,31 @@ def trm_act_loss_and_metrics(
         True,
     )
     solved_targets = jax.lax.stop_gradient(solved_examples.astype(jnp.float32))
-    solved_rate = jnp.mean(solved_targets)
-    solved_count = jnp.sum(solved_targets)
+    current_solved_rate = jnp.mean(solved_targets)
+    current_solved_count = jnp.sum(solved_targets)
+    valid_halted = new_carry["halted"] & (blanks_per_example > 0)
+    valid_halted_f32 = valid_halted.astype(jnp.float32)
+    valid_halted_count = jnp.sum(valid_halted_f32)
+    valid_halted_normalizer = jnp.maximum(valid_halted_count, 1.0)
+    per_example_accuracy = correct_per_example / jnp.maximum(blanks_per_example, 1.0)
+    blank_cell_accuracy = jnp.sum(per_example_accuracy * valid_halted_f32) / valid_halted_normalizer
+    solved_rate = jnp.sum(solved_targets * valid_halted_f32) / valid_halted_normalizer
+    solved_count = jnp.sum(solved_targets * valid_halted_f32)
 
     halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(diagnostics["halt_logits"], solved_targets))
     loss = blank_ce_loss + halt_loss_weight * halt_loss
 
     probs = jax.nn.softmax(logits, axis=-1)
     target_probability = jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
-    target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
+    current_target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
+    per_example_target_probability = (
+        jnp.sum(target_probability * loss_mask, axis=-1)
+        / jnp.maximum(blanks_per_example, 1.0)
+    )
+    target_probability = (
+        jnp.sum(per_example_target_probability * valid_halted_f32)
+        / valid_halted_normalizer
+    )
     metrics = {
         "loss": loss,
         "blank_ce_loss": blank_ce_loss,
@@ -966,6 +982,11 @@ def trm_act_loss_and_metrics(
         "blank_cell_accuracy": blank_cell_accuracy,
         "solved_rate": solved_rate,
         "solved_count": solved_count,
+        "halted_count": valid_halted_count,
+        "current_target_probability": current_target_probability,
+        "current_blank_cell_accuracy": current_blank_cell_accuracy,
+        "current_solved_rate": current_solved_rate,
+        "current_solved_count": current_solved_count,
         "halt_loss": halt_loss,
         "act_step": diagnostics["act_step"],
         "halted_rate": diagnostics["halted_rate"],
