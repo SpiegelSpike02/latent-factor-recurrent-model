@@ -50,6 +50,24 @@ class BRCSudokuConfig:
     verifier_margin: float = 1.0
 
 
+
+
+@dataclass(frozen=True)
+class URMConfig:
+    recurrent_steps: int = 16
+    deep_recursion: int = 2
+    latent_recursion: int = 6
+    block_layers: int = 4
+    num_heads: int = 8
+    mlp_ratio: int = 4
+    conv_kernel: int = 2
+    puzzle_emb_ndim: int = 512
+    puzzle_emb_len: int = 1
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
+    halt_exploration_prob: float = 0.1
+    step_loss_weights: tuple[float, ...] | None = None
+
 @dataclass(frozen=True)
 class ModelConfig:
     vocab_size: int
@@ -63,10 +81,12 @@ class ModelConfig:
     d_model: int = 256
     rollout_steps: int = 6
     dropout_rate: float = 0.0
+    loss_type: str = "softmax"
     clamp_given: bool = False
     path_loss_weight: float = 1.0
     trm: TRMConfig | None = None
     brc: BRCSudokuConfig | None = None
+    urm: URMConfig | None = None
 
     @property
     def trm_config(self) -> TRMConfig:
@@ -76,14 +96,21 @@ class ModelConfig:
     def brc_config(self) -> BRCSudokuConfig:
         return self.brc or BRCSudokuConfig()
 
+    @property
+    def urm_config(self) -> URMConfig:
+        return self.urm or URMConfig()
+
 
 @dataclass(frozen=True)
 class OptimizerConfig:
+    optimizer_type: str = "adamw"
     learning_rate: float = 3e-4
+    puzzle_emb_learning_rate: float = 0.0
     lr_min_ratio: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.999
     weight_decay: float = 0.1
+    puzzle_emb_weight_decay: float = 0.0
     warmup_steps: int = 100
     grad_clip_norm: float = 1.0
     flatten_optimizer: bool = False

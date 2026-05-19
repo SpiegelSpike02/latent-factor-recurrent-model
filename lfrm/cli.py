@@ -23,6 +23,7 @@ from lfrm.config import (
     RuntimeConfig,
     TRMConfig,
     TrainConfig,
+    URMConfig,
     WandbConfig,
 )
 from lfrm.datasets import dataset_overview, load_dataset, sample_batch
@@ -44,7 +45,7 @@ from lfrm.training import (
 
 CONFIG_SECTIONS = ("data", "task", "model", "optimizer", "train", "runtime", "wandb")
 NESTED_SECTIONS = {
-    "model": {"trm", "brc"},
+    "model": {"trm", "brc", "urm"},
     "train": {"ema"},
 }
 ALLOWED_SECTION_KEYS = {
@@ -58,15 +59,20 @@ ALLOWED_SECTION_KEYS = {
         "d_model",
         "rollout_steps",
         "dropout_rate",
+        "loss_type",
         "trm",
         "brc",
+        "urm",
     },
     "optimizer": {
+        "optimizer_type",
         "learning_rate",
+        "puzzle_emb_learning_rate",
         "lr_min_ratio",
         "beta1",
         "beta2",
         "weight_decay",
+        "puzzle_emb_weight_decay",
         "warmup_steps",
         "grad_clip_norm",
         "flatten_optimizer",
@@ -132,6 +138,21 @@ ALLOWED_NESTED_KEYS = {
         "verifier_layers",
         "verifier_margin",
     },
+    "urm": {
+        "recurrent_steps",
+        "deep_recursion",
+        "latent_recursion",
+        "block_layers",
+        "num_heads",
+        "mlp_ratio",
+        "conv_kernel",
+        "puzzle_emb_ndim",
+        "puzzle_emb_len",
+        "rms_norm_eps",
+        "rope_theta",
+        "halt_exploration_prob",
+        "step_loss_weights",
+    },
 }
 
 
@@ -171,12 +192,16 @@ def load_toml_config(path: str | None) -> dict[str, object]:
                 normalized_key = "task_type"
             flat[normalized_key] = value
 
-    if flat.get("model_type", "brc_sudoku") not in ("trm", "brc_sudoku"):
-        raise ValueError("Only model_type='trm' or model_type='brc_sudoku' is supported")
+    if flat.get("model_type", "brc_sudoku") not in ("trm", "brc_sudoku", "urm"):
+        raise ValueError("Only model_type=trm, brc_sudoku, or urm is supported")
     if flat.get("task_type", "sudoku") not in ("sudoku", "maze", "arc"):
         raise ValueError("Only task_type='sudoku', 'maze', or 'arc' is supported")
     if flat.get("supervision", "unknown_only") not in ("unknown_only", "full_grid"):
         raise ValueError("Only supervision='unknown_only' or 'full_grid' is supported")
+    if flat.get("loss_type", "softmax") not in ("softmax", "stablemax"):
+        raise ValueError("Only loss_type='softmax' or loss_type='stablemax' is supported")
+    if flat.get("optimizer_type", "adamw") not in ("adamw", "adam_atan2"):
+        raise ValueError("Only optimizer_type='adamw' or optimizer_type='adam_atan2' is supported")
     return flat
 
 
@@ -214,12 +239,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--terminal-residual-weight", type=float, default=0.0)
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ema-decay", type=float, default=0.999)
-    parser.add_argument("--model-type", choices=("trm", "brc_sudoku"), default="brc_sudoku")
+    parser.add_argument("--model-type", choices=("trm", "brc_sudoku", "urm"), default="brc_sudoku")
     parser.add_argument("--task-type", choices=("sudoku", "maze", "arc"), default="sudoku")
     parser.add_argument("--supervision", choices=("unknown_only", "full_grid"), default="unknown_only")
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--rollout-steps", type=int, default=6)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
+    parser.add_argument("--loss-type", choices=("softmax", "stablemax"), default="softmax")
     parser.add_argument("--clamp-given", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--path-loss-weight", type=float, default=1.0)
     parser.add_argument("--trm-deep-recursion", type=int, default=3)
@@ -260,11 +286,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-fit-prior-weight", type=float, default=0.02)
     parser.add_argument("--brc-verifier-layers", type=int, default=4)
     parser.add_argument("--brc-verifier-margin", type=float, default=1.0)
+    parser.add_argument("--urm-recurrent-steps", type=int, default=16)
+    parser.add_argument("--urm-deep-recursion", type=int, default=2)
+    parser.add_argument("--urm-latent-recursion", type=int, default=6)
+    parser.add_argument("--urm-block-layers", type=int, default=4)
+    parser.add_argument("--urm-num-heads", type=int, default=8)
+    parser.add_argument("--urm-mlp-ratio", type=int, default=4)
+    parser.add_argument("--urm-conv-kernel", type=int, default=2)
+    parser.add_argument("--urm-puzzle-emb-ndim", type=int, default=512)
+    parser.add_argument("--urm-puzzle-emb-len", type=int, default=1)
+    parser.add_argument("--urm-rms-norm-eps", type=float, default=1e-5)
+    parser.add_argument("--urm-rope-theta", type=float, default=10000.0)
+    parser.add_argument("--urm-halt-exploration-prob", type=float, default=0.1)
+    parser.add_argument("--urm-step-loss-weights", type=float, nargs="*", default=None)
+    parser.add_argument("--optimizer-type", choices=("adamw", "adam_atan2"), default="adamw")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--puzzle-emb-learning-rate", type=float, default=0.0)
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--weight-decay", type=float, default=0.1)
+    parser.add_argument("--puzzle-emb-weight-decay", type=float, default=0.0)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--flatten-optimizer", action=argparse.BooleanOptionalAction, default=False)
@@ -303,6 +345,7 @@ def build_config(
         d_model=args.d_model,
         rollout_steps=args.rollout_steps,
         dropout_rate=args.dropout_rate,
+        loss_type=args.loss_type,
         clamp_given=args.clamp_given,
         path_loss_weight=args.path_loss_weight,
         trm=TRMConfig(
@@ -351,13 +394,31 @@ def build_config(
             verifier_layers=args.brc_verifier_layers,
             verifier_margin=args.brc_verifier_margin,
         ),
+        urm=URMConfig(
+            recurrent_steps=args.urm_recurrent_steps,
+            deep_recursion=args.urm_deep_recursion,
+            latent_recursion=args.urm_latent_recursion,
+            block_layers=args.urm_block_layers,
+            num_heads=args.urm_num_heads,
+            mlp_ratio=args.urm_mlp_ratio,
+            conv_kernel=args.urm_conv_kernel,
+            puzzle_emb_ndim=args.urm_puzzle_emb_ndim,
+            puzzle_emb_len=args.urm_puzzle_emb_len,
+            rms_norm_eps=args.urm_rms_norm_eps,
+            rope_theta=args.urm_rope_theta,
+            halt_exploration_prob=args.urm_halt_exploration_prob,
+            step_loss_weights=tuple(args.urm_step_loss_weights) if args.urm_step_loss_weights is not None else None,
+        ),
     )
     optimizer = OptimizerConfig(
+        optimizer_type=args.optimizer_type,
         learning_rate=args.learning_rate,
+        puzzle_emb_learning_rate=args.puzzle_emb_learning_rate,
         lr_min_ratio=args.lr_min_ratio,
         beta1=args.beta1,
         beta2=args.beta2,
         weight_decay=args.weight_decay,
+        puzzle_emb_weight_decay=args.puzzle_emb_weight_decay,
         warmup_steps=args.warmup_steps,
         grad_clip_norm=args.grad_clip_norm,
         flatten_optimizer=args.flatten_optimizer,
@@ -1095,8 +1156,8 @@ def main() -> None:
         raise ValueError("eval_batch_size must be non-negative")
     if config.train.eval_count < 0:
         raise ValueError("eval_count must be non-negative")
-    if config.model.model_type != "trm" and config.train.trm_train_mode != "act":
-        raise ValueError("trm_train_mode is only supported for model_type='trm'")
+    if config.model.model_type not in ("trm", "urm") and config.train.trm_train_mode != "act":
+        raise ValueError("trm_train_mode is only supported for model_type='trm' or 'urm'")
 
     resume_checkpoint: Path | None = None
     resume_step = 0
@@ -1112,7 +1173,7 @@ def main() -> None:
 
     model = create_model(config)
     optimizer = create_optimizer(model, config)
-    if config.model.model_type == "trm":
+    if config.model.model_type in ("trm", "urm"):
         if config.train.trm_train_mode == "dense_unroll":
             train_step_fn = build_trm_dense_unroll_train_step_runner(
                 halt_loss_weight=config.train.halt_loss_weight,
@@ -1180,7 +1241,7 @@ def main() -> None:
     prefetcher = BatchPrefetcher(sample_train_batch, depth=2)
 
     current_batch = prefetcher.next()
-    use_trm_act = config.model.model_type == "trm" and config.train.trm_train_mode == "act"
+    use_trm_act = config.model.model_type in ("trm", "urm") and config.train.trm_train_mode == "act"
     console_model_label = "brc" if config.model.model_type == "brc_sudoku" else config.model.model_type
     train_carry = model.initial_carry(current_batch) if use_trm_act else None
     eval_interval = eval_interval_steps(config)

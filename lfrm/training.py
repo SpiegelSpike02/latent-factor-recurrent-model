@@ -14,35 +14,146 @@ from orbax.checkpoint import (
 )
 
 from lfrm.config import ExperimentConfig
-from lfrm.models import BRCSudokuModel, TinyRecursiveModel
+from lfrm.models import BRCSudokuModel, TinyRecursiveModel, UnifiedReasoningModel
 
 
-GridReasoningModel = BRCSudokuModel | TinyRecursiveModel
+GridReasoningModel = BRCSudokuModel | TinyRecursiveModel | UnifiedReasoningModel
 
 
-def build_optimizer(config: ExperimentConfig) -> optax.GradientTransformation:
-    optimizer_steps = max(1, config.train.max_steps)
-    warmup_steps = max(1, config.optimizer.warmup_steps)
+def scale_by_adam_atan2(
+    *,
+    b1: float = 0.9,
+    b2: float = 0.95,
+    eps: float = 1e-8,
+) -> optax.GradientTransformation:
+    """Adam-style moments with atan2 normalization, matching URM's strong optimizer."""
+
+    def init_fn(params):
+        return optax.ScaleByAdamState(
+            count=jnp.zeros([], jnp.int32),
+            mu=jax.tree.map(jnp.zeros_like, params),
+            nu=jax.tree.map(jnp.zeros_like, params),
+        )
+
+    def update_fn(updates, state, params=None):
+        del params
+        count_inc = optax.safe_increment(state.count)
+        mu = optax.update_moment(updates, state.mu, b1, 1)
+        nu = optax.update_moment_per_elem_norm(updates, state.nu, b2, 2)
+        mu_hat = optax.bias_correction(mu, b1, count_inc)
+        nu_hat = optax.bias_correction(nu, b2, count_inc)
+        updates = jax.tree.map(
+            lambda m, v: jnp.arctan2(m, jnp.sqrt(v) + eps),
+            mu_hat,
+            nu_hat,
+        )
+        return updates, optax.ScaleByAdamState(count=count_inc, mu=mu, nu=nu)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _scheduled_lr(
+    *,
+    peak_value: float,
+    min_ratio: float,
+    warmup_steps: int,
+    optimizer_steps: int,
+):
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
-        peak_value=config.optimizer.learning_rate,
+        peak_value=peak_value,
         warmup_steps=warmup_steps,
         decay_steps=max(optimizer_steps, warmup_steps + 1),
-        end_value=config.optimizer.learning_rate * config.optimizer.lr_min_ratio,
+        end_value=peak_value * min_ratio,
     )
-    optimizer_schedule = lambda count: schedule(count + jnp.asarray(1, dtype=count.dtype))
-    transforms = []
+    return lambda count: schedule(count + jnp.asarray(1, dtype=count.dtype))
+
+
+def _is_puzzle_embedding_path(path: tuple[object, ...]) -> bool:
+    return any(getattr(entry, "key", None) == "puzzle_embed" for entry in path)
+
+
+def _optimizer_param_labels(params):
+    return jax.tree_util.tree_map_with_path(
+        lambda path, _value: "puzzle_embed" if _is_puzzle_embedding_path(path) else "default",
+        params,
+    )
+
+
+def _adam_atan2_optimizer(config: ExperimentConfig, schedule) -> optax.GradientTransformation:
+    transforms: list[optax.GradientTransformation] = []
     if config.optimizer.grad_clip_norm > 0.0:
         transforms.append(optax.clip_by_global_norm(config.optimizer.grad_clip_norm))
-    transforms.append(
-        optax.adamw(
-            learning_rate=optimizer_schedule,
-            b1=config.optimizer.beta1,
-            b2=config.optimizer.beta2,
-            weight_decay=config.optimizer.weight_decay,
+    transforms.append(scale_by_adam_atan2(b1=config.optimizer.beta1, b2=config.optimizer.beta2))
+    if config.optimizer.weight_decay > 0.0:
+        transforms.append(optax.add_decayed_weights(config.optimizer.weight_decay))
+    transforms.extend((optax.scale_by_schedule(schedule), optax.scale(-1.0)))
+    return optax.chain(*transforms)
+
+
+def _default_optimizer(config: ExperimentConfig, schedule) -> optax.GradientTransformation:
+    transforms: list[optax.GradientTransformation] = []
+    if config.optimizer.grad_clip_norm > 0.0:
+        transforms.append(optax.clip_by_global_norm(config.optimizer.grad_clip_norm))
+    if config.optimizer.optimizer_type == "adamw":
+        transforms.append(
+            optax.adamw(
+                learning_rate=schedule,
+                b1=config.optimizer.beta1,
+                b2=config.optimizer.beta2,
+                weight_decay=config.optimizer.weight_decay,
+            )
         )
+    elif config.optimizer.optimizer_type == "adam_atan2":
+        transforms.append(_adam_atan2_optimizer(config, schedule))
+    else:
+        raise ValueError(f"Unsupported optimizer_type: {config.optimizer.optimizer_type}")
+    return optax.chain(*transforms)
+
+
+def _puzzle_embedding_optimizer(config: ExperimentConfig, schedule) -> optax.GradientTransformation:
+    transforms: list[optax.GradientTransformation] = []
+    transforms.append(optax.scale_by_sign())
+    if config.optimizer.puzzle_emb_weight_decay > 0.0:
+        transforms.append(optax.add_decayed_weights(config.optimizer.puzzle_emb_weight_decay))
+    transforms.extend((optax.scale_by_schedule(schedule), optax.scale(-1.0)))
+    return optax.chain(*transforms)
+
+
+def build_optimizer(
+    config: ExperimentConfig,
+    model: GridReasoningModel | None = None,
+) -> optax.GradientTransformation:
+    optimizer_steps = max(1, config.train.max_steps)
+    warmup_steps = max(1, config.optimizer.warmup_steps)
+    schedule = _scheduled_lr(
+        peak_value=config.optimizer.learning_rate,
+        min_ratio=config.optimizer.lr_min_ratio,
+        warmup_steps=warmup_steps,
+        optimizer_steps=optimizer_steps,
     )
-    optimizer = optax.chain(*transforms)
+    default_optimizer = _default_optimizer(config, schedule)
+    if (
+        model is not None
+        and config.model.model_type == "urm"
+        and config.model.urm_config.puzzle_emb_len > 0
+        and config.optimizer.puzzle_emb_learning_rate > 0.0
+    ):
+        puzzle_schedule = _scheduled_lr(
+            peak_value=config.optimizer.puzzle_emb_learning_rate,
+            min_ratio=config.optimizer.lr_min_ratio,
+            warmup_steps=warmup_steps,
+            optimizer_steps=optimizer_steps,
+        )
+        optimizer = optax.multi_transform(
+            {
+                "default": default_optimizer,
+                "puzzle_embed": _puzzle_embedding_optimizer(config, puzzle_schedule),
+            },
+            _optimizer_param_labels,
+        )
+    else:
+        optimizer = default_optimizer
     if config.optimizer.flatten_optimizer:
         optimizer = optax.flatten(optimizer)
     return optimizer
@@ -61,11 +172,17 @@ def create_model(config: ExperimentConfig) -> GridReasoningModel:
             config.runtime,
             rngs=nnx.Rngs(config.train.seed),
         )
-    raise ValueError("Only model_type='trm' or model_type='brc_sudoku' is supported")
+    if config.model.model_type == "urm":
+        return UnifiedReasoningModel(
+            config.model,
+            config.runtime,
+            rngs=nnx.Rngs(config.train.seed),
+        )
+    raise ValueError("Only model_type='trm', 'brc_sudoku', or 'urm' is supported")
 
 
 def create_optimizer(model: GridReasoningModel, config: ExperimentConfig) -> nnx.Optimizer:
-    return nnx.Optimizer(model, build_optimizer(config), wrt=nnx.Param)
+    return nnx.Optimizer(model, build_optimizer(config, model), wrt=nnx.Param)
 
 
 def create_ema_model(model: GridReasoningModel, config: ExperimentConfig) -> GridReasoningModel:
@@ -77,6 +194,38 @@ def create_ema_model(model: GridReasoningModel, config: ExperimentConfig) -> Gri
 
 def ema_param_filter(config: ExperimentConfig):
     return nnx.Param
+
+
+def stablemax(logits: jax.Array, axis: int = -1) -> jax.Array:
+    positive = jnp.where(logits >= 0.0, logits + 1.0, 1.0 / (1.0 - logits))
+    return positive / jnp.sum(positive, axis=axis, keepdims=True)
+
+
+def stablemax_cross_entropy_with_integer_labels(logits: jax.Array, targets: jax.Array) -> jax.Array:
+    log_positive = jnp.where(logits >= 0.0, jnp.log1p(logits), -jnp.log1p(-logits))
+    log_normalizer = jax.nn.logsumexp(log_positive, axis=-1)
+    target_log_positive = jnp.take_along_axis(log_positive, targets[..., None], axis=-1).squeeze(-1)
+    return log_normalizer - target_log_positive
+
+
+def _token_cross_entropy(model: object, logits: jax.Array, targets: jax.Array) -> jax.Array:
+    loss_type = getattr(getattr(model, "config", None), "loss_type", "softmax")
+    if loss_type == "softmax":
+        return optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+    if loss_type == "stablemax":
+        return stablemax_cross_entropy_with_integer_labels(logits, targets)
+    raise ValueError(f"Unsupported loss_type: {loss_type}")
+
+
+def _target_probability(model: object, logits: jax.Array, targets: jax.Array) -> jax.Array:
+    loss_type = getattr(getattr(model, "config", None), "loss_type", "softmax")
+    if loss_type == "softmax":
+        probs = jax.nn.softmax(logits, axis=-1)
+    elif loss_type == "stablemax":
+        probs = stablemax(logits, axis=-1)
+    else:
+        raise ValueError(f"Unsupported loss_type: {loss_type}")
+    return jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
 
 
 def _masked_token_ce(logits: jax.Array, targets: jax.Array, mask: jax.Array) -> jax.Array:
@@ -454,7 +603,7 @@ def _brc_compact_training_rollout(
         raw_logits = model.lm_head(h_next.astype(model.dtype))
         next_belief = model._belief_update(inputs, belief_logits, raw_logits, step_index)
         logits = model._belief_to_token_logits(next_belief, inputs, step_index)
-        token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+        token_loss = _token_cross_entropy(model, logits, targets)
         per_step_loss = jnp.sum(token_loss * loss_mask_f32) / loss_normalizer
         predictions = jnp.argmax(logits, axis=-1).astype(jnp.int32)
         early_candidate = jnp.where(step_index == early_index, predictions, early_candidate)
@@ -504,8 +653,8 @@ def _brc_compact_training_rollout(
 
 
 def _trm_step_loss_weights(model: GridReasoningModel, rollout_steps: int) -> jax.Array:
-    trm_config = getattr(model, "trm", None)
-    return _normalized_step_loss_weights(getattr(trm_config, "step_loss_weights", None), rollout_steps)
+    recurrent_config = getattr(model, "trm", None) or getattr(model, "urm", None)
+    return _normalized_step_loss_weights(getattr(recurrent_config, "step_loss_weights", None), rollout_steps)
 
 
 def _trm_halt_selected_step(halt_logits: jax.Array) -> jax.Array:
@@ -580,7 +729,7 @@ def brc_loss_and_metrics(
         )
         step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
         step_loss_mask = loss_mask[None, :, :]
-        token_loss = optax.softmax_cross_entropy_with_integer_labels(step_logits, step_targets)
+        token_loss = _token_cross_entropy(model, step_logits, step_targets)
         per_step_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=(1, 2)) / normalizer
         final_logits = step_logits[-1]
     step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
@@ -659,8 +808,7 @@ def brc_loss_and_metrics(
     )
     solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
     solved_count = jnp.sum(solved_examples.astype(jnp.float32))
-    probs = jax.nn.softmax(final_logits, axis=-1)
-    target_probability = jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
+    target_probability = _target_probability(model, final_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask.astype(jnp.float32)) / normalizer
     if train:
         oracle_step = jnp.argmin(per_step_loss)
@@ -756,11 +904,12 @@ def loss_and_metrics(
 
     compute_terminal_residual = terminal_residual_weight != 0.0
     model_forward_kwargs = {}
-    if isinstance(model, TinyRecursiveModel):
+    if isinstance(model, (TinyRecursiveModel, UnifiedReasoningModel)):
         model_forward_kwargs = {
-            "compute_terminal_residual": compute_terminal_residual,
             "puzzle_identifiers": batch["puzzle_identifiers"],
         }
+        if isinstance(model, TinyRecursiveModel):
+            model_forward_kwargs["compute_terminal_residual"] = compute_terminal_residual
     step_logits, diagnostics = model.forward_all_steps_with_diagnostics(
         inputs,
         train=train,
@@ -775,7 +924,7 @@ def loss_and_metrics(
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = weighted_loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
-    token_loss = optax.softmax_cross_entropy_with_integer_labels(effective_step_logits, step_targets)
+    token_loss = _token_cross_entropy(model, effective_step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
     per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
     per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
@@ -818,8 +967,7 @@ def loss_and_metrics(
 
     final_logits = effective_step_logits[-1]
     predictions = jnp.argmax(final_logits, axis=-1)
-    final_probs = jax.nn.softmax(final_logits, axis=-1)
-    target_probability = jnp.take_along_axis(final_probs, targets[..., None], axis=-1).squeeze(-1)
+    target_probability = _target_probability(model, final_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
     correct = (predictions == targets).astype(jnp.float32) * loss_mask
     blank_cell_accuracy = jnp.sum(correct) / metric_normalizer
@@ -833,7 +981,7 @@ def loss_and_metrics(
     solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
     solved_count = jnp.sum(solved_examples.astype(jnp.float32))
     if halt_loss_weight != 0.0:
-        halt_selected_token_loss = optax.softmax_cross_entropy_with_integer_labels(halt_selected_logits, targets)
+        halt_selected_token_loss = _token_cross_entropy(model, halt_selected_logits, targets)
         halt_selected_ce_loss = jnp.sum(halt_selected_token_loss * weighted_loss_mask) / normalizer
         halt_selected_predictions = jnp.argmax(halt_selected_logits, axis=-1)
         halt_selected_correct = (halt_selected_predictions == targets).astype(jnp.float32) * loss_mask
@@ -934,7 +1082,7 @@ def trm_act_loss_and_metrics(
     if _should_clamp_given(model):
         logits = _clamp_logits_to_given(logits, new_carry["current_inputs"], given_mask, model.config.vocab_size)
 
-    token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+    token_loss = _token_cross_entropy(model, logits, targets)
     per_example_loss = jnp.sum(token_loss * weighted_loss_mask, axis=-1) / per_example_normalizer
     blank_ce_loss = jnp.mean(per_example_loss)
 
@@ -963,8 +1111,7 @@ def trm_act_loss_and_metrics(
     halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(diagnostics["halt_logits"], solved_targets))
     loss = blank_ce_loss + halt_loss_weight * halt_loss
 
-    probs = jax.nn.softmax(logits, axis=-1)
-    target_probability = jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
+    target_probability = _target_probability(model, logits, targets)
     current_target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
     per_example_target_probability = (
         jnp.sum(target_probability * loss_mask, axis=-1)
@@ -1014,19 +1161,21 @@ def trm_dense_unroll_loss_and_metrics(
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
 
+    model_forward_kwargs = {"puzzle_identifiers": batch["puzzle_identifiers"]}
+    if isinstance(model, TinyRecursiveModel):
+        model_forward_kwargs["compute_terminal_residual"] = False
     step_logits, diagnostics = model.forward_all_steps_with_diagnostics(
         inputs,
-        puzzle_identifiers=batch["puzzle_identifiers"],
         train=train,
         dropout_key=dropout_key,
-        compute_terminal_residual=False,
+        **model_forward_kwargs,
     )
     if _should_clamp_given(model):
         step_logits = _clamp_logits_to_given(step_logits, inputs, given_mask, model.config.vocab_size)
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = weighted_loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
-    token_loss = optax.softmax_cross_entropy_with_integer_labels(step_logits, step_targets)
+    token_loss = _token_cross_entropy(model, step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
     rollout_steps = per_step_loss.shape[0]
     step_weights = _trm_step_loss_weights(model, rollout_steps)
@@ -1046,8 +1195,7 @@ def trm_dense_unroll_loss_and_metrics(
     )
     final_logits = step_logits[-1]
     predictions = jnp.argmax(final_logits, axis=-1)
-    final_probs = jax.nn.softmax(final_logits, axis=-1)
-    target_probability = jnp.take_along_axis(final_probs, targets[..., None], axis=-1).squeeze(-1)
+    target_probability = _target_probability(model, final_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
     correct = (predictions == targets).astype(jnp.float32) * loss_mask
     blank_cell_accuracy = jnp.sum(correct) / metric_normalizer
@@ -1109,19 +1257,21 @@ def trm_eval_loss_and_metrics(
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
 
+    model_forward_kwargs = {"puzzle_identifiers": batch["puzzle_identifiers"]}
+    if isinstance(model, TinyRecursiveModel):
+        model_forward_kwargs["compute_terminal_residual"] = False
     step_logits, diagnostics = model.forward_all_steps_with_diagnostics(
         inputs,
-        puzzle_identifiers=batch["puzzle_identifiers"],
         train=False,
         dropout_key=None,
-        compute_terminal_residual=False,
+        **model_forward_kwargs,
     )
     if _should_clamp_given(model):
         step_logits = _clamp_logits_to_given(step_logits, inputs, given_mask, model.config.vocab_size)
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = weighted_loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
-    token_loss = optax.softmax_cross_entropy_with_integer_labels(step_logits, step_targets)
+    token_loss = _token_cross_entropy(model, step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
     per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
 
@@ -1143,7 +1293,7 @@ def trm_eval_loss_and_metrics(
         jnp.broadcast_to(gather_index, (1, inputs.shape[0], step_logits.shape[2], step_logits.shape[3])),
         axis=0,
     ).squeeze(0)
-    selected_token_loss = optax.softmax_cross_entropy_with_integer_labels(selected_logits, targets)
+    selected_token_loss = _token_cross_entropy(model, selected_logits, targets)
     blank_ce_loss = jnp.sum(selected_token_loss * weighted_loss_mask) / normalizer
     selected_solved_targets = jnp.take_along_axis(
         per_step_example_solved.astype(jnp.float32),
@@ -1155,14 +1305,13 @@ def trm_eval_loss_and_metrics(
     loss = blank_ce_loss + halt_loss_weight * halt_loss
 
     predictions = jnp.argmax(selected_logits, axis=-1)
-    selected_probs = jax.nn.softmax(selected_logits, axis=-1)
-    target_probability = jnp.take_along_axis(selected_probs, targets[..., None], axis=-1).squeeze(-1)
+    target_probability = _target_probability(model, selected_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
     correct = (predictions == targets).astype(jnp.float32) * loss_mask
     blank_cell_accuracy = jnp.sum(correct) / metric_normalizer
     solved_rate = jnp.mean(selected_solved_targets)
     final_logits = step_logits[-1]
-    final_token_loss = optax.softmax_cross_entropy_with_integer_labels(final_logits, targets)
+    final_token_loss = _token_cross_entropy(model, final_logits, targets)
     final_blank_ce_loss = jnp.sum(final_token_loss * weighted_loss_mask) / normalizer
     final_predictions = jnp.argmax(final_logits, axis=-1)
     final_correct = (final_predictions == targets).astype(jnp.float32) * loss_mask

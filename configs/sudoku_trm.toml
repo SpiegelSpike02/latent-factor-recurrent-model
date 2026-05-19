@@ -13,6 +13,7 @@ grid_width = 9
 d_model = 512
 rollout_steps = 16
 dropout_rate = 0.05
+loss_type = "stablemax"
 
 [model.trm]
 # Official TRM naming: deep_recursion = H_cycles, latent_recursion = L_cycles,
@@ -74,5 +75,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-trm-rel2d-standard-conv-act-b768-official-schedule"
+name = "sudoku-trm-rel2d-standard-conv-act-stablemax-b768"
 mode = "online"
