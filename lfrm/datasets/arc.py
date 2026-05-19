@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.request import urlretrieve
 
 import numpy as np
 
@@ -12,6 +14,12 @@ import numpy as np
 ARC_MAX_GRID_SIZE = 30
 ARC_AUGMENT_RETRIES_FACTOR = 5
 PUZZLE_ID_SEPARATOR = "|||"
+ARC_NETWORK_SOURCES = {
+    "samsung-trm-hf": (
+        "https://huggingface.co",
+        "wtfmahe/Samsung-TRM/resolve/main/kaggle/combined",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -125,6 +133,33 @@ def _resolve_arc_file(input_file_prefix: str, subset: str, kind: str) -> Path:
         if path.is_file():
             return path
     raise FileNotFoundError(f"Could not find ARC {kind} file for subset={subset!r}, prefix={input_file_prefix!r}")
+
+
+def _arc_file_path(input_file_prefix: str, subset: str, kind: str) -> Path:
+    return Path(f"{input_file_prefix}_{subset}_{kind}.json")
+
+
+def ensure_arc_source_files(
+    *,
+    input_file_prefix: str,
+    subsets: tuple[str, ...],
+    source: str = "samsung-trm-hf",
+    overwrite: bool = False,
+) -> None:
+    if source not in ARC_NETWORK_SOURCES:
+        raise ValueError(f"Unsupported ARC download source: {source!r}")
+    default_endpoint, repo_path = ARC_NETWORK_SOURCES[source]
+    endpoint = os.environ.get("HF_ENDPOINT", default_endpoint).rstrip("/")
+    base_url = f"{endpoint}/{repo_path}"
+    for subset in subsets:
+        for kind in ("challenges", "solutions"):
+            output_path = _arc_file_path(input_file_prefix, subset, kind)
+            if output_path.exists() and not overwrite:
+                continue
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            url = f"{base_url}/arc-agi_{subset}_{kind}.json"
+            print(f"[arc] downloading {url} -> {output_path}", flush=True)
+            urlretrieve(url, output_path)
 
 
 def _load_subset(input_file_prefix: str, subset: str) -> dict[str, dict]:

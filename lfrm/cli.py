@@ -12,6 +12,8 @@ from typing import Any
 
 import jax
 import numpy as np
+from flax import nnx
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from lfrm.config import (
     DataConfig,
@@ -101,7 +103,7 @@ ALLOWED_SECTION_KEYS = {
         "checkpoint_dir",
         "ema",
     },
-    "runtime": {"compute_dtype"},
+    "runtime": {"compute_dtype", "data_parallel_devices"},
     "wandb": {"enabled", "project", "entity", "name", "mode"},
 }
 ALLOWED_NESTED_KEYS = {
@@ -330,6 +332,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--flatten-optimizer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compute-dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument(
+        "--data-parallel-devices",
+        type=int,
+        default=1,
+        help="Number of local devices for data parallelism. Use 0 for all visible devices.",
+    )
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument(
         "--resume-from",
@@ -459,7 +467,10 @@ def build_config(
         ),
     )
     data = DataConfig(dataset_path=args.dataset_path)
-    runtime = RuntimeConfig(compute_dtype=args.compute_dtype)
+    runtime = RuntimeConfig(
+        compute_dtype=args.compute_dtype,
+        data_parallel_devices=args.data_parallel_devices,
+    )
     wandb = WandbConfig(
         enabled=args.wandb_enabled,
         project=args.wandb_project,
@@ -611,7 +622,7 @@ def sample_device_batch(
     *,
     config: ExperimentConfig,
     split: str,
-    device: jax.Device,
+    device: jax.Device | NamedSharding,
 ) -> dict[str, jax.Array]:
     if isinstance(rng, GridBatchSampler):
         batch = rng.sample(batch_size=config.train.batch_size, seq_len=config.model.seq_len, split=split)
@@ -624,6 +635,40 @@ def sample_device_batch(
             split=split,
         )
     return jax.device_put(batch, device=device)
+
+
+def data_parallel_mesh(config: ExperimentConfig) -> Mesh | None:
+    requested = config.runtime.data_parallel_devices
+    if requested < 0:
+        raise ValueError("data_parallel_devices must be non-negative")
+    devices = jax.devices()
+    if requested == 0:
+        requested = len(devices)
+    if requested <= 1:
+        return None
+    if requested > len(devices):
+        raise ValueError(
+            f"Requested data_parallel_devices={requested}, but only {len(devices)} JAX devices are visible"
+        )
+    return Mesh(np.asarray(devices[:requested]), ("data",))
+
+
+def batch_sharding(mesh: Mesh | None) -> NamedSharding | None:
+    if mesh is None:
+        return None
+    return NamedSharding(mesh, P("data"))
+
+
+def replicated_sharding(mesh: Mesh | None) -> NamedSharding | None:
+    if mesh is None:
+        return None
+    return NamedSharding(mesh, P())
+
+
+def place_module_replicated(module, sharding: NamedSharding | None) -> None:
+    if sharding is None:
+        return
+    nnx.update(module, jax.device_put(nnx.state(module), sharding))
 
 
 class BatchPrefetcher:
@@ -668,7 +713,8 @@ def eval_device_batch(
 
 
 def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[str, Any]:
-    device = jax.devices()[0]
+    mesh = data_parallel_mesh(config)
+    device = batch_sharding(mesh) or jax.devices()[0]
     reduced: dict[str, Any] | None = None
     total = dataset.eval_inputs.shape[0]
     if total == 0:
@@ -756,6 +802,19 @@ def main() -> None:
         raise ValueError("lr_warmup_steps must be positive")
     if config.model.model_type not in ("trm", "urm") and config.train.trm_train_mode != "act":
         raise ValueError("trm_train_mode is only supported for model_type='trm' or 'urm'")
+    mesh = data_parallel_mesh(config)
+    data_sharding = batch_sharding(mesh)
+    state_sharding = replicated_sharding(mesh)
+    data_parallel_size = 1 if mesh is None else int(mesh.shape["data"])
+    if config.train.batch_size % data_parallel_size != 0:
+        raise ValueError(
+            f"batch_size={config.train.batch_size} must be divisible by data_parallel_devices={data_parallel_size}"
+        )
+    eval_batch_size = config.train.eval_batch_size or config.train.batch_size
+    if eval_batch_size % data_parallel_size != 0:
+        raise ValueError(
+            f"eval_batch_size={eval_batch_size} must be divisible by data_parallel_devices={data_parallel_size}"
+        )
 
     resume_checkpoint: Path | None = None
     resume_step = 0
@@ -798,13 +857,17 @@ def main() -> None:
         restored_step = load_checkpoint(resume_checkpoint, model, optimizer, ema_model=ema_model)
         if restored_step != resume_step:
             resume_step = restored_step
+    place_module_replicated(model, state_sharding)
+    place_module_replicated(optimizer, state_sharding)
+    if ema_model is not None:
+        place_module_replicated(ema_model, state_sharding)
 
     train_rng = np.random.default_rng(config.train.seed + resume_step)
     train_sampler = GridBatchSampler(train_rng, dataset)
     train_key = jax.random.fold_in(jax.random.key(config.train.seed), resume_step)
     scalar_metrics = scalar_metric_names(config)
 
-    device = jax.devices()[0]
+    device = data_sharding or jax.devices()[0]
     overview = dataset_overview(dataset)
     print(
         "device=", device,
@@ -833,6 +896,8 @@ def main() -> None:
         "checkpoint_dir=", checkpoint_dir,
         "resume_checkpoint=", resume_checkpoint,
         "resume_step=", resume_step,
+        "data_parallel_devices=", data_parallel_size,
+        "data_sharding=", data_sharding,
         "XLA_PYTHON_CLIENT_PREALLOCATE=", os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE"),
         "XLA_PYTHON_CLIENT_MEM_FRACTION=", os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION"),
         "XLA_PYTHON_CLIENT_ALLOCATOR=", os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR"),

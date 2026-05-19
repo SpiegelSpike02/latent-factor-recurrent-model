@@ -156,6 +156,7 @@ class DataConfig:
 @dataclass(frozen=True)
 class RuntimeConfig:
     compute_dtype: str = "bfloat16"
+    data_parallel_devices: int = 1
 
 
 @dataclass(frozen=True)

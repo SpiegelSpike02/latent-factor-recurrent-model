@@ -54,20 +54,19 @@ Build an offline Maze dataset in the HRM/TRM format:
 uv run lfrm-build-maze --output-dir data/maze-30x30-hard-1k-aug --aug
 ```
 
-Build ARC-AGI datasets in the official TRM/URM format. The `input-file-prefix`
-points to files such as `arc-agi_training_challenges.json` and
-`arc-agi_training_solutions.json`:
+Build ARC-AGI datasets in the official TRM/URM format. If the source JSON files
+are not present locally, `lfrm-build-arc` downloads them first and caches them
+under `data/raw/arc-agi/`. Set `HF_ENDPOINT=https://hf-mirror.com` to use a
+HuggingFace mirror.
 
 ```bash
 uv run lfrm-build-arc \
-  --input-file-prefix kaggle/combined/arc-agi \
   --output-dir data/arc1concept-aug-1000 \
   --subsets training evaluation concept \
   --test-set-name evaluation \
   --num-aug 1000
 
 uv run lfrm-build-arc \
-  --input-file-prefix kaggle/combined/arc-agi \
   --output-dir data/arc2concept-aug-1000 \
   --subsets training2 evaluation2 concept \
   --test-set-name evaluation2 \
