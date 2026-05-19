@@ -137,9 +137,10 @@ class URMBlock(nnx.Module):
         self.conv_swiglu = ConvSwiGLU(config, dtype, rngs=rngs)
 
     def __call__(self, h: Array, rope_cos: Array, rope_sin: Array) -> Array:
-        h = h + self.attention(_rms_norm(maybe_cast(h, self.dtype), self.norm_eps), rope_cos, rope_sin)
-        h = _rms_norm(maybe_cast(h, self.dtype), self.norm_eps)
-        return h + self.conv_swiglu(h)
+        attn_output = self.attention(maybe_cast(h, self.dtype), rope_cos, rope_sin)
+        h = _rms_norm(h + attn_output.astype(h.dtype), self.norm_eps)
+        mlp_output = self.conv_swiglu(maybe_cast(h, self.dtype))
+        return _rms_norm(h + mlp_output.astype(h.dtype), self.norm_eps)
 
 
 class UnifiedReasoningModel(nnx.Module):

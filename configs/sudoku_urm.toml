@@ -52,6 +52,7 @@ batch_size = 128
 eval_batch_size = 256
 epochs = 50000
 log_every = 10
+eval_epochs = 2000
 eval_every = 2500
 trm_train_mode = "act"
 halt_loss_weight = 0.5

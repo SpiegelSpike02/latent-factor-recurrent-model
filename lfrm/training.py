@@ -82,8 +82,6 @@ def _optimizer_param_labels(params):
 
 def _adam_atan2_optimizer(config: ExperimentConfig, schedule) -> optax.GradientTransformation:
     transforms: list[optax.GradientTransformation] = []
-    if config.optimizer.grad_clip_norm > 0.0:
-        transforms.append(optax.clip_by_global_norm(config.optimizer.grad_clip_norm))
     transforms.append(scale_by_adam_atan2(b1=config.optimizer.beta1, b2=config.optimizer.beta2))
     if config.optimizer.weight_decay > 0.0:
         transforms.append(optax.add_decayed_weights(config.optimizer.weight_decay))
@@ -197,12 +195,19 @@ def ema_param_filter(config: ExperimentConfig):
 
 
 def stablemax(logits: jax.Array, axis: int = -1) -> jax.Array:
-    positive = jnp.where(logits >= 0.0, logits + 1.0, 1.0 / (1.0 - logits))
+    negative_logits = jnp.where(logits < 0.0, logits, 0.0)
+    positive = jnp.where(logits >= 0.0, logits + 1.0, 1.0 / (1.0 - negative_logits))
     return positive / jnp.sum(positive, axis=axis, keepdims=True)
 
 
 def stablemax_cross_entropy_with_integer_labels(logits: jax.Array, targets: jax.Array) -> jax.Array:
-    log_positive = jnp.where(logits >= 0.0, jnp.log1p(logits), -jnp.log1p(-logits))
+    positive_logits = jnp.where(logits >= 0.0, logits, 0.0)
+    negative_logits = jnp.where(logits < 0.0, logits, 0.0)
+    log_positive = jnp.where(
+        logits >= 0.0,
+        jnp.log1p(positive_logits),
+        -jnp.log1p(-negative_logits),
+    )
     log_normalizer = jax.nn.logsumexp(log_positive, axis=-1)
     target_log_positive = jnp.take_along_axis(log_positive, targets[..., None], axis=-1).squeeze(-1)
     return log_normalizer - target_log_positive
