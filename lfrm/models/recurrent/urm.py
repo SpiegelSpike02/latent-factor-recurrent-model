@@ -10,64 +10,15 @@ from lfrm.config import ModelConfig, RuntimeConfig
 from lfrm.models.recurrent.layers import (
     Array,
     CastedEmbedding,
+    FullAttention,
     casted_linear_init,
     compute_dtype,
-    dot_product_attention,
     maybe_cast,
     rms_norm as _rms_norm,
-    rotate_half as _rotate_half,
     swiglu_intermediate_size,
     trunc_normal,
     trunc_normal_init,
 )
-
-
-class URMAttention(nnx.Module):
-    """Official-style full attention with RoPE positional encoding."""
-
-    def __init__(self, d_model: int, num_heads: int, dtype: jnp.dtype, *, rngs: nnx.Rngs) -> None:
-        if d_model % num_heads != 0:
-            raise ValueError("URM d_model must be divisible by num_heads")
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.dtype = dtype
-
-        self.qkv = nnx.Linear(
-            d_model,
-            3 * d_model,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.out = nnx.Linear(
-            d_model,
-            d_model,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-
-    def __call__(self, h: Array, rope_cos: Array, rope_sin: Array) -> Array:
-        batch_size, seq_len, d_model = h.shape
-        qkv = self.qkv(maybe_cast(h, self.dtype))
-        q, k, v = jnp.split(qkv, 3, axis=-1)
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-
-        cos = rope_cos[None, :seq_len, None, :].astype(q.dtype)
-        sin = rope_sin[None, :seq_len, None, :].astype(q.dtype)
-        q = (q * cos) + (_rotate_half(q) * sin)
-        k = (k * cos) + (_rotate_half(k) * sin)
-
-        output = dot_product_attention(q, k, v)
-        output = output.reshape(batch_size, seq_len, d_model)
-        return self.out(output)
 
 
 class ConvSwiGLU(nnx.Module):
@@ -123,11 +74,21 @@ class URMBlock(nnx.Module):
     def __init__(self, config: ModelConfig, dtype: jnp.dtype, *, rngs: nnx.Rngs) -> None:
         self.dtype = dtype
         self.norm_eps = config.urm_config.rms_norm_eps
-        self.attention = URMAttention(config.d_model, config.urm_config.num_heads, dtype, rngs=rngs)
+        self.attention = FullAttention(
+            config.d_model,
+            config.urm_config.num_heads,
+            dtype,
+            name="URM",
+            rngs=rngs,
+        )
         self.conv_swiglu = ConvSwiGLU(config, dtype, rngs=rngs)
 
     def __call__(self, h: Array, rope_cos: Array, rope_sin: Array) -> Array:
-        attn_output = self.attention(maybe_cast(h, self.dtype), rope_cos, rope_sin)
+        attn_output = self.attention(
+            h,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+        )
         h = _rms_norm(h + attn_output.astype(h.dtype), self.norm_eps)
         mlp_output = self.conv_swiglu(maybe_cast(h, self.dtype))
         return _rms_norm(h + mlp_output.astype(h.dtype), self.norm_eps)

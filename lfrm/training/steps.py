@@ -13,31 +13,8 @@ from lfrm.training.losses import (
     target_probability as token_target_probability,
     token_cross_entropy,
 )
+from lfrm.training.metrics import maybe_path_metrics
 from lfrm.training.optim import scheduled_lr, trainable_param_filter, uses_sparse_puzzle_embedding
-
-
-def _path_metrics(predictions: jax.Array, targets: jax.Array, loss_mask: jax.Array) -> dict[str, jax.Array]:
-    mask = loss_mask.astype(bool)
-    predicted_path = (predictions == 5) & mask
-    target_path = (targets == 5) & mask
-    true_positive = jnp.sum((predicted_path & target_path).astype(jnp.float32))
-    predicted_positive = jnp.sum(predicted_path.astype(jnp.float32))
-    target_positive = jnp.sum(target_path.astype(jnp.float32))
-    mask_total = jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
-    precision = true_positive / jnp.maximum(predicted_positive, 1.0)
-    recall = true_positive / jnp.maximum(target_positive, 1.0)
-    f1 = jnp.where(
-        precision + recall > 0.0,
-        2.0 * precision * recall / (precision + recall),
-        0.0,
-    )
-    return {
-        "path_precision": precision,
-        "path_recall": recall,
-        "path_f1": f1,
-        "path_positive_rate": predicted_positive / mask_total,
-        "target_path_rate": target_positive / mask_total,
-    }
 
 
 def _maybe_path_metrics(
@@ -46,9 +23,12 @@ def _maybe_path_metrics(
     targets: jax.Array,
     loss_mask: jax.Array,
 ) -> dict[str, jax.Array]:
-    if getattr(getattr(model, "config", None), "task_type", "sudoku") != "maze":
-        return {}
-    return _path_metrics(predictions, targets, loss_mask)
+    return maybe_path_metrics(
+        task_type=getattr(getattr(model, "config", None), "task_type", "sudoku"),
+        predictions=predictions,
+        targets=targets,
+        loss_mask=loss_mask,
+    )
 
 
 def _clamp_logits_to_given(

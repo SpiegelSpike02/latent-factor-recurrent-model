@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 
@@ -22,6 +24,42 @@ def format_step_summary(name: str, values: list[float]) -> str:
         f"mid:{values[middle_index]:.4f},"
         f"last:{values[-1]:.4f}"
     )
+
+
+def path_metrics(predictions: jax.Array, targets: jax.Array, loss_mask: jax.Array) -> dict[str, jax.Array]:
+    mask = loss_mask.astype(bool)
+    predicted_path = (predictions == 5) & mask
+    target_path = (targets == 5) & mask
+    true_positive = jnp.sum((predicted_path & target_path).astype(jnp.float32))
+    predicted_positive = jnp.sum(predicted_path.astype(jnp.float32))
+    target_positive = jnp.sum(target_path.astype(jnp.float32))
+    mask_total = jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
+    precision = true_positive / jnp.maximum(predicted_positive, 1.0)
+    recall = true_positive / jnp.maximum(target_positive, 1.0)
+    f1 = jnp.where(
+        precision + recall > 0.0,
+        2.0 * precision * recall / (precision + recall),
+        0.0,
+    )
+    return {
+        "path_precision": precision,
+        "path_recall": recall,
+        "path_f1": f1,
+        "path_positive_rate": predicted_positive / mask_total,
+        "target_path_rate": target_positive / mask_total,
+    }
+
+
+def maybe_path_metrics(
+    *,
+    task_type: str,
+    predictions: jax.Array,
+    targets: jax.Array,
+    loss_mask: jax.Array,
+) -> dict[str, jax.Array]:
+    if task_type != "maze":
+        return {}
+    return path_metrics(predictions, targets, loss_mask)
 
 
 CORE_SCALAR_METRICS = (

@@ -8,12 +8,11 @@ from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
 from .common import Array, casted_linear_init, compute_dtype, maybe_cast, trunc_normal, trunc_normal_init
+from .recurrent.layers import rms_norm as _shared_rms_norm
 
 
 def _rms_norm(x: Array, eps: float = 1e-5) -> Array:
-    x_f32 = x.astype(jnp.float32)
-    variance = jnp.mean(jnp.square(x_f32), axis=-1, keepdims=True)
-    return (x_f32 * jax.lax.rsqrt(variance + eps)).astype(x.dtype)
+    return _shared_rms_norm(x, eps)
 
 
 class RelationTypedAttention(nnx.Module):

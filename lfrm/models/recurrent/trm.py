@@ -10,13 +10,12 @@ from lfrm.config import ModelConfig, RuntimeConfig
 from lfrm.models.recurrent.layers import (
     Array,
     CastedEmbedding,
+    FullAttention,
+    SwiGLU,
     casted_linear_init,
     compute_dtype,
-    dot_product_attention,
     maybe_cast,
     rms_norm as _rms_norm,
-    rotate_half as _rotate_half,
-    swiglu_intermediate_size as _swiglu_intermediate_size,
     trunc_normal,
     trunc_normal_init,
 )
@@ -24,33 +23,6 @@ from lfrm.models.recurrent.layers import (
 
 State = dict[str, Array]
 Carry = dict[str, Array]
-
-
-class SwiGLU(nnx.Module):
-    def __init__(self, hidden_size: int, expansion: float, dtype: jnp.dtype, *, rngs: nnx.Rngs) -> None:
-        intermediate_size = _swiglu_intermediate_size(hidden_size, expansion)
-        self.gate_up = nnx.Linear(
-            hidden_size,
-            2 * intermediate_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.down = nnx.Linear(
-            intermediate_size,
-            hidden_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-
-    def __call__(self, x: Array) -> Array:
-        gate, up = jnp.split(self.gate_up(x), 2, axis=-1)
-        return self.down(jax.nn.silu(gate) * up)
 
 
 class LocalConvSwiGLU(nnx.Module):
@@ -118,75 +90,6 @@ class LocalConvSwiGLU(nnx.Module):
         return jnp.concatenate([prefix, mixed], axis=1)
 
 
-class Attention(nnx.Module):
-    def __init__(
-        self,
-        config: ModelConfig,
-        prefix_len: int,
-        dtype: jnp.dtype,
-        *,
-        rngs: nnx.Rngs,
-    ) -> None:
-        d_model = config.d_model
-        trm = config.trm_config
-        num_heads = trm.num_heads
-        if d_model % num_heads != 0:
-            raise ValueError("TRM d_model must be divisible by trm.num_heads")
-        self.config = config
-        self.trm = trm
-        self.prefix_len = prefix_len
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.qkv = nnx.Linear(
-            d_model,
-            3 * d_model,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.out = nnx.Linear(
-            d_model,
-            d_model,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-
-    def __call__(
-        self,
-        x: Array,
-        rope_cos: Array | None,
-        rope_sin: Array | None,
-        attention_bias: Array | None,
-    ) -> Array:
-        batch_size, seq_len, d_model = x.shape
-        qkv = self.qkv(x)
-        q, k, v = jnp.split(qkv, 3, axis=-1)
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        if rope_cos is not None and rope_sin is not None:
-            q, k = _apply_rope(q, k, rope_cos, rope_sin)
-        attended = dot_product_attention(q, k, v, bias=attention_bias)
-        attended = attended.reshape(batch_size, seq_len, d_model)
-        return self.out(attended)
-
-
-def _apply_rope(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
-    cos = cos[None, :, None, :]
-    sin = sin[None, :, None, :]
-    q_f32 = q.astype(jnp.float32)
-    k_f32 = k.astype(jnp.float32)
-    return (
-        (q_f32 * cos + _rotate_half(q_f32) * sin).astype(q.dtype),
-        (k_f32 * cos + _rotate_half(k_f32) * sin).astype(k.dtype),
-    )
-
-
 class TRMBlock(nnx.Module):
     def __init__(
         self,
@@ -203,7 +106,13 @@ class TRMBlock(nnx.Module):
         if trm.mlp_t:
             self.token_mlp = SwiGLU(sequence_length, trm.mlp_ratio, dtype, rngs=rngs)
         else:
-            self.attention = Attention(config, prefix_len, dtype, rngs=rngs)
+            self.attention = FullAttention(
+                config.d_model,
+                trm.num_heads,
+                dtype,
+                name="TRM",
+                rngs=rngs,
+            )
         if trm.local_mixing:
             self.local_mixing = LocalConvSwiGLU(config, prefix_len, dtype, rngs=rngs)
         if not trm.mlp_t:
@@ -221,7 +130,12 @@ class TRMBlock(nnx.Module):
             mixed = _rms_norm(mixed + self.token_mlp(mixed), self.trm.rms_norm_eps)
             return jnp.swapaxes(mixed, 1, 2)
         else:
-            attention_out = self.attention(hidden_states, rope_cos, rope_sin, attention_bias)
+            attention_out = self.attention(
+                hidden_states,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+                bias=attention_bias,
+            )
             hidden_states = _rms_norm(
                 hidden_states + attention_out,
                 self.trm.rms_norm_eps,
