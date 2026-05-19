@@ -110,7 +110,8 @@ class OptimizerConfig:
     beta2: float = 0.999
     weight_decay: float = 0.1
     puzzle_embed_weight_decay: float = 0.0
-    warmup_steps: int = 100
+    warmup_epochs: int = 100
+    warmup_updates: int = 0
     grad_clip_norm: float = 1.0
     flatten_optimizer: bool = False
 
@@ -126,12 +127,12 @@ class TrainConfig:
     batch_size: int = 16
     eval_batch_size: int = 0
     gradient_accumulation_steps: int = 1
-    epochs: int = 0
-    max_steps: int = 500
-    log_every: int = 10
-    eval_epochs: int = 0
-    eval_every: int = 100
-    eval_count: int = 0
+    epochs: int = 500
+    optimizer_updates: int = 0
+    log_epochs: int = 10
+    log_interval_updates: int = 0
+    eval_epochs: int = 100
+    eval_interval_updates: int = 0
     trm_train_mode: str = "act"
     halt_loss_weight: float = 0.0
     terminal_residual_weight: float = 0.0

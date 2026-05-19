@@ -43,14 +43,14 @@ def scheduled_lr(
     *,
     peak_value: float,
     min_ratio: float,
-    warmup_steps: int,
-    optimizer_steps: int,
+    warmup_updates: int,
+    optimizer_updates: int,
 ):
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_value,
-        warmup_steps=warmup_steps,
-        decay_steps=max(optimizer_steps, warmup_steps + 1),
+        warmup_steps=warmup_updates,
+        decay_steps=max(optimizer_updates, warmup_updates + 1),
         end_value=peak_value * min_ratio,
     )
     return lambda count: schedule(count + jnp.asarray(1, dtype=count.dtype))
@@ -114,13 +114,13 @@ def _puzzle_embedding_optimizer(config: ExperimentConfig, schedule) -> optax.Gra
 
 
 def build_optimizer(config: ExperimentConfig, model: object | None = None) -> optax.GradientTransformation:
-    optimizer_steps = max(1, config.train.max_steps)
-    warmup_steps = max(1, config.optimizer.warmup_steps)
+    optimizer_updates = max(1, config.train.optimizer_updates)
+    warmup_updates = max(1, config.optimizer.warmup_updates)
     schedule = scheduled_lr(
         peak_value=config.optimizer.learning_rate,
         min_ratio=config.optimizer.lr_min_ratio,
-        warmup_steps=warmup_steps,
-        optimizer_steps=optimizer_steps,
+        warmup_updates=warmup_updates,
+        optimizer_updates=optimizer_updates,
     )
     default_optimizer = _default_optimizer(config, schedule)
     if (
@@ -131,8 +131,8 @@ def build_optimizer(config: ExperimentConfig, model: object | None = None) -> op
         puzzle_schedule = scheduled_lr(
             peak_value=config.optimizer.puzzle_embed_learning_rate,
             min_ratio=config.optimizer.lr_min_ratio,
-            warmup_steps=warmup_steps,
-            optimizer_steps=optimizer_steps,
+            warmup_updates=warmup_updates,
+            optimizer_updates=optimizer_updates,
         )
         optimizer = optax.multi_transform(
             {

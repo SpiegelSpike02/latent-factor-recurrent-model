@@ -54,16 +54,16 @@ lr_min_ratio = 0.2
 beta1 = 0.9
 beta2 = 0.95
 weight_decay = 0.1
-warmup_steps = 3000
+warmup_epochs = 2304
 grad_clip_norm = 1.0
 flatten_optimizer = true
 
 [train]
 batch_size = 768
 eval_batch_size = 256
-max_steps = 30000
-log_every = 10
-eval_every = 2500
+epochs = 23040
+log_epochs = 10
+eval_epochs = 1920
 seed = 0
 checkpoint_dir = "checkpoints"
 

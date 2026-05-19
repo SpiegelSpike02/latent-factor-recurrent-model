@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 import math
 import os
@@ -84,7 +84,7 @@ ALLOWED_SECTION_KEYS = {
         "beta2",
         "weight_decay",
         "puzzle_embed_weight_decay",
-        "warmup_steps",
+        "warmup_epochs",
         "grad_clip_norm",
         "flatten_optimizer",
     },
@@ -93,11 +93,8 @@ ALLOWED_SECTION_KEYS = {
         "eval_batch_size",
         "gradient_accumulation_steps",
         "epochs",
-        "max_steps",
-        "log_every",
+        "log_epochs",
         "eval_epochs",
-        "eval_every",
-        "eval_count",
         "trm_train_mode",
         "halt_loss_weight",
         "terminal_residual_weight",
@@ -239,27 +236,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Eval batch size. Uses --batch-size when set to 0.",
     )
-    parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument(
         "--epochs",
         type=int,
-        default=0,
-        help="Official-style grouped dataset epochs. When >0, max_steps is derived from dataset metadata.",
+        default=500,
+        help="Grouped dataset epochs. The training loop derives optimizer updates internally.",
     )
-    parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument(
         "--eval-epochs",
         type=int,
-        default=0,
-        help="Official-style eval interval in grouped dataset epochs. When >0, eval_every is derived from dataset metadata.",
+        default=100,
+        help="Eval interval in grouped dataset epochs. The loop derives optimizer-update intervals internally.",
     )
-    parser.add_argument(
-        "--eval-count",
-        type=int,
-        default=0,
-        help="When >0, automatically evaluate this many times over max_steps.",
-    )
-    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--log-epochs", type=int, default=10)
     parser.add_argument(
         "--trm-train-mode",
         choices=("act", "dense_unroll"),
@@ -338,7 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--puzzle-embed-weight-decay", type=float, default=0.0)
-    parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument("--warmup-epochs", type=int, default=100)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--flatten-optimizer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compute-dtype", choices=("bfloat16", "float32"), default="bfloat16")
@@ -449,7 +438,7 @@ def build_config(
         beta2=args.beta2,
         weight_decay=args.weight_decay,
         puzzle_embed_weight_decay=args.puzzle_embed_weight_decay,
-        warmup_steps=args.warmup_steps,
+        warmup_epochs=args.warmup_epochs,
         grad_clip_norm=args.grad_clip_norm,
         flatten_optimizer=args.flatten_optimizer,
     )
@@ -458,11 +447,8 @@ def build_config(
         eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         epochs=args.epochs,
-        max_steps=args.max_steps,
-        log_every=args.log_every,
+        log_epochs=args.log_epochs,
         eval_epochs=args.eval_epochs,
-        eval_every=args.eval_every,
-        eval_count=args.eval_count,
         trm_train_mode=args.trm_train_mode,
         halt_loss_weight=args.halt_loss_weight,
         terminal_residual_weight=args.terminal_residual_weight,
@@ -539,29 +525,27 @@ def read_wandb_run_id(run_dir: Path) -> str | None:
 
 def schedule_learning_rate(config: ExperimentConfig, step: int) -> float:
     optimizer_step = max(1, step)
-    optimizer_steps = max(1, config.train.max_steps)
-    warmup_steps = max(1, config.optimizer.warmup_steps)
+    optimizer_updates = max(1, config.train.optimizer_updates)
+    warmup_updates = max(1, config.optimizer.warmup_updates)
     peak = config.optimizer.learning_rate
     end = peak * config.optimizer.lr_min_ratio
-    decay_steps = max(optimizer_steps, warmup_steps + 1)
-    if optimizer_step <= warmup_steps:
-        return peak * optimizer_step / max(warmup_steps, 1)
-    progress = min(max((optimizer_step - warmup_steps) / max(decay_steps - warmup_steps, 1), 0.0), 1.0)
+    decay_updates = max(optimizer_updates, warmup_updates + 1)
+    if optimizer_step <= warmup_updates:
+        return peak * optimizer_step / max(warmup_updates, 1)
+    progress = min(max((optimizer_step - warmup_updates) / max(decay_updates - warmup_updates, 1), 0.0), 1.0)
     cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
     return float(end + (peak - end) * cosine)
 
 
-def eval_interval_steps(config: ExperimentConfig) -> int:
-    if config.train.eval_count > 0:
-        return max(1, math.ceil(config.train.max_steps / config.train.eval_count))
-    return max(1, config.train.eval_every)
+def eval_interval_updates(config: ExperimentConfig) -> int:
+    return max(1, config.train.eval_interval_updates)
 
 
 def effective_train_batch_size(config: ExperimentConfig) -> int:
     return config.train.batch_size * config.train.gradient_accumulation_steps
 
 
-def steps_from_epochs(dataset, batch_size: int, epochs: int) -> int:
+def updates_from_epochs(dataset, batch_size: int, epochs: int) -> int:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
     if batch_size < 1:
@@ -578,32 +562,20 @@ def steps_from_epochs(dataset, batch_size: int, epochs: int) -> int:
 
 
 def apply_epoch_budget(config: ExperimentConfig, dataset) -> ExperimentConfig:
-    if config.train.epochs <= 0:
-        return config
-    eval_every = config.train.eval_every
     effective_batch_size = effective_train_batch_size(config)
-    if config.train.eval_epochs > 0:
-        eval_every = steps_from_epochs(dataset, effective_batch_size, config.train.eval_epochs)
-    train = TrainConfig(
-        batch_size=config.train.batch_size,
-        eval_batch_size=config.train.eval_batch_size,
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps,
-        epochs=config.train.epochs,
-        max_steps=steps_from_epochs(dataset, effective_batch_size, config.train.epochs),
-        log_every=config.train.log_every,
-        eval_epochs=config.train.eval_epochs,
-        eval_every=eval_every,
-        eval_count=config.train.eval_count,
-        trm_train_mode=config.train.trm_train_mode,
-        halt_loss_weight=config.train.halt_loss_weight,
-        terminal_residual_weight=config.train.terminal_residual_weight,
-        seed=config.train.seed,
-        checkpoint_dir=config.train.checkpoint_dir,
-        ema=config.train.ema,
+    train = replace(
+        config.train,
+        optimizer_updates=updates_from_epochs(dataset, effective_batch_size, config.train.epochs),
+        log_interval_updates=updates_from_epochs(dataset, effective_batch_size, config.train.log_epochs),
+        eval_interval_updates=updates_from_epochs(dataset, effective_batch_size, config.train.eval_epochs),
+    )
+    optimizer = replace(
+        config.optimizer,
+        warmup_updates=updates_from_epochs(dataset, effective_batch_size, config.optimizer.warmup_epochs),
     )
     return ExperimentConfig(
         model=config.model,
-        optimizer=config.optimizer,
+        optimizer=optimizer,
         train=train,
         data=config.data,
         runtime=config.runtime,
@@ -776,12 +748,14 @@ def main() -> None:
         raise ValueError("gradient_accumulation_steps must be at least 1")
     if config.train.eval_batch_size < 0:
         raise ValueError("eval_batch_size must be non-negative")
-    if config.train.epochs < 0:
-        raise ValueError("epochs must be non-negative")
-    if config.train.eval_epochs < 0:
-        raise ValueError("eval_epochs must be non-negative")
-    if config.train.eval_count < 0:
-        raise ValueError("eval_count must be non-negative")
+    if config.train.epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if config.train.log_epochs <= 0:
+        raise ValueError("log_epochs must be positive")
+    if config.train.eval_epochs <= 0:
+        raise ValueError("eval_epochs must be positive")
+    if config.optimizer.warmup_epochs <= 0:
+        raise ValueError("warmup_epochs must be positive")
     if config.model.model_type not in ("trm", "urm") and config.train.trm_train_mode != "act":
         raise ValueError("trm_train_mode is only supported for model_type='trm' or 'urm'")
 
@@ -847,10 +821,13 @@ def main() -> None:
         "effective_batch_size=", effective_train_batch_size(config),
         "eval_batch_size=", config.train.eval_batch_size or config.train.batch_size,
         "epochs=", config.train.epochs,
-        "max_steps=", config.train.max_steps,
+        "optimizer_updates=", config.train.optimizer_updates,
+        "log_epochs=", config.train.log_epochs,
+        "log_interval=", config.train.log_interval_updates,
         "eval_epochs=", config.train.eval_epochs,
-        "eval_interval=", eval_interval_steps(config),
-        "eval_count=", config.train.eval_count,
+        "eval_interval=", eval_interval_updates(config),
+        "warmup_epochs=", config.optimizer.warmup_epochs,
+        "warmup_updates=", config.optimizer.warmup_updates,
         "trm_train_mode=", config.train.trm_train_mode,
         "seq_len=", config.model.seq_len,
         "grid_height=", config.model.grid_height,
@@ -880,11 +857,11 @@ def main() -> None:
     use_trm_act = config.model.model_type in ("trm", "urm") and config.train.trm_train_mode == "act"
     console_model_label = "brc" if config.model.model_type == "brc_sudoku" else config.model.model_type
     train_carry = model.initial_carry(current_batch) if use_trm_act else None
-    eval_interval = eval_interval_steps(config)
+    eval_interval = eval_interval_updates(config)
 
     try:
-        for step in range(resume_step + 1, config.train.max_steps + 1):
-            is_eval_step = step % eval_interval == 0 or step == config.train.max_steps
+        for step in range(resume_step + 1, config.train.optimizer_updates + 1):
+            is_eval_step = step % eval_interval == 0 or step == config.train.optimizer_updates
             metrics = None
             for _ in range(config.train.gradient_accumulation_steps):
                 train_key, step_key = jax.random.split(train_key)
@@ -910,7 +887,7 @@ def main() -> None:
             if ema_model is not None and ema_update_fn is not None:
                 ema_update_fn(ema_model, model)
 
-            if step % config.train.log_every == 0 or step == 1:
+            if step % config.train.log_interval_updates == 0 or step == 1:
                 train_log = {
                     "train/loss": float(metrics["loss"]),
                     "train/learning_rate": schedule_learning_rate(config, step),
