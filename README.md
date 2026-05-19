@@ -74,10 +74,12 @@ reports given consistency, invalid-board rate, row/column/box conflict count,
 verifier ranking accuracy, and belief/refinement diagnostics.
 
 The package also applies project-level JAX defaults before JAX initializes:
-Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, GPU preallocation
-is set to 95% with `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`, preallocation is
-explicitly enabled, and `TF_GPU_ALLOCATOR=cuda_malloc_async` selects CUDA async
-allocation. Values already set in the shell are preserved.
+Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, the XLA GPU
+latency hiding scheduler is enabled, GPU preallocation is set to 95% with
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`, and preallocation is explicitly enabled.
+Values already set in the shell are preserved. `TF_GPU_ALLOCATOR` is not set by
+default because JAX documents `cuda_malloc_async` as a growing memory pool rather
+than the fixed preallocation behavior expected for these training runs.
 
 ## Notes
 

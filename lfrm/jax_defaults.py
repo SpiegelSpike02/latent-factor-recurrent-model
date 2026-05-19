@@ -6,11 +6,11 @@ import os
 DEFAULT_JAX_ENV = {
     "XLA_PYTHON_CLIENT_PREALLOCATE": "true",
     "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.95",
-    "TF_GPU_ALLOCATOR": "cuda_malloc_async",
 }
 
 DEFAULT_XLA_FLAGS = (
     "--xla_gpu_triton_gemm_any=true",
+    "--xla_gpu_enable_latency_hiding_scheduler=true",
 )
 
 

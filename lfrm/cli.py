@@ -41,6 +41,16 @@ from lfrm.training import (
     load_checkpoint,
     save_checkpoint,
 )
+from lfrm.training.metrics import (
+    WANDB_HISTORY_EXCLUDED_SCALAR_METRICS,
+    flatten_step_metrics,
+    format_scalar_metric,
+    format_step_summary,
+    grouped_scalar_summary,
+    optional_scalar_log,
+    optional_summary_log,
+    scalar_metric_names,
+)
 
 
 CONFIG_SECTIONS = ("data", "task", "model", "optimizer", "train", "runtime", "wandb")
@@ -67,12 +77,12 @@ ALLOWED_SECTION_KEYS = {
     "optimizer": {
         "optimizer_type",
         "learning_rate",
-        "puzzle_emb_learning_rate",
+        "puzzle_embed_learning_rate",
         "lr_min_ratio",
         "beta1",
         "beta2",
         "weight_decay",
-        "puzzle_emb_weight_decay",
+        "puzzle_embed_weight_decay",
         "warmup_steps",
         "grad_clip_norm",
         "flatten_optimizer",
@@ -107,8 +117,8 @@ ALLOWED_NESTED_KEYS = {
         "mlp_t",
         "local_mixing",
         "local_mixing_kernel",
-        "puzzle_emb_ndim",
-        "puzzle_emb_len",
+        "puzzle_embed_ndim",
+        "puzzle_embed_len",
         "position_encoding",
         "rms_norm_eps",
         "rope_theta",
@@ -148,8 +158,8 @@ ALLOWED_NESTED_KEYS = {
         "num_heads",
         "mlp_ratio",
         "conv_kernel",
-        "puzzle_emb_ndim",
-        "puzzle_emb_len",
+        "puzzle_embed_ndim",
+        "puzzle_embed_len",
         "rms_norm_eps",
         "rope_theta",
         "halt_exploration_prob",
@@ -270,8 +280,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trm-local-mixing", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trm-local-mixing-kernel", type=int, default=3)
-    parser.add_argument("--trm-puzzle-emb-ndim", type=int, default=0)
-    parser.add_argument("--trm-puzzle-emb-len", type=int, default=16)
+    parser.add_argument("--trm-puzzle-embed-ndim", type=int, default=0)
+    parser.add_argument("--trm-puzzle-embed-len", type=int, default=16)
     parser.add_argument("--trm-position-encoding", choices=("none", "learned", "rope", "grid", "rel2d"), default="none")
     parser.add_argument("--trm-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--trm-rope-theta", type=float, default=10000.0)
@@ -307,20 +317,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--urm-num-heads", type=int, default=8)
     parser.add_argument("--urm-mlp-ratio", type=int, default=4)
     parser.add_argument("--urm-conv-kernel", type=int, default=2)
-    parser.add_argument("--urm-puzzle-emb-ndim", type=int, default=512)
-    parser.add_argument("--urm-puzzle-emb-len", type=int, default=1)
+    parser.add_argument("--urm-puzzle-embed-ndim", type=int, default=512)
+    parser.add_argument("--urm-puzzle-embed-len", type=int, default=1)
     parser.add_argument("--urm-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--urm-rope-theta", type=float, default=10000.0)
     parser.add_argument("--urm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--urm-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--optimizer-type", choices=("adamw", "adam_atan2"), default="adamw")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--puzzle-emb-learning-rate", type=float, default=0.0)
+    parser.add_argument("--puzzle-embed-learning-rate", type=float, default=0.0)
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--weight-decay", type=float, default=0.1)
-    parser.add_argument("--puzzle-emb-weight-decay", type=float, default=0.0)
+    parser.add_argument("--puzzle-embed-weight-decay", type=float, default=0.0)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--flatten-optimizer", action=argparse.BooleanOptionalAction, default=False)
@@ -371,8 +381,8 @@ def build_config(
             mlp_t=args.trm_mlp_t,
             local_mixing=args.trm_local_mixing,
             local_mixing_kernel=args.trm_local_mixing_kernel,
-            puzzle_emb_ndim=args.trm_puzzle_emb_ndim,
-            puzzle_emb_len=args.trm_puzzle_emb_len,
+            puzzle_embed_ndim=args.trm_puzzle_embed_ndim,
+            puzzle_embed_len=args.trm_puzzle_embed_len,
             position_encoding=args.trm_position_encoding,
             rms_norm_eps=args.trm_rms_norm_eps,
             rope_theta=args.trm_rope_theta,
@@ -416,8 +426,8 @@ def build_config(
             num_heads=args.urm_num_heads,
             mlp_ratio=args.urm_mlp_ratio,
             conv_kernel=args.urm_conv_kernel,
-            puzzle_emb_ndim=args.urm_puzzle_emb_ndim,
-            puzzle_emb_len=args.urm_puzzle_emb_len,
+            puzzle_embed_ndim=args.urm_puzzle_embed_ndim,
+            puzzle_embed_len=args.urm_puzzle_embed_len,
             rms_norm_eps=args.urm_rms_norm_eps,
             rope_theta=args.urm_rope_theta,
             halt_exploration_prob=args.urm_halt_exploration_prob,
@@ -427,12 +437,12 @@ def build_config(
     optimizer = OptimizerConfig(
         optimizer_type=args.optimizer_type,
         learning_rate=args.learning_rate,
-        puzzle_emb_learning_rate=args.puzzle_emb_learning_rate,
+        puzzle_embed_learning_rate=args.puzzle_embed_learning_rate,
         lr_min_ratio=args.lr_min_ratio,
         beta1=args.beta1,
         beta2=args.beta2,
         weight_decay=args.weight_decay,
-        puzzle_emb_weight_decay=args.puzzle_emb_weight_decay,
+        puzzle_embed_weight_decay=args.puzzle_embed_weight_decay,
         warmup_steps=args.warmup_steps,
         grad_clip_norm=args.grad_clip_norm,
         flatten_optimizer=args.flatten_optimizer,
@@ -710,7 +720,7 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
             }
         for key, value in metrics.items():
             value_array = np.asarray(jax.device_get(value), dtype=np.float64)
-            if key.endswith("_count"):
+            if key == "count" or key.endswith("_count"):
                 reduced[key] += value_array
             else:
                 reduced[key] += value_array * weight
@@ -721,7 +731,7 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
         raise ValueError("No eval batches were produced")
     scale = 1.0 / total_weight
     averaged = {
-        key: value if key.endswith("_count") else value * scale
+        key: value if key == "count" or key.endswith("_count") else value * scale
         for key, value in reduced.items()
     }
     return {
@@ -729,474 +739,6 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
         for key, value in averaged.items()
     }
 
-
-def flatten_step_metrics(prefix: str, values: list[float]) -> dict[str, float]:
-    return {
-        f"{prefix}/step_{index + 1:02d}": float(value)
-        for index, value in enumerate(values)
-    }
-
-
-def format_step_summary(name: str, values: list[float]) -> str:
-    if not values:
-        return f"{name}=[]"
-    middle_index = len(values) // 2
-    return (
-        f"{name}="
-        f"first:{values[0]:.4f},"
-        f"mid:{values[middle_index]:.4f},"
-        f"last:{values[-1]:.4f}"
-    )
-
-
-CORE_SCALAR_METRICS = (
-    "unroll_steps",
-    "belief_entropy",
-    "belief_confidence",
-    "target_probability",
-    "current_target_probability",
-    "current_blank_cell_accuracy",
-    "current_solved_rate",
-    "current_solved_count",
-    "mean_blank_ce_loss",
-    "step_weighted_ce_loss",
-    "latent_fit_loss",
-    "fit_given_loss",
-    "fit_energy",
-    "fit_consistency_loss",
-    "fit_prior_loss",
-    "latent_update_norm",
-    "latent_grad_norm",
-    "latent_step_norm",
-    "meta_outer_loss",
-    "verifier_loss",
-    "verifier_ranking_accuracy",
-    "given_consistency",
-    "invalid_board_rate",
-    "conflict_count",
-    "diffusion_filled_ratio",
-    "brc_gate_mean",
-    "brc_gate_std",
-    "true_energy",
-    "fake_energy",
-    "belief_init_noise_rate",
-    "belief_init_uniform_rate",
-    "belief_init_teacher_rate",
-    "belief_init_corrupt_rate",
-    "belief_init_soft_rate",
-    "step_loss_weights",
-    "halt_loss",
-    "halt_selected_blank_ce_loss",
-    "halt_selected_blank_cell_accuracy",
-    "halt_selected_solved_rate",
-    "halt_selected_solved_count",
-    "halt_selected_step",
-    "oracle_step",
-    "act_step",
-    "halted_rate",
-    "halted_count",
-    "reset_rate",
-    "solved_count",
-    "final_blank_cell_accuracy",
-    "final_solved_rate",
-    "final_solved_count",
-    "path_precision",
-    "path_recall",
-    "path_f1",
-    "path_positive_rate",
-    "target_path_rate",
-    "halt_selected_path_precision",
-    "halt_selected_path_recall",
-    "halt_selected_path_f1",
-    "final_path_precision",
-    "final_path_recall",
-    "final_path_f1",
-)
-WANDB_HISTORY_EXCLUDED_SCALAR_METRICS = {
-    "verifier_ranking_accuracy",
-}
-TERMINAL_DIAGNOSTIC_METRICS = (
-    "terminal_belief_delta",
-    "terminal_belief_mse",
-)
-INTEGER_SCALAR_METRICS = {
-    "unroll_steps",
-    "solved_count",
-    "halted_count",
-    "current_solved_count",
-    "halt_selected_solved_count",
-    "final_solved_count",
-}
-METRIC_DISPLAY_NAMES = {
-    "blank_ce_loss": "ce_step",
-    "step_weighted_ce_loss": "ce_step",
-    "final_blank_ce_loss": "ce_final",
-    "mean_blank_ce_loss": "ce_mean",
-    "blank_cell_accuracy": "acc_blank",
-    "current_blank_cell_accuracy": "acc_current",
-    "final_blank_cell_accuracy": "acc_final",
-    "target_probability": "p_target",
-    "current_target_probability": "p_current",
-    "solved_rate": "solved",
-    "current_solved_rate": "solved_current",
-    "final_solved_rate": "solved_final",
-    "halted_count": "halted_n",
-    "current_solved_count": "current_solved_n",
-    "halt_selected_blank_ce_loss": "halt_ce",
-    "halt_selected_blank_cell_accuracy": "halt_acc",
-    "halt_selected_solved_rate": "halt_solved",
-    "halt_selected_step": "halt_step",
-    "oracle_step": "oracle_step",
-    "act_step": "act_step",
-    "unroll_steps": "unroll",
-    "per_step_hidden_delta": "hidden_delta",
-    "diffusion_filled_ratio": "filled",
-    "brc_gate_mean": "gate_mean",
-    "brc_gate_std": "gate_std",
-    "given_consistency": "given_ok",
-    "invalid_board_rate": "invalid",
-    "conflict_count": "conflicts",
-    "verifier_ranking_accuracy": "verifier_acc",
-    "fit_energy": "energy_fit",
-    "path_precision": "path_p",
-    "path_recall": "path_r",
-    "path_f1": "path_f1",
-    "path_positive_rate": "path_pos",
-    "target_path_rate": "target_path",
-    "halt_selected_path_precision": "halt_path_p",
-    "halt_selected_path_recall": "halt_path_r",
-    "halt_selected_path_f1": "halt_path_f1",
-    "final_path_precision": "final_path_p",
-    "final_path_recall": "final_path_r",
-    "final_path_f1": "final_path_f1",
-    "belief_init_noise_rate": "belief_init_noise",
-    "belief_init_uniform_rate": "belief_init_uniform",
-    "belief_init_teacher_rate": "belief_init_teacher",
-    "belief_init_corrupt_rate": "belief_init_corrupt",
-    "belief_init_soft_rate": "belief_init_soft",
-}
-METRIC_GROUPS = (
-    (
-        "loss",
-        (
-            "loss",
-            "blank_ce_loss",
-            "final_blank_ce_loss",
-            "mean_blank_ce_loss",
-            "verifier_loss",
-            "meta_outer_loss",
-            "halt_loss",
-        ),
-    ),
-    (
-        "accuracy",
-        (
-            "blank_cell_accuracy",
-            "final_blank_cell_accuracy",
-            "target_probability",
-            "current_target_probability",
-            "solved_rate",
-            "current_solved_rate",
-            "final_solved_rate",
-            "solved_count",
-            "halted_count",
-            "current_solved_count",
-            "final_solved_count",
-            "current_blank_cell_accuracy",
-            "path_precision",
-            "path_recall",
-            "path_f1",
-            "path_positive_rate",
-            "target_path_rate",
-            "final_path_precision",
-            "final_path_recall",
-            "final_path_f1",
-        ),
-    ),
-    (
-        "selection",
-        (
-            "halt_selected_step",
-            "oracle_step",
-            "act_step",
-            "halt_selected_blank_ce_loss",
-            "halt_selected_blank_cell_accuracy",
-            "halt_selected_solved_rate",
-            "halt_selected_solved_count",
-            "halt_selected_path_precision",
-            "halt_selected_path_recall",
-            "halt_selected_path_f1",
-        ),
-    ),
-    (
-        "sudoku",
-        (
-            "given_consistency",
-            "invalid_board_rate",
-            "conflict_count",
-            "verifier_ranking_accuracy",
-            "true_energy",
-            "fake_energy",
-        ),
-    ),
-    (
-        "latent",
-        (
-            "latent_fit_loss",
-            "fit_given_loss",
-            "fit_energy",
-            "fit_consistency_loss",
-            "fit_prior_loss",
-            "latent_update_norm",
-            "latent_grad_norm",
-            "latent_step_norm",
-        ),
-    ),
-    (
-        "dynamics",
-        (
-            "unroll_steps",
-            "belief_entropy",
-            "belief_confidence",
-            "diffusion_filled_ratio",
-            "brc_gate_mean",
-            "brc_gate_std",
-            "belief_init_noise_rate",
-            "belief_init_uniform_rate",
-            "belief_init_teacher_rate",
-            "belief_init_corrupt_rate",
-            "belief_init_soft_rate",
-            "terminal_belief_delta",
-            "terminal_belief_mse",
-        ),
-    ),
-)
-BRC_CONSOLE_GROUPS = (
-    (
-        "loss",
-        (
-            "loss",
-            "blank_ce_loss",
-            "final_blank_ce_loss",
-            "mean_blank_ce_loss",
-        ),
-    ),
-    (
-        "output",
-        (
-            "blank_cell_accuracy",
-            "final_blank_cell_accuracy",
-            "target_probability",
-            "solved_rate",
-            "final_solved_rate",
-            "solved_count",
-            "final_solved_count",
-        ),
-    ),
-    (
-        "sudoku",
-        (
-            "given_consistency",
-            "invalid_board_rate",
-            "conflict_count",
-            "verifier_ranking_accuracy",
-            "true_energy",
-            "fake_energy",
-            "verifier_loss",
-            "meta_outer_loss",
-        ),
-    ),
-    (
-        "latent",
-        (
-            "latent_fit_loss",
-            "fit_given_loss",
-            "fit_energy",
-            "fit_consistency_loss",
-            "fit_prior_loss",
-            "latent_update_norm",
-            "latent_grad_norm",
-            "latent_step_norm",
-        ),
-    ),
-    (
-        "belief",
-        (
-            "unroll_steps",
-            "diffusion_filled_ratio",
-            "brc_gate_mean",
-            "brc_gate_std",
-            "belief_init_noise_rate",
-            "belief_init_uniform_rate",
-            "belief_init_teacher_rate",
-            "belief_init_corrupt_rate",
-            "belief_init_soft_rate",
-        ),
-    ),
-)
-TRM_CONSOLE_GROUPS = (
-    (
-        "loss",
-        (
-            "loss",
-            "blank_ce_loss",
-            "final_blank_ce_loss",
-            "halt_loss",
-        ),
-    ),
-    (
-        "halted",
-        (
-            "blank_cell_accuracy",
-            "target_probability",
-            "solved_rate",
-            "solved_count",
-            "halted_count",
-        ),
-    ),
-    (
-        "current",
-        (
-            "current_blank_cell_accuracy",
-            "current_target_probability",
-            "current_solved_rate",
-            "current_solved_count",
-        ),
-    ),
-    (
-        "final",
-        (
-            "final_blank_cell_accuracy",
-            "final_solved_rate",
-            "final_solved_count",
-        ),
-    ),
-    (
-        "path",
-        (
-            "path_precision",
-            "path_recall",
-            "path_f1",
-            "path_positive_rate",
-            "target_path_rate",
-            "final_path_precision",
-            "final_path_recall",
-            "final_path_f1",
-        ),
-    ),
-    (
-        "halt",
-        (
-            "halt_selected_step",
-            "oracle_step",
-            "act_step",
-            "halted_rate",
-            "reset_rate",
-            "halt_selected_blank_ce_loss",
-            "halt_selected_blank_cell_accuracy",
-            "halt_selected_solved_rate",
-            "halt_selected_solved_count",
-            "halt_selected_path_precision",
-            "halt_selected_path_recall",
-            "halt_selected_path_f1",
-        ),
-    ),
-    (
-        "dynamics",
-        (
-            "unroll_steps",
-            "terminal_belief_delta",
-            "terminal_belief_mse",
-        ),
-    ),
-)
-CONSOLE_GROUPS_BY_MODEL = {
-    "brc_sudoku": BRC_CONSOLE_GROUPS,
-    "trm": TRM_CONSOLE_GROUPS,
-}
-
-
-def format_scalar_metric(name: str, value: Any) -> str:
-    array = np.asarray(value)
-    scalar = float(array)
-    is_integer_like = np.isfinite(scalar) and np.isclose(scalar, round(scalar), atol=1e-6)
-    is_integer_dtype = np.issubdtype(array.dtype, np.integer)
-    if is_integer_dtype or name in INTEGER_SCALAR_METRICS or name.endswith(("_count", "_iters", "_steps")):
-        if is_integer_like:
-            return str(int(round(scalar)))
-    if scalar != 0.0 and abs(scalar) < 1e-3:
-        return f"{scalar:.2e}"
-    return f"{scalar:.4f}"
-
-
-def metric_display_name(name: str) -> str:
-    return METRIC_DISPLAY_NAMES.get(name, name)
-
-
-def scalar_metric_names(config: ExperimentConfig) -> tuple[str, ...]:
-    names = list(CORE_SCALAR_METRICS)
-    if config.train.terminal_residual_weight != 0.0:
-        names.extend(TERMINAL_DIAGNOSTIC_METRICS)
-    return tuple(names)
-
-
-def optional_scalar_log(
-    prefix: str,
-    metrics: dict[str, Any],
-    names: tuple[str, ...],
-    *,
-    exclude_history: set[str] | None = None,
-) -> dict[str, float]:
-    log: dict[str, float] = {}
-    excluded = exclude_history or set()
-    for name in names:
-        if name in excluded:
-            continue
-        if name in metrics:
-            value = metrics[name]
-            if np.ndim(np.asarray(value)) == 0:
-                log[f"{prefix}/{name}"] = float(value)
-    return log
-
-
-def optional_summary_log(prefix: str, metrics: dict[str, Any], names: set[str]) -> dict[str, float]:
-    log: dict[str, float] = {}
-    for name in names:
-        if name in metrics:
-            value = metrics[name]
-            if np.ndim(np.asarray(value)) == 0:
-                log[f"{prefix}/{name}"] = float(value)
-    return log
-
-
-def grouped_scalar_summary(metrics: dict[str, Any], names: tuple[str, ...], model_type: str | None = None) -> str:
-    allowed = set(names)
-    groups = CONSOLE_GROUPS_BY_MODEL.get(model_type or "", METRIC_GROUPS)
-    lines: list[str] = []
-    emitted: set[str] = set()
-    for group_name, group_metrics in groups:
-        parts = []
-        for name in group_metrics:
-            if name not in allowed or name not in metrics:
-                continue
-            value = metrics[name]
-            if np.ndim(np.asarray(value)) != 0:
-                continue
-            parts.append(f"{metric_display_name(name)}={format_scalar_metric(name, value)}")
-            emitted.add(name)
-        if parts:
-            lines.append(f"  {group_name}: " + " ".join(parts))
-
-    misc = []
-    for name in names:
-        if name in emitted or name not in metrics:
-            continue
-        value = metrics[name]
-        if np.ndim(np.asarray(value)) == 0:
-            misc.append(f"{metric_display_name(name)}={format_scalar_metric(name, value)}")
-    if misc:
-        lines.append("  misc: " + " ".join(misc))
-    return "\n".join(lines)
 
 
 def main() -> None:
@@ -1345,10 +887,6 @@ def main() -> None:
             if step % config.train.log_every == 0 or step == 1:
                 train_log = {
                     "train/loss": float(metrics["loss"]),
-                    "train/blank_ce_loss": float(metrics["blank_ce_loss"]),
-                    "train/final_blank_ce_loss": float(metrics["final_blank_ce_loss"]),
-                    "train/blank_cell_accuracy": float(metrics["blank_cell_accuracy"]),
-                    "train/solved_rate": float(metrics["solved_rate"]),
                     "train/learning_rate": schedule_learning_rate(config, step),
                 }
                 train_log.update(
@@ -1394,14 +932,7 @@ def main() -> None:
                     if wandb_run is not None:
                         eval_log = {
                             f"{prefix}/loss": eval_metrics["loss"],
-                            f"{prefix}/blank_ce_loss": eval_metrics["blank_ce_loss"],
-                            f"{prefix}/final_blank_ce_loss": eval_metrics["final_blank_ce_loss"],
-                            f"{prefix}/blank_cell_accuracy": eval_metrics["blank_cell_accuracy"],
-                            f"{prefix}/solved_rate": eval_metrics["solved_rate"],
                         }
-                        for metric_name in ("final_blank_cell_accuracy", "final_solved_rate"):
-                            if metric_name in eval_metrics:
-                                eval_log[f"{prefix}/{metric_name}"] = eval_metrics[metric_name]
                         eval_log.update(
                             optional_scalar_log(
                                 prefix,
@@ -1450,7 +981,6 @@ def main() -> None:
                     return eval_metrics
 
                 if ema_model is not None:
-                    run_eval_and_log(model, "eval/raw", "eval/raw", commit=False)
                     run_eval_and_log(ema_model, "eval/ema", "eval/ema", commit=True)
                 else:
                     run_eval_and_log(model, "eval", "eval", commit=True)

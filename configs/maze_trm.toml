@@ -3,9 +3,9 @@ dataset_path = "data/maze-30x30-hard-1k-aug"
 
 [task]
 type = "maze"
-supervision = "unknown_only"
+supervision = "full_grid"
 clamp_given = true
-path_loss_weight = 8.0
+path_loss_weight = 1.0
 
 [model]
 model_type = "trm"
@@ -15,6 +15,7 @@ grid_width = 30
 d_model = 512
 rollout_steps = 16
 dropout_rate = 0.05
+loss_type = "stablemax"
 
 [model.trm]
 # Official TRM naming: deep_recursion = H_cycles, latent_recursion = L_cycles,
@@ -25,14 +26,11 @@ block_layers = 2
 num_heads = 8
 mlp_ratio = 4
 mlp_t = false
-# Local deviation. Set false for official TRM.
-local_mixing = true
+local_mixing = false
 local_mixing_kernel = 3
-puzzle_emb_ndim = 512
-puzzle_emb_len = 16
-# Official TRM attention config defaults to "rope"; this config intentionally
-# uses 2D relative bias.
-position_encoding = "rel2d"
+puzzle_embed_ndim = 512
+puzzle_embed_len = 16
+position_encoding = "rope"
 rms_norm_eps = 1e-5
 halt_exploration_prob = 0.1
 # Matches official no_ACT_continue=True: halt uses one sigmoid logit, no continue Q loss.
@@ -45,14 +43,17 @@ step_loss_weights = [
 ]
 
 [optimizer]
+optimizer_type = "adam_atan2"
 learning_rate = 1e-4
+puzzle_embed_learning_rate = 1e-4
 lr_min_ratio = 1.0
 beta1 = 0.9
 beta2 = 0.95
 weight_decay = 1.0
+puzzle_embed_weight_decay = 1.0
 warmup_steps = 2000
 grad_clip_norm = 1.0
-flatten_optimizer = true
+flatten_optimizer = false
 
 [train]
 batch_size = 768
@@ -75,5 +76,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-trm-rel2d-standard-conv-act-masked-aug-b768-70k"
+name = "maze-trm-official-rope-act-stablemax-b768-70k"
 mode = "online"

@@ -1,265 +1,20 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
-from flax.training import orbax_utils
-from orbax.checkpoint import (
-    Checkpointer,
-    PyTreeCheckpointHandler,
-    args as ocp_args,
-)
 
-from lfrm.config import ExperimentConfig
 from lfrm.models import BRCSudokuModel, TinyRecursiveModel, UnifiedReasoningModel
-
-
-GridReasoningModel = BRCSudokuModel | TinyRecursiveModel | UnifiedReasoningModel
-
-
-def scale_by_adam_atan2(
-    *,
-    b1: float = 0.9,
-    b2: float = 0.95,
-    eps: float = 1e-8,
-) -> optax.GradientTransformation:
-    """Adam-style moments with atan2 normalization, matching URM's strong optimizer."""
-
-    def init_fn(params):
-        return optax.ScaleByAdamState(
-            count=jnp.zeros([], jnp.int32),
-            mu=jax.tree.map(jnp.zeros_like, params),
-            nu=jax.tree.map(jnp.zeros_like, params),
-        )
-
-    def update_fn(updates, state, params=None):
-        del params
-        count_inc = optax.safe_increment(state.count)
-        mu = optax.update_moment(updates, state.mu, b1, 1)
-        nu = optax.update_moment_per_elem_norm(updates, state.nu, b2, 2)
-        mu_hat = optax.bias_correction(mu, b1, count_inc)
-        nu_hat = optax.bias_correction(nu, b2, count_inc)
-        updates = jax.tree.map(
-            lambda m, v: jnp.arctan2(m, jnp.sqrt(v) + eps),
-            mu_hat,
-            nu_hat,
-        )
-        return updates, optax.ScaleByAdamState(count=count_inc, mu=mu, nu=nu)
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-def _scheduled_lr(
-    *,
-    peak_value: float,
-    min_ratio: float,
-    warmup_steps: int,
-    optimizer_steps: int,
-):
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=peak_value,
-        warmup_steps=warmup_steps,
-        decay_steps=max(optimizer_steps, warmup_steps + 1),
-        end_value=peak_value * min_ratio,
-    )
-    return lambda count: schedule(count + jnp.asarray(1, dtype=count.dtype))
-
-
-def _is_puzzle_embedding_path(path: tuple[object, ...]) -> bool:
-    return any(getattr(entry, "key", None) == "puzzle_embed" for entry in path)
-
-
-def _optimizer_param_labels(params):
-    return jax.tree_util.tree_map_with_path(
-        lambda path, _value: "puzzle_embed" if _is_puzzle_embedding_path(path) else "default",
-        params,
-    )
-
-
-def _adam_atan2_optimizer(config: ExperimentConfig, schedule) -> optax.GradientTransformation:
-    transforms: list[optax.GradientTransformation] = []
-    transforms.append(scale_by_adam_atan2(b1=config.optimizer.beta1, b2=config.optimizer.beta2))
-    if config.optimizer.weight_decay > 0.0:
-        transforms.append(optax.add_decayed_weights(config.optimizer.weight_decay))
-    transforms.extend((optax.scale_by_schedule(schedule), optax.scale(-1.0)))
-    return optax.chain(*transforms)
-
-
-def _default_optimizer(config: ExperimentConfig, schedule) -> optax.GradientTransformation:
-    transforms: list[optax.GradientTransformation] = []
-    if config.optimizer.grad_clip_norm > 0.0:
-        transforms.append(optax.clip_by_global_norm(config.optimizer.grad_clip_norm))
-    if config.optimizer.optimizer_type == "adamw":
-        transforms.append(
-            optax.adamw(
-                learning_rate=schedule,
-                b1=config.optimizer.beta1,
-                b2=config.optimizer.beta2,
-                weight_decay=config.optimizer.weight_decay,
-            )
-        )
-    elif config.optimizer.optimizer_type == "adam_atan2":
-        transforms.append(_adam_atan2_optimizer(config, schedule))
-    else:
-        raise ValueError(f"Unsupported optimizer_type: {config.optimizer.optimizer_type}")
-    return optax.chain(*transforms)
-
-
-def _puzzle_embedding_optimizer(config: ExperimentConfig, schedule) -> optax.GradientTransformation:
-    transforms: list[optax.GradientTransformation] = []
-    transforms.append(optax.scale_by_sign())
-    if config.optimizer.puzzle_emb_weight_decay > 0.0:
-        transforms.append(optax.add_decayed_weights(config.optimizer.puzzle_emb_weight_decay))
-    transforms.extend((optax.scale_by_schedule(schedule), optax.scale(-1.0)))
-    return optax.chain(*transforms)
-
-
-def build_optimizer(
-    config: ExperimentConfig,
-    model: GridReasoningModel | None = None,
-) -> optax.GradientTransformation:
-    optimizer_steps = max(1, config.train.max_steps)
-    warmup_steps = max(1, config.optimizer.warmup_steps)
-    schedule = _scheduled_lr(
-        peak_value=config.optimizer.learning_rate,
-        min_ratio=config.optimizer.lr_min_ratio,
-        warmup_steps=warmup_steps,
-        optimizer_steps=optimizer_steps,
-    )
-    default_optimizer = _default_optimizer(config, schedule)
-    if (
-        model is not None
-        and config.model.model_type == "urm"
-        and config.model.urm_config.puzzle_emb_len > 0
-        and config.optimizer.puzzle_emb_learning_rate > 0.0
-    ):
-        puzzle_schedule = _scheduled_lr(
-            peak_value=config.optimizer.puzzle_emb_learning_rate,
-            min_ratio=config.optimizer.lr_min_ratio,
-            warmup_steps=warmup_steps,
-            optimizer_steps=optimizer_steps,
-        )
-        optimizer = optax.multi_transform(
-            {
-                "default": default_optimizer,
-                "puzzle_embed": _puzzle_embedding_optimizer(config, puzzle_schedule),
-            },
-            _optimizer_param_labels,
-        )
-    else:
-        optimizer = default_optimizer
-    if config.optimizer.flatten_optimizer:
-        optimizer = optax.flatten(optimizer)
-    return optimizer
-
-
-def create_model(config: ExperimentConfig) -> GridReasoningModel:
-    if config.model.model_type == "trm":
-        return TinyRecursiveModel(
-            config.model,
-            config.runtime,
-            rngs=nnx.Rngs(config.train.seed),
-        )
-    if config.model.model_type == "brc_sudoku":
-        return BRCSudokuModel(
-            config.model,
-            config.runtime,
-            rngs=nnx.Rngs(config.train.seed),
-        )
-    if config.model.model_type == "urm":
-        return UnifiedReasoningModel(
-            config.model,
-            config.runtime,
-            rngs=nnx.Rngs(config.train.seed),
-        )
-    raise ValueError("Only model_type='trm', 'brc_sudoku', or 'urm' is supported")
-
-
-def create_optimizer(model: GridReasoningModel, config: ExperimentConfig) -> nnx.Optimizer:
-    return nnx.Optimizer(model, build_optimizer(config, model), wrt=nnx.Param)
-
-
-def create_ema_model(model: GridReasoningModel, config: ExperimentConfig) -> GridReasoningModel:
-    """Create an eval-only shadow model initialized from the current params."""
-    ema_model = create_model(config)
-    nnx.update(ema_model, nnx.state(model))
-    return ema_model
-
-
-def ema_param_filter(config: ExperimentConfig):
-    return nnx.Param
-
-
-def stablemax(logits: jax.Array, axis: int = -1) -> jax.Array:
-    negative_logits = jnp.where(logits < 0.0, logits, 0.0)
-    positive = jnp.where(logits >= 0.0, logits + 1.0, 1.0 / (1.0 - negative_logits))
-    return positive / jnp.sum(positive, axis=axis, keepdims=True)
-
-
-def stablemax_cross_entropy_with_integer_labels(logits: jax.Array, targets: jax.Array) -> jax.Array:
-    positive_logits = jnp.where(logits >= 0.0, logits, 0.0)
-    negative_logits = jnp.where(logits < 0.0, logits, 0.0)
-    log_positive = jnp.where(
-        logits >= 0.0,
-        jnp.log1p(positive_logits),
-        -jnp.log1p(-negative_logits),
-    )
-    log_normalizer = jax.nn.logsumexp(log_positive, axis=-1)
-    target_log_positive = jnp.take_along_axis(log_positive, targets[..., None], axis=-1).squeeze(-1)
-    return log_normalizer - target_log_positive
-
-
-def _token_cross_entropy(model: object, logits: jax.Array, targets: jax.Array) -> jax.Array:
-    loss_type = getattr(getattr(model, "config", None), "loss_type", "softmax")
-    if loss_type == "softmax":
-        return optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-    if loss_type == "stablemax":
-        return stablemax_cross_entropy_with_integer_labels(logits, targets)
-    raise ValueError(f"Unsupported loss_type: {loss_type}")
-
-
-def _target_probability(model: object, logits: jax.Array, targets: jax.Array) -> jax.Array:
-    loss_type = getattr(getattr(model, "config", None), "loss_type", "softmax")
-    if loss_type == "softmax":
-        probs = jax.nn.softmax(logits, axis=-1)
-    elif loss_type == "stablemax":
-        probs = stablemax(logits, axis=-1)
-    else:
-        raise ValueError(f"Unsupported loss_type: {loss_type}")
-    return jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
-
-
-def _masked_token_ce(logits: jax.Array, targets: jax.Array, mask: jax.Array) -> jax.Array:
-    mask_f32 = mask.astype(jnp.float32)
-    normalizer = jnp.maximum(jnp.sum(mask_f32), 1.0)
-    token_loss = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-    return jnp.sum(token_loss * mask_f32) / normalizer
-
-
-def _target_loss_weights(model: GridReasoningModel, targets: jax.Array) -> jax.Array:
-    if getattr(getattr(model, "config", None), "task_type", "sudoku") != "maze":
-        return jnp.asarray(1.0, dtype=jnp.float32)
-    path_weight = getattr(getattr(model, "config", None), "path_loss_weight", 1.0)
-    if path_weight == 1.0:
-        return jnp.asarray(1.0, dtype=jnp.float32)
-    return jnp.where(targets == 5, jnp.asarray(path_weight, dtype=jnp.float32), 1.0)
-
-
-def _loss_mask_from_given(model: object, given_mask: jax.Array) -> jax.Array:
-    supervision = getattr(getattr(model, "config", None), "supervision", "unknown_only")
-    if supervision == "unknown_only":
-        return (~given_mask).astype(jnp.float32)
-    if supervision == "full_grid":
-        return jnp.ones_like(given_mask, dtype=jnp.float32)
-    raise ValueError(f"Unsupported supervision mode: {supervision}")
-
-
-def _weighted_mask_normalizer(mask: jax.Array, weights: jax.Array) -> jax.Array:
-    return jnp.maximum(jnp.sum(mask.astype(jnp.float32) * weights.astype(jnp.float32)), 1.0)
+from lfrm.training.factory import GridReasoningModel
+from lfrm.training.losses import (
+    loss_mask_from_given,
+    masked_token_ce,
+    target_loss_weights,
+    target_probability as token_target_probability,
+    token_cross_entropy,
+    weighted_mask_normalizer,
+)
 
 
 def _path_metrics(predictions: jax.Array, targets: jax.Array, loss_mask: jax.Array) -> dict[str, jax.Array]:
@@ -454,9 +209,9 @@ def _sudoku_board_metrics(
     row_conflicts = jnp.sum(jnp.maximum(row_counts - 1.0, 0.0), axis=(1, 2))
     col_conflicts = jnp.sum(jnp.maximum(col_counts - 1.0, 0.0), axis=(1, 2))
     box_conflicts = jnp.sum(jnp.maximum(box_counts - 1.0, 0.0), axis=(1, 2))
-    conflict_count = jnp.mean(row_conflicts + col_conflicts + box_conflicts)
+    conflicts = jnp.mean(row_conflicts + col_conflicts + box_conflicts)
     invalid_rate = 1.0 - jnp.mean(unit_valid.astype(jnp.float32))
-    return given_consistency, invalid_rate, conflict_count
+    return given_consistency, invalid_rate, conflicts
 
 
 def _verifier_guided_latent_fit(
@@ -488,7 +243,7 @@ def _verifier_guided_latent_fit(
         )
         raw_final_logits_a = diagnostics_a["raw_final_logits"]
         probs_a = jax.nn.softmax(logits_a, axis=-1)
-        given_loss = _masked_token_ce(raw_final_logits_a, inputs, given_mask)
+        given_loss = masked_token_ce(model, raw_final_logits_a, inputs, given_mask)
         energy = jnp.mean(model.verifier_energy_from_probs(inputs, probs_a))
 
         final_logits_b, _ = model.run_diffusion(
@@ -608,7 +363,7 @@ def _brc_compact_training_rollout(
         raw_logits = model.lm_head(h_next.astype(model.dtype))
         next_belief = model._belief_update(inputs, belief_logits, raw_logits, step_index)
         logits = model._belief_to_token_logits(next_belief, inputs, step_index)
-        token_loss = _token_cross_entropy(model, logits, targets)
+        token_loss = token_cross_entropy(model, logits, targets)
         per_step_loss = jnp.sum(token_loss * loss_mask_f32) / loss_normalizer
         predictions = jnp.argmax(logits, axis=-1).astype(jnp.int32)
         early_candidate = jnp.where(step_index == early_index, predictions, early_candidate)
@@ -662,7 +417,7 @@ def _trm_step_loss_weights(model: GridReasoningModel, rollout_steps: int) -> jax
     return _normalized_step_loss_weights(getattr(recurrent_config, "step_loss_weights", None), rollout_steps)
 
 
-def _trm_halt_selected_step(halt_logits: jax.Array) -> jax.Array:
+def _trm_selected_step(halt_logits: jax.Array) -> jax.Array:
     step_halted = halt_logits > 0.0
     step_halted = step_halted.at[-1, :].set(True)
     return jnp.argmax(step_halted.astype(jnp.int32), axis=0)
@@ -684,7 +439,7 @@ def brc_loss_and_metrics(
         train=train,
     )
     given_mask = inputs != 1
-    loss_mask = _loss_mask_from_given(model, given_mask)
+    loss_mask = loss_mask_from_given(model, given_mask)
     brc = model.brc
     zero = jnp.asarray(0.0, dtype=jnp.float32)
 
@@ -734,18 +489,18 @@ def brc_loss_and_metrics(
         )
         step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
         step_loss_mask = loss_mask[None, :, :]
-        token_loss = _token_cross_entropy(model, step_logits, step_targets)
+        token_loss = token_cross_entropy(model, step_logits, step_targets)
         per_step_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=(1, 2)) / normalizer
         final_logits = step_logits[-1]
     step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
     step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
     solution_loss = per_step_loss[-1]
-    blanks_per_example = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
+    supervised_cells_per_example = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
 
     true_energy = zero
     fake_energy = zero
     verifier_loss = zero
-    verifier_ranking_accuracy = zero
+    verifier_accuracy = zero
     if brc.verifier_loss_weight != 0.0:
         random_fake = _corrupt_solution(model, inputs, targets, given_mask, verifier_key)
         if train:
@@ -767,7 +522,7 @@ def brc_loss_and_metrics(
         fake_normalizer = jnp.maximum(jnp.sum(fake_wrong_f32), 1.0)
         verifier_margin_loss = jax.nn.relu(brc.verifier_margin + true_energy_per_example[:, None] - fake_energy_all)
         verifier_loss = jnp.sum(verifier_margin_loss * fake_wrong_f32) / fake_normalizer
-        verifier_ranking_accuracy = (
+        verifier_accuracy = (
             jnp.sum((true_energy_per_example[:, None] < fake_energy_all).astype(jnp.float32) * fake_wrong_f32)
             / fake_normalizer
         )
@@ -793,7 +548,7 @@ def brc_loss_and_metrics(
             dropout_key=meta_key,
             return_final_only=True,
         )
-        meta_outer_loss = _masked_token_ce(meta_logits, targets, loss_mask)
+        meta_outer_loss = masked_token_ce(model, meta_logits, targets, loss_mask)
 
     loss = (
         step_ce_loss
@@ -803,31 +558,30 @@ def brc_loss_and_metrics(
 
     predictions = jnp.argmax(final_logits, axis=-1)
     correct = (predictions == targets).astype(jnp.float32) * loss_mask.astype(jnp.float32)
-    blank_cell_accuracy = jnp.sum(correct) / normalizer
+    cell_accuracy = jnp.sum(correct) / normalizer
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32), axis=-1), 1.0)
     correct_per_example = jnp.sum(correct, axis=-1)
-    solved_examples = jnp.where(
-        blanks_per_example > 0,
-        correct_per_example == blanks_per_example,
+    exact_examples = jnp.where(
+        supervised_cells_per_example > 0,
+        correct_per_example == supervised_cells_per_example,
         True,
     )
-    solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
-    solved_count = jnp.sum(solved_examples.astype(jnp.float32))
-    target_probability = _target_probability(model, final_logits, targets)
+    exact_accuracy = jnp.mean(exact_examples.astype(jnp.float32))
+    exact_count = jnp.sum(exact_examples.astype(jnp.float32))
+    target_probability = token_target_probability(model, final_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask.astype(jnp.float32)) / normalizer
     if train:
         oracle_step = jnp.argmin(per_step_loss)
     else:
         per_step_example_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=-1) / per_example_normalizer[None, :]
         oracle_step = jnp.mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32))
-    given_consistency, invalid_board_rate, conflict_count = _sudoku_board_metrics(model, predictions, inputs, given_mask)
+    given_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs, given_mask)
 
     metrics = {
         "loss": loss,
-        "blank_ce_loss": step_ce_loss,
-        "step_weighted_ce_loss": step_ce_loss,
-        "final_blank_ce_loss": solution_loss,
-        "mean_blank_ce_loss": jnp.mean(per_step_loss),
+        "lm_loss": step_ce_loss,
+        "final_lm_loss": solution_loss,
+        "mean_lm_loss": jnp.mean(per_step_loss),
         "latent_fit_loss": fit_metrics["latent_fit_loss"],
         "fit_given_loss": fit_metrics["fit_given_loss"],
         "fit_energy": fit_metrics["fit_energy"],
@@ -838,15 +592,15 @@ def brc_loss_and_metrics(
         "latent_step_norm": fit_metrics["latent_step_norm"],
         "meta_outer_loss": meta_outer_loss,
         "verifier_loss": verifier_loss,
-        "verifier_ranking_accuracy": verifier_ranking_accuracy,
-        "target_probability": target_probability,
-        "blank_cell_accuracy": blank_cell_accuracy,
-        "solved_rate": solved_rate,
-        "solved_count": solved_count,
+        "verifier_accuracy": verifier_accuracy,
+        "final_target_probability": target_probability,
+        "accuracy": cell_accuracy,
+        "exact_accuracy": exact_accuracy,
+        "exact_count": exact_count,
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "given_consistency": given_consistency,
-        "invalid_board_rate": invalid_board_rate,
-        "conflict_count": conflict_count,
+        "invalid_rate": invalid_rate,
+        "conflicts": conflicts,
         "belief_init_noise_rate": belief_init_noise_rate,
         "belief_init_uniform_rate": belief_init_uniform_rate,
         "belief_init_teacher_rate": belief_init_teacher_rate,
@@ -862,21 +616,6 @@ def brc_loss_and_metrics(
         "fake_energy": fake_energy,
     }
     return loss, metrics
-
-
-def build_ema_update_runner(decay: float, wrt=nnx.Param):
-    def update_ema_model(ema_model: GridReasoningModel, model: GridReasoningModel) -> None:
-        ema_params = nnx.state(ema_model, wrt)
-        model_params = nnx.state(model, wrt)
-        nnx.update(ema_model, nnx.state(model))
-        updated_params = jax.tree.map(
-            lambda ema, current: decay * ema + (1.0 - decay) * current,
-            ema_params,
-            model_params,
-        )
-        nnx.update(ema_model, updated_params)
-
-    return nnx.jit(update_ema_model)
 
 
 def loss_and_metrics(
@@ -899,10 +638,10 @@ def loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = _loss_mask_from_given(model, given_mask)
-    loss_weights = _target_loss_weights(model, targets)
+    loss_mask = loss_mask_from_given(model, given_mask)
+    loss_weights = target_loss_weights(model, targets)
     weighted_loss_mask = loss_mask * loss_weights
-    normalizer = _weighted_mask_normalizer(loss_mask, loss_weights)
+    normalizer = weighted_mask_normalizer(loss_mask, loss_weights)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
 
     model_key = dropout_key
@@ -929,33 +668,33 @@ def loss_and_metrics(
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = weighted_loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
-    token_loss = _token_cross_entropy(model, effective_step_logits, step_targets)
+    token_loss = token_cross_entropy(model, effective_step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
     per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
     per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
 
     rollout_steps = effective_step_logits.shape[0]
     step_weights = _trm_step_loss_weights(model, rollout_steps)
-    blank_ce_loss = jnp.sum(step_weights * per_step_loss)
-    blanks_per_example = jnp.sum(loss_mask, axis=-1)
+    lm_loss_value = jnp.sum(step_weights * per_step_loss)
+    supervised_cells_per_example = jnp.sum(loss_mask, axis=-1)
     step_predictions = jnp.argmax(effective_step_logits, axis=-1)
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * metric_step_loss_mask
     step_correct_per_example = jnp.sum(step_correct, axis=-1)
     per_step_example_solved = jnp.where(
-        blanks_per_example[None, :] > 0,
-        step_correct_per_example == blanks_per_example[None, :],
+        supervised_cells_per_example[None, :] > 0,
+        step_correct_per_example == supervised_cells_per_example[None, :],
         True,
     )
     halt_logits = diagnostics.get("halt_logits")
     halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
-    halt_selected_logits = effective_step_logits[-1]
-    halt_selected_step = jnp.full((inputs.shape[0],), effective_step_logits.shape[0] - 1, dtype=jnp.int32)
+    selected_logits = effective_step_logits[-1]
+    selected_step = jnp.full((inputs.shape[0],), effective_step_logits.shape[0] - 1, dtype=jnp.int32)
     if halt_logits is not None and halt_loss_weight != 0.0:
         halt_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
         halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(halt_logits, halt_targets))
-        halt_selected_step = _trm_halt_selected_step(halt_logits)
-        gather_index = halt_selected_step[None, :, None, None]
-        halt_selected_logits = jnp.take_along_axis(
+        selected_step = _trm_selected_step(halt_logits)
+        gather_index = selected_step[None, :, None, None]
+        selected_logits = jnp.take_along_axis(
             effective_step_logits,
             jnp.broadcast_to(gather_index, (1, inputs.shape[0], effective_step_logits.shape[2], effective_step_logits.shape[3])),
             axis=0,
@@ -965,58 +704,58 @@ def loss_and_metrics(
         diagnostics.get("terminal_belief_delta", jnp.asarray(0.0, dtype=jnp.float32)),
     )
     loss = (
-        blank_ce_loss
+        lm_loss_value
         + halt_loss_weight * halt_loss
         + terminal_residual_weight * terminal_residual
     )
 
     final_logits = effective_step_logits[-1]
     predictions = jnp.argmax(final_logits, axis=-1)
-    target_probability = _target_probability(model, final_logits, targets)
+    target_probability = token_target_probability(model, final_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
     correct = (predictions == targets).astype(jnp.float32) * loss_mask
-    blank_cell_accuracy = jnp.sum(correct) / metric_normalizer
+    cell_accuracy = jnp.sum(correct) / metric_normalizer
 
     correct_per_example = jnp.sum(correct, axis=-1)
-    solved_examples = jnp.where(
-        blanks_per_example > 0,
-        correct_per_example == blanks_per_example,
+    exact_examples = jnp.where(
+        supervised_cells_per_example > 0,
+        correct_per_example == supervised_cells_per_example,
         True,
     )
-    solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
-    solved_count = jnp.sum(solved_examples.astype(jnp.float32))
+    exact_accuracy = jnp.mean(exact_examples.astype(jnp.float32))
+    exact_count = jnp.sum(exact_examples.astype(jnp.float32))
     if halt_loss_weight != 0.0:
-        halt_selected_token_loss = _token_cross_entropy(model, halt_selected_logits, targets)
-        halt_selected_ce_loss = jnp.sum(halt_selected_token_loss * weighted_loss_mask) / normalizer
-        halt_selected_predictions = jnp.argmax(halt_selected_logits, axis=-1)
-        halt_selected_correct = (halt_selected_predictions == targets).astype(jnp.float32) * loss_mask
-        halt_selected_accuracy = jnp.sum(halt_selected_correct) / metric_normalizer
-        halt_selected_correct_per_example = jnp.sum(halt_selected_correct, axis=-1)
-        halt_selected_solved_examples = jnp.where(
-            blanks_per_example > 0,
-            halt_selected_correct_per_example == blanks_per_example,
+        selected_token_loss = token_cross_entropy(model, selected_logits, targets)
+        selected_ce_loss = jnp.sum(selected_token_loss * weighted_loss_mask) / normalizer
+        selected_predictions = jnp.argmax(selected_logits, axis=-1)
+        selected_correct = (selected_predictions == targets).astype(jnp.float32) * loss_mask
+        selected_accuracy = jnp.sum(selected_correct) / metric_normalizer
+        selected_correct_per_example = jnp.sum(selected_correct, axis=-1)
+        selected_exact_examples = jnp.where(
+            supervised_cells_per_example > 0,
+            selected_correct_per_example == supervised_cells_per_example,
             True,
         )
-        halt_selected_solved_rate = jnp.mean(halt_selected_solved_examples.astype(jnp.float32))
+        selected_exact_accuracy = jnp.mean(selected_exact_examples.astype(jnp.float32))
     else:
-        halt_selected_ce_loss = per_step_loss[-1]
-        halt_selected_accuracy = blank_cell_accuracy
-        halt_selected_solved_rate = solved_rate
+        selected_ce_loss = per_step_loss[-1]
+        selected_accuracy = cell_accuracy
+        selected_exact_accuracy = exact_accuracy
     oracle_step = jnp.argmin(per_step_example_loss, axis=0)
 
     metrics = {
         "loss": loss,
-        "blank_ce_loss": blank_ce_loss,
-        "step_weighted_ce_loss": blank_ce_loss,
+        "lm_loss": lm_loss_value,
         "halt_loss": halt_loss,
-        "final_blank_ce_loss": per_step_loss[-1],
-        "target_probability": target_probability,
-        "blank_cell_accuracy": blank_cell_accuracy,
-        "solved_rate": solved_rate,
-        "halt_selected_blank_ce_loss": halt_selected_ce_loss,
-        "halt_selected_blank_cell_accuracy": halt_selected_accuracy,
-        "halt_selected_solved_rate": halt_selected_solved_rate,
-        "halt_selected_step": jnp.mean(halt_selected_step.astype(jnp.float32) + 1.0),
+        "final_lm_loss": per_step_loss[-1],
+        "final_target_probability": target_probability,
+        "accuracy": cell_accuracy,
+        "exact_accuracy": exact_accuracy,
+        "exact_count": exact_count,
+        "selected_lm_loss": selected_ce_loss,
+        "selected_accuracy": selected_accuracy,
+        "selected_exact_accuracy": selected_exact_accuracy,
+        "selected_step": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
         "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_weights,
@@ -1024,10 +763,10 @@ def loss_and_metrics(
     }
     metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
     if halt_loss_weight != 0.0:
-        halt_path_metrics = _maybe_path_metrics(model, halt_selected_predictions, targets, loss_mask)
+        halt_path_metrics = _maybe_path_metrics(model, selected_predictions, targets, loss_mask)
         metrics.update(
             {
-                f"halt_selected_{key}": value
+                f"selected_{key}": value
                 for key, value in halt_path_metrics.items()
                 if key in ("path_precision", "path_recall", "path_f1")
             }
@@ -1049,10 +788,10 @@ def loss_and_metrics(
         "belief_entropy",
         "belief_confidence",
         "halt_loss",
-        "halt_selected_blank_ce_loss",
-        "halt_selected_blank_cell_accuracy",
-        "halt_selected_solved_rate",
-        "halt_selected_step",
+        "selected_lm_loss",
+        "selected_accuracy",
+        "selected_exact_accuracy",
+        "selected_step",
         "oracle_step",
     ):
         if key in diagnostics:
@@ -1078,49 +817,51 @@ def trm_act_loss_and_metrics(
     )
     targets = new_carry["current_labels"]
     given_mask = new_carry["current_given_mask"]
-    loss_mask = _loss_mask_from_given(model, given_mask)
-    loss_weights = _target_loss_weights(model, targets)
+    loss_mask = loss_mask_from_given(model, given_mask)
+    loss_weights = target_loss_weights(model, targets)
     weighted_loss_mask = loss_mask * loss_weights
-    normalizer = _weighted_mask_normalizer(loss_mask, loss_weights)
+    normalizer = weighted_mask_normalizer(loss_mask, loss_weights)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
     if _should_clamp_given(model):
         logits = _clamp_logits_to_given(logits, new_carry["current_inputs"], given_mask, model.config.vocab_size)
 
-    token_loss = _token_cross_entropy(model, logits, targets)
+    token_loss = token_cross_entropy(model, logits, targets)
     per_example_loss = jnp.sum(token_loss * weighted_loss_mask, axis=-1) / per_example_normalizer
-    blank_ce_loss = jnp.mean(per_example_loss)
+    lm_loss_value = jnp.mean(per_example_loss)
 
     predictions = jnp.argmax(logits, axis=-1)
     correct = (predictions == targets).astype(jnp.float32) * loss_mask
-    current_blank_cell_accuracy = jnp.sum(correct) / metric_normalizer
+    current_cell_accuracy = jnp.sum(correct) / metric_normalizer
     correct_per_example = jnp.sum(correct, axis=-1)
-    blanks_per_example = jnp.sum(loss_mask, axis=-1)
-    solved_examples = jnp.where(
-        blanks_per_example > 0,
-        correct_per_example == blanks_per_example,
+    supervised_cells_per_example = jnp.sum(loss_mask, axis=-1)
+    exact_examples = jnp.where(
+        supervised_cells_per_example > 0,
+        correct_per_example == supervised_cells_per_example,
         True,
     )
-    solved_targets = jax.lax.stop_gradient(solved_examples.astype(jnp.float32))
-    current_solved_rate = jnp.mean(solved_targets)
-    current_solved_count = jnp.sum(solved_targets)
-    valid_halted = new_carry["halted"] & (blanks_per_example > 0)
+    exact_targets = jax.lax.stop_gradient(exact_examples.astype(jnp.float32))
+    current_exact_accuracy = jnp.mean(exact_targets)
+    current_exact_count = jnp.sum(exact_targets)
+    valid_halted = new_carry["halted"] & (supervised_cells_per_example > 0)
     valid_halted_f32 = valid_halted.astype(jnp.float32)
     valid_halted_count = jnp.sum(valid_halted_f32)
     valid_halted_normalizer = jnp.maximum(valid_halted_count, 1.0)
-    per_example_accuracy = correct_per_example / jnp.maximum(blanks_per_example, 1.0)
-    blank_cell_accuracy = jnp.sum(per_example_accuracy * valid_halted_f32) / valid_halted_normalizer
-    solved_rate = jnp.sum(solved_targets * valid_halted_f32) / valid_halted_normalizer
-    solved_count = jnp.sum(solved_targets * valid_halted_f32)
+    per_example_accuracy = correct_per_example / jnp.maximum(supervised_cells_per_example, 1.0)
+    cell_accuracy = jnp.sum(per_example_accuracy * valid_halted_f32) / valid_halted_normalizer
+    exact_accuracy = jnp.sum(exact_targets * valid_halted_f32) / valid_halted_normalizer
+    exact_count = jnp.sum(exact_targets * valid_halted_f32)
+    q_halt_correct = ((diagnostics["halt_logits"] >= 0.0) == exact_examples) & valid_halted
+    q_halt_accuracy = jnp.sum(q_halt_correct.astype(jnp.float32)) / valid_halted_normalizer
+    steps = jnp.where(valid_halted_count > 0.0, diagnostics["act_step"], 0.0)
 
-    halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(diagnostics["halt_logits"], solved_targets))
-    loss = blank_ce_loss + halt_loss_weight * halt_loss
+    halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(diagnostics["halt_logits"], exact_targets))
+    loss = lm_loss_value + halt_loss_weight * halt_loss
 
-    target_probability = _target_probability(model, logits, targets)
-    current_target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
+    target_probability = token_target_probability(model, logits, targets)
     per_example_target_probability = (
         jnp.sum(target_probability * loss_mask, axis=-1)
-        / jnp.maximum(blanks_per_example, 1.0)
+        / jnp.maximum(supervised_cells_per_example, 1.0)
     )
     target_probability = (
         jnp.sum(per_example_target_probability * valid_halted_f32)
@@ -1128,17 +869,18 @@ def trm_act_loss_and_metrics(
     )
     metrics = {
         "loss": loss,
-        "blank_ce_loss": blank_ce_loss,
-        "final_blank_ce_loss": blank_ce_loss,
-        "target_probability": target_probability,
-        "blank_cell_accuracy": blank_cell_accuracy,
-        "solved_rate": solved_rate,
-        "solved_count": solved_count,
-        "halted_count": valid_halted_count,
-        "current_target_probability": current_target_probability,
-        "current_blank_cell_accuracy": current_blank_cell_accuracy,
-        "current_solved_rate": current_solved_rate,
-        "current_solved_count": current_solved_count,
+        "lm_loss": lm_loss_value,
+        "q_halt_loss": halt_loss,
+        "count": valid_halted_count,
+        "accuracy": cell_accuracy,
+        "exact_accuracy": exact_accuracy,
+        "q_halt_accuracy": q_halt_accuracy,
+        "steps": steps,
+        "final_lm_loss": lm_loss_value,
+        "halted_target_probability": target_probability,
+        "current_accuracy": current_cell_accuracy,
+        "current_exact_accuracy": current_exact_accuracy,
+        "current_exact_count": current_exact_count,
         "halt_loss": halt_loss,
         "act_step": diagnostics["act_step"],
         "halted_rate": diagnostics["halted_rate"],
@@ -1159,10 +901,10 @@ def trm_dense_unroll_loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = _loss_mask_from_given(model, given_mask)
-    loss_weights = _target_loss_weights(model, targets)
+    loss_mask = loss_mask_from_given(model, given_mask)
+    loss_weights = target_loss_weights(model, targets)
     weighted_loss_mask = loss_mask * loss_weights
-    normalizer = _weighted_mask_normalizer(loss_mask, loss_weights)
+    normalizer = weighted_mask_normalizer(loss_mask, loss_weights)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
 
@@ -1180,38 +922,38 @@ def trm_dense_unroll_loss_and_metrics(
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = weighted_loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
-    token_loss = _token_cross_entropy(model, step_logits, step_targets)
+    token_loss = token_cross_entropy(model, step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
     rollout_steps = per_step_loss.shape[0]
     step_weights = _trm_step_loss_weights(model, rollout_steps)
-    blank_ce_loss = jnp.sum(step_weights * per_step_loss)
-    mean_blank_ce_loss = jnp.mean(per_step_loss)
-    final_blank_ce_loss = per_step_loss[-1]
-    blanks_per_example = jnp.sum(loss_mask, axis=-1)
+    lm_loss_value = jnp.sum(step_weights * per_step_loss)
+    mean_lm_loss_value = jnp.mean(per_step_loss)
+    final_lm_loss_value = per_step_loss[-1]
+    supervised_cells_per_example = jnp.sum(loss_mask, axis=-1)
 
     step_predictions = jnp.argmax(step_logits, axis=-1)
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * metric_step_loss_mask
     per_step_accuracy = jnp.sum(step_correct, axis=(1, 2)) / metric_normalizer
     step_correct_per_example = jnp.sum(step_correct, axis=-1)
     per_step_example_solved = jnp.where(
-        blanks_per_example[None, :] > 0,
-        step_correct_per_example == blanks_per_example[None, :],
+        supervised_cells_per_example[None, :] > 0,
+        step_correct_per_example == supervised_cells_per_example[None, :],
         True,
     )
     final_logits = step_logits[-1]
     predictions = jnp.argmax(final_logits, axis=-1)
-    target_probability = _target_probability(model, final_logits, targets)
+    target_probability = token_target_probability(model, final_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
     correct = (predictions == targets).astype(jnp.float32) * loss_mask
-    blank_cell_accuracy = jnp.sum(correct) / metric_normalizer
+    cell_accuracy = jnp.sum(correct) / metric_normalizer
     correct_per_example = jnp.sum(correct, axis=-1)
-    solved_examples = jnp.where(
-        blanks_per_example > 0,
-        correct_per_example == blanks_per_example,
+    exact_examples = jnp.where(
+        supervised_cells_per_example > 0,
+        correct_per_example == supervised_cells_per_example,
         True,
     )
-    solved_rate = jnp.mean(solved_examples.astype(jnp.float32))
-    solved_count = jnp.sum(solved_examples.astype(jnp.float32))
+    exact_accuracy = jnp.mean(exact_examples.astype(jnp.float32))
+    exact_count = jnp.sum(exact_examples.astype(jnp.float32))
 
     halt_logits = diagnostics.get("halt_logits")
     halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
@@ -1219,21 +961,20 @@ def trm_dense_unroll_loss_and_metrics(
         halt_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
         halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(halt_logits, halt_targets))
 
-    loss = blank_ce_loss + halt_loss_weight * halt_loss
+    loss = lm_loss_value + halt_loss_weight * halt_loss
     oracle_step = jnp.argmin(
         jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :],
         axis=0,
     )
     metrics = {
         "loss": loss,
-        "blank_ce_loss": blank_ce_loss,
-        "step_weighted_ce_loss": blank_ce_loss,
-        "mean_blank_ce_loss": mean_blank_ce_loss,
-        "final_blank_ce_loss": final_blank_ce_loss,
-        "target_probability": target_probability,
-        "blank_cell_accuracy": blank_cell_accuracy,
-        "solved_rate": solved_rate,
-        "solved_count": solved_count,
+        "lm_loss": lm_loss_value,
+        "mean_lm_loss": mean_lm_loss_value,
+        "final_lm_loss": final_lm_loss_value,
+        "final_target_probability": target_probability,
+        "accuracy": cell_accuracy,
+        "exact_accuracy": exact_accuracy,
+        "exact_count": exact_count,
         "halt_loss": halt_loss,
         "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
         "per_step_loss": per_step_loss,
@@ -1255,10 +996,10 @@ def trm_eval_loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = _loss_mask_from_given(model, given_mask)
-    loss_weights = _target_loss_weights(model, targets)
+    loss_mask = loss_mask_from_given(model, given_mask)
+    loss_weights = target_loss_weights(model, targets)
     weighted_loss_mask = loss_mask * loss_weights
-    normalizer = _weighted_mask_normalizer(loss_mask, loss_weights)
+    normalizer = weighted_mask_normalizer(loss_mask, loss_weights)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
 
@@ -1276,7 +1017,7 @@ def trm_eval_loss_and_metrics(
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
     step_loss_mask = weighted_loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
-    token_loss = _token_cross_entropy(model, step_logits, step_targets)
+    token_loss = token_cross_entropy(model, step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
     per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
 
@@ -1284,69 +1025,76 @@ def trm_eval_loss_and_metrics(
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * metric_step_loss_mask
     per_step_accuracy = jnp.sum(step_correct, axis=(1, 2)) / metric_normalizer
     step_correct_per_example = jnp.sum(step_correct, axis=-1)
-    blanks_per_example = jnp.sum(loss_mask, axis=-1)
+    supervised_cells_per_example = jnp.sum(loss_mask, axis=-1)
     per_step_example_solved = jnp.where(
-        blanks_per_example[None, :] > 0,
-        step_correct_per_example == blanks_per_example[None, :],
+        supervised_cells_per_example[None, :] > 0,
+        step_correct_per_example == supervised_cells_per_example[None, :],
         True,
     )
     halt_logits = diagnostics["halt_logits"]
-    selected_step = _trm_halt_selected_step(halt_logits)
+    selected_step = _trm_selected_step(halt_logits)
     gather_index = selected_step[None, :, None, None]
     selected_logits = jnp.take_along_axis(
         step_logits,
         jnp.broadcast_to(gather_index, (1, inputs.shape[0], step_logits.shape[2], step_logits.shape[3])),
         axis=0,
     ).squeeze(0)
-    selected_token_loss = _token_cross_entropy(model, selected_logits, targets)
-    blank_ce_loss = jnp.sum(selected_token_loss * weighted_loss_mask) / normalizer
-    selected_solved_targets = jnp.take_along_axis(
+    selected_token_loss = token_cross_entropy(model, selected_logits, targets)
+    lm_loss_value = jnp.sum(selected_token_loss * weighted_loss_mask) / normalizer
+    selected_exact_targets = jnp.take_along_axis(
         per_step_example_solved.astype(jnp.float32),
         selected_step[None, :],
         axis=0,
     ).squeeze(0)
-    selected_solved_count = jnp.sum(selected_solved_targets)
+    selected_exact_count = jnp.sum(selected_exact_targets)
     halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(halt_logits, jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))))
-    loss = blank_ce_loss + halt_loss_weight * halt_loss
+    loss = lm_loss_value + halt_loss_weight * halt_loss
 
     predictions = jnp.argmax(selected_logits, axis=-1)
-    target_probability = _target_probability(model, selected_logits, targets)
+    target_probability = token_target_probability(model, selected_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
     correct = (predictions == targets).astype(jnp.float32) * loss_mask
-    blank_cell_accuracy = jnp.sum(correct) / metric_normalizer
-    solved_rate = jnp.mean(selected_solved_targets)
+    cell_accuracy = jnp.sum(correct) / metric_normalizer
+    exact_accuracy = jnp.mean(selected_exact_targets)
+    selected_q_halt_logits = jnp.take_along_axis(halt_logits, selected_step[None, :], axis=0).squeeze(0)
+    selected_q_halt_correct = (selected_q_halt_logits >= 0.0) == selected_exact_targets.astype(bool)
+    q_halt_accuracy = jnp.mean(selected_q_halt_correct.astype(jnp.float32))
     final_logits = step_logits[-1]
-    final_token_loss = _token_cross_entropy(model, final_logits, targets)
-    final_blank_ce_loss = jnp.sum(final_token_loss * weighted_loss_mask) / normalizer
+    final_token_loss = token_cross_entropy(model, final_logits, targets)
+    final_lm_loss_value = jnp.sum(final_token_loss * weighted_loss_mask) / normalizer
     final_predictions = jnp.argmax(final_logits, axis=-1)
     final_correct = (final_predictions == targets).astype(jnp.float32) * loss_mask
-    final_blank_cell_accuracy = jnp.sum(final_correct) / metric_normalizer
+    final_cell_accuracy = jnp.sum(final_correct) / metric_normalizer
     final_correct_per_example = jnp.sum(final_correct, axis=-1)
-    final_solved_examples = jnp.where(
-        blanks_per_example > 0,
-        final_correct_per_example == blanks_per_example,
+    final_exact_examples = jnp.where(
+        supervised_cells_per_example > 0,
+        final_correct_per_example == supervised_cells_per_example,
         True,
     )
-    final_solved_count = jnp.sum(final_solved_examples.astype(jnp.float32))
+    final_exact_count = jnp.sum(final_exact_examples.astype(jnp.float32))
     oracle_step = jnp.argmin(per_step_example_loss, axis=0)
     metrics = {
         "loss": loss,
-        "blank_ce_loss": blank_ce_loss,
+        "lm_loss": lm_loss_value,
+        "q_halt_loss": halt_loss,
+        "count": jnp.asarray(inputs.shape[0], dtype=jnp.float32),
+        "accuracy": cell_accuracy,
+        "exact_accuracy": exact_accuracy,
+        "q_halt_accuracy": q_halt_accuracy,
+        "steps": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
         "halt_loss": halt_loss,
-        "final_blank_ce_loss": final_blank_ce_loss,
-        "final_blank_cell_accuracy": final_blank_cell_accuracy,
-        "final_solved_rate": jnp.mean(final_solved_examples.astype(jnp.float32)),
-        "target_probability": target_probability,
-        "blank_cell_accuracy": blank_cell_accuracy,
-        "solved_rate": solved_rate,
-        "solved_count": selected_solved_count,
-        "halt_selected_blank_ce_loss": blank_ce_loss,
-        "halt_selected_blank_cell_accuracy": blank_cell_accuracy,
-        "halt_selected_solved_rate": solved_rate,
-        "halt_selected_solved_count": selected_solved_count,
-        "halt_selected_step": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
+        "final_lm_loss": final_lm_loss_value,
+        "final_accuracy": final_cell_accuracy,
+        "final_exact_accuracy": jnp.mean(final_exact_examples.astype(jnp.float32)),
+        "halted_target_probability": target_probability,
+        "exact_count": selected_exact_count,
+        "selected_lm_loss": lm_loss_value,
+        "selected_accuracy": cell_accuracy,
+        "selected_exact_accuracy": exact_accuracy,
+        "selected_exact_count": selected_exact_count,
+        "selected_step": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
         "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
-        "final_solved_count": final_solved_count,
+        "final_exact_count": final_exact_count,
         "per_step_loss": per_step_loss,
         "per_step_accuracy": per_step_accuracy,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
@@ -1357,7 +1105,7 @@ def trm_eval_loss_and_metrics(
     selected_path_metrics = _maybe_path_metrics(model, predictions, targets, loss_mask)
     metrics.update(
         {
-            f"halt_selected_{key}": value
+            f"selected_{key}": value
             for key, value in selected_path_metrics.items()
             if key in ("path_precision", "path_recall", "path_f1")
         }
@@ -1497,58 +1245,3 @@ def build_trm_eval_step_runner(halt_loss_weight: float = 0.5):
         return metrics
 
     return nnx.jit(eval_step)
-
-
-def save_checkpoint(
-    checkpoint_dir: str,
-    model: GridReasoningModel,
-    optimizer: nnx.Optimizer,
-    step: int,
-    *,
-    ema_model: GridReasoningModel | None = None,
-) -> None:
-    checkpointer = Checkpointer(PyTreeCheckpointHandler())
-    target_dir = Path(checkpoint_dir).resolve() / f"step_{step}"
-    payload = {
-        "model": nnx.state(model),
-        "optimizer": nnx.state(optimizer),
-        "step": step,
-        "uses_ema_model": ema_model is not None,
-    }
-    if ema_model is not None:
-        payload["ema_model"] = nnx.state(ema_model)
-    checkpointer.save(target_dir, payload, force=True)
-
-
-def load_checkpoint(
-    checkpoint_path: str | Path,
-    model: GridReasoningModel,
-    optimizer: nnx.Optimizer,
-    *,
-    ema_model: GridReasoningModel | None = None,
-) -> int:
-    checkpointer = Checkpointer(PyTreeCheckpointHandler())
-    restore_target = {
-        "model": nnx.state(model),
-        "optimizer": nnx.state(optimizer),
-        "step": 0,
-        "uses_ema_model": False,
-    }
-    if ema_model is not None:
-        restore_target["ema_model"] = nnx.state(ema_model)
-    payload = checkpointer.restore(
-        Path(checkpoint_path).resolve(),
-        args=ocp_args.PyTreeRestore(
-            item=restore_target,
-            restore_args=orbax_utils.restore_args_from_target(restore_target),
-            partial_restore=True,
-        ),
-    )
-    nnx.update(model, payload["model"])
-    nnx.update(optimizer, payload["optimizer"])
-    if ema_model is not None:
-        if "ema_model" in payload:
-            nnx.update(ema_model, payload["ema_model"])
-        else:
-            nnx.update(ema_model, payload["model"])
-    return int(payload["step"])

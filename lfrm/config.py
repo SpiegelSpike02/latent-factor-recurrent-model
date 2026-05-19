@@ -14,8 +14,8 @@ class TRMConfig:
     mlp_t: bool = False
     local_mixing: bool = False
     local_mixing_kernel: int = 3
-    puzzle_emb_ndim: int = 0
-    puzzle_emb_len: int = 16
+    puzzle_embed_ndim: int = 0
+    puzzle_embed_len: int = 16
     position_encoding: str = "none"
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
@@ -61,8 +61,8 @@ class URMConfig:
     num_heads: int = 8
     mlp_ratio: int = 4
     conv_kernel: int = 2
-    puzzle_emb_ndim: int = 512
-    puzzle_emb_len: int = 1
+    puzzle_embed_ndim: int = 512
+    puzzle_embed_len: int = 1
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     halt_exploration_prob: float = 0.1
@@ -105,12 +105,12 @@ class ModelConfig:
 class OptimizerConfig:
     optimizer_type: str = "adamw"
     learning_rate: float = 3e-4
-    puzzle_emb_learning_rate: float = 0.0
+    puzzle_embed_learning_rate: float = 0.0
     lr_min_ratio: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.999
     weight_decay: float = 0.1
-    puzzle_emb_weight_decay: float = 0.0
+    puzzle_embed_weight_decay: float = 0.0
     warmup_steps: int = 100
     grad_clip_norm: float = 1.0
     flatten_optimizer: bool = False

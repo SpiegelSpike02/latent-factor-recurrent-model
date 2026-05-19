@@ -1,0 +1,301 @@
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+
+
+def flatten_step_metrics(prefix: str, values: list[float]) -> dict[str, float]:
+    return {
+        f"{prefix}/step_{index + 1:02d}": float(value)
+        for index, value in enumerate(values)
+    }
+
+
+def format_step_summary(name: str, values: list[float]) -> str:
+    if not values:
+        return f"{name}=[]"
+    middle_index = len(values) // 2
+    return (
+        f"{name}="
+        f"first:{values[0]:.4f},"
+        f"mid:{values[middle_index]:.4f},"
+        f"last:{values[-1]:.4f}"
+    )
+
+
+CORE_SCALAR_METRICS = (
+    "loss",
+    "lm_loss",
+    "q_halt_loss",
+    "accuracy",
+    "exact_accuracy",
+    "q_halt_accuracy",
+    "steps",
+    "count",
+    "final_lm_loss",
+    "final_accuracy",
+    "final_exact_accuracy",
+    "mean_lm_loss",
+    "current_accuracy",
+    "current_exact_accuracy",
+    "halted_target_probability",
+    "final_target_probability",
+    "unroll_steps",
+    "belief_entropy",
+    "belief_confidence",
+    "latent_fit_loss",
+    "fit_given_loss",
+    "fit_energy",
+    "fit_consistency_loss",
+    "fit_prior_loss",
+    "latent_update_norm",
+    "latent_grad_norm",
+    "latent_step_norm",
+    "meta_outer_loss",
+    "verifier_loss",
+    "verifier_accuracy",
+    "given_consistency",
+    "invalid_rate",
+    "conflicts",
+    "diffusion_filled_ratio",
+    "brc_gate_mean",
+    "brc_gate_std",
+    "true_energy",
+    "fake_energy",
+    "belief_init_noise_rate",
+    "belief_init_uniform_rate",
+    "belief_init_teacher_rate",
+    "belief_init_corrupt_rate",
+    "belief_init_soft_rate",
+    "step_loss_weights",
+    "halt_loss",
+    "selected_lm_loss",
+    "selected_accuracy",
+    "selected_exact_accuracy",
+    "selected_step",
+    "oracle_step",
+    "act_step",
+    "halted_rate",
+    "reset_rate",
+    "exact_count",
+    "current_exact_count",
+    "selected_exact_count",
+    "final_exact_count",
+    "path_precision",
+    "path_recall",
+    "path_f1",
+    "path_positive_rate",
+    "target_path_rate",
+    "selected_path_precision",
+    "selected_path_recall",
+    "selected_path_f1",
+    "final_path_precision",
+    "final_path_recall",
+    "final_path_f1",
+)
+WANDB_HISTORY_EXCLUDED_SCALAR_METRICS = {
+    "verifier_accuracy",
+}
+TERMINAL_DIAGNOSTIC_METRICS = (
+    "terminal_belief_delta",
+    "terminal_belief_mse",
+)
+INTEGER_SCALAR_METRICS = {
+    "unroll_steps",
+    "count",
+    "exact_count",
+    "current_exact_count",
+    "selected_exact_count",
+    "final_exact_count",
+}
+LEGACY_METRIC_NAMES = {
+    "blank_ce_loss",
+    "final_blank_ce_loss",
+    "mean_blank_ce_loss",
+    "step_weighted_ce_loss",
+    "blank_cell_accuracy",
+    "solved_rate",
+    "solved_count",
+    "target_probability",
+    "current_target_probability",
+    "current_blank_cell_accuracy",
+    "current_solved_rate",
+    "current_solved_count",
+    "halted_count",
+    "halt_selected_blank_ce_loss",
+    "halt_selected_blank_cell_accuracy",
+    "halt_selected_solved_rate",
+    "halt_selected_solved_count",
+    "halt_selected_step",
+    "halt_selected_path_precision",
+    "halt_selected_path_recall",
+    "halt_selected_path_f1",
+    "final_blank_cell_accuracy",
+    "final_solved_rate",
+    "final_solved_count",
+    "invalid_board_rate",
+    "conflict_count",
+    "verifier_ranking_accuracy",
+}
+BRC_CONSOLE_GROUPS = (
+    ("objective", ("loss", "lm_loss", "final_lm_loss", "mean_lm_loss")),
+    (
+        "solve",
+        (
+            "accuracy",
+            "exact_accuracy",
+            "final_target_probability",
+            "exact_count",
+        ),
+    ),
+    (
+        "sudoku",
+        (
+            "given_consistency",
+            "invalid_rate",
+            "conflicts",
+        ),
+    ),
+    (
+        "verifier",
+        (
+            "verifier_loss",
+            "verifier_accuracy",
+            "true_energy",
+            "fake_energy",
+            "meta_outer_loss",
+        ),
+    ),
+    (
+        "belief",
+        (
+            "diffusion_filled_ratio",
+            "brc_gate_mean",
+            "belief_init_noise_rate",
+            "belief_init_uniform_rate",
+            "belief_init_teacher_rate",
+            "belief_init_corrupt_rate",
+            "belief_init_soft_rate",
+        ),
+    ),
+    (
+        "latent",
+        (
+            "latent_fit_loss",
+            "fit_energy",
+            "latent_update_norm",
+            "latent_grad_norm",
+        ),
+    ),
+)
+TRM_CONSOLE_GROUPS = (
+    ("objective", ("loss", "lm_loss", "q_halt_loss")),
+    ("official", ("accuracy", "exact_accuracy", "q_halt_accuracy", "steps", "count")),
+    ("current", ("current_accuracy", "current_exact_accuracy", "halted_target_probability", "reset_rate")),
+    ("final", ("final_lm_loss", "final_accuracy", "final_exact_accuracy")),
+    (
+        "path",
+        (
+            "path_precision",
+            "path_recall",
+            "path_f1",
+            "path_positive_rate",
+            "target_path_rate",
+            "final_path_precision",
+            "final_path_recall",
+            "final_path_f1",
+        ),
+    ),
+    ("halt", ("selected_step", "oracle_step", "act_step", "halted_rate", "selected_accuracy", "selected_exact_accuracy")),
+    ("dynamics", ("unroll_steps", "terminal_belief_delta", "terminal_belief_mse")),
+)
+METRIC_GROUPS = BRC_CONSOLE_GROUPS
+CONSOLE_GROUPS_BY_MODEL = {
+    "brc_sudoku": BRC_CONSOLE_GROUPS,
+    "trm": TRM_CONSOLE_GROUPS,
+    "urm": TRM_CONSOLE_GROUPS,
+}
+
+
+def assert_no_legacy_metrics(metrics: dict[str, Any]) -> None:
+    legacy = sorted(set(metrics) & LEGACY_METRIC_NAMES)
+    if legacy:
+        raise AssertionError(f"Legacy metric keys are no longer allowed: {legacy}")
+
+
+def format_scalar_metric(name: str, value: Any) -> str:
+    array = np.asarray(value)
+    scalar = float(array)
+    is_integer_like = np.isfinite(scalar) and np.isclose(scalar, round(scalar), atol=1e-6)
+    is_integer_dtype = np.issubdtype(array.dtype, np.integer)
+    if is_integer_dtype or name in INTEGER_SCALAR_METRICS or name.endswith(("_count", "_iters", "_steps")):
+        if is_integer_like:
+            return str(int(round(scalar)))
+    if scalar != 0.0 and abs(scalar) < 1e-3:
+        return f"{scalar:.2e}"
+    return f"{scalar:.4f}"
+
+
+def metric_display_name(name: str) -> str:
+    return name
+
+
+def scalar_metric_names(config) -> tuple[str, ...]:
+    names = list(CORE_SCALAR_METRICS)
+    if config.train.terminal_residual_weight != 0.0:
+        names.extend(TERMINAL_DIAGNOSTIC_METRICS)
+    return tuple(names)
+
+
+def optional_scalar_log(
+    prefix: str,
+    metrics: dict[str, Any],
+    names: tuple[str, ...],
+    *,
+    exclude_history: set[str] | None = None,
+) -> dict[str, float]:
+    assert_no_legacy_metrics(metrics)
+    log: dict[str, float] = {}
+    excluded = exclude_history or set()
+    for name in names:
+        if name in excluded:
+            continue
+        if name in metrics:
+            value = metrics[name]
+            if np.ndim(np.asarray(value)) == 0:
+                log[f"{prefix}/{name}"] = float(value)
+    return log
+
+
+def optional_summary_log(prefix: str, metrics: dict[str, Any], names: set[str]) -> dict[str, float]:
+    assert_no_legacy_metrics(metrics)
+    log: dict[str, float] = {}
+    for name in names:
+        if name in metrics:
+            value = metrics[name]
+            if np.ndim(np.asarray(value)) == 0:
+                log[f"{prefix}/{name}"] = float(value)
+    return log
+
+
+def grouped_scalar_summary(metrics: dict[str, Any], names: tuple[str, ...], model_type: str | None = None) -> str:
+    assert_no_legacy_metrics(metrics)
+    allowed = set(names)
+    groups = CONSOLE_GROUPS_BY_MODEL.get(model_type or "", METRIC_GROUPS)
+    lines: list[str] = []
+    emitted: set[str] = set()
+    for group_name, group_metrics in groups:
+        parts = []
+        for name in group_metrics:
+            if name not in allowed or name not in metrics:
+                continue
+            value = metrics[name]
+            if np.ndim(np.asarray(value)) != 0:
+                continue
+            parts.append(f"{metric_display_name(name)}={format_scalar_metric(name, value)}")
+            emitted.add(name)
+        if parts:
+            lines.append(f"  {group_name}: " + " ".join(parts))
+
+    return "\n".join(lines)

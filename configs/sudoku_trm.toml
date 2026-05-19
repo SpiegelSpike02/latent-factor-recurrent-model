@@ -3,7 +3,7 @@ dataset_path = "data/sudoku-extreme-1k-aug-1000"
 
 [task]
 type = "sudoku"
-supervision = "unknown_only"
+supervision = "full_grid"
 
 [model]
 model_type = "trm"
@@ -17,22 +17,19 @@ loss_type = "stablemax"
 
 [model.trm]
 # Official TRM naming: deep_recursion = H_cycles, latent_recursion = L_cycles,
-# block_layers = L_layers. Official Sudoku attention config uses 3/6/2.
+# block_layers = L_layers. Official Sudoku MLP-T config uses 3/6/2,
+# mlp_t=true, and position_encoding="none".
 deep_recursion = 3
 latent_recursion = 6
 block_layers = 2
 num_heads = 8
 mlp_ratio = 4
-mlp_t = false
-# Local deviation. Set false for official TRM.
-local_mixing = true
+mlp_t = true
+local_mixing = false
 local_mixing_kernel = 3
-puzzle_emb_ndim = 512
-puzzle_emb_len = 16
-# Official TRM attention config defaults to "rope"; this config intentionally
-# uses 2D relative bias. Official Sudoku MLP-T config uses mlp_t=true and
-# position_encoding="none".
-position_encoding = "rel2d"
+puzzle_embed_ndim = 512
+puzzle_embed_len = 16
+position_encoding = "none"
 rms_norm_eps = 1e-5
 halt_exploration_prob = 0.1
 # Matches official no_ACT_continue=True: halt uses one sigmoid logit, no continue Q loss.
@@ -45,14 +42,17 @@ step_loss_weights = [
 ]
 
 [optimizer]
+optimizer_type = "adam_atan2"
 learning_rate = 1e-4
+puzzle_embed_learning_rate = 1e-4
 lr_min_ratio = 1.0
 beta1 = 0.9
 beta2 = 0.95
 weight_decay = 1.0
+puzzle_embed_weight_decay = 1.0
 warmup_steps = 2000
 grad_clip_norm = 1.0
-flatten_optimizer = true
+flatten_optimizer = false
 
 [train]
 batch_size = 768
@@ -75,5 +75,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-trm-rel2d-standard-conv-act-stablemax-b768"
+name = "sudoku-trm-official-mlpt-act-stablemax-b768"
 mode = "online"

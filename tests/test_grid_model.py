@@ -26,7 +26,6 @@ from lfrm.config import (
 from lfrm.models import BRCSudokuModel, TinyRecursiveModel
 from lfrm.jax_defaults import apply_jax_defaults
 from lfrm.training import (
-    _clamp_logits_to_given,
     build_train_step_runner,
     build_trm_act_train_step_runner,
     create_model,
@@ -34,8 +33,10 @@ from lfrm.training import (
     load_checkpoint,
     loss_and_metrics,
     save_checkpoint,
+    stablemax_cross_entropy_with_integer_labels,
     trm_dense_unroll_loss_and_metrics,
 )
+from lfrm.training.steps import _clamp_logits_to_given
 
 
 class GridModelTests(unittest.TestCase):
@@ -51,9 +52,10 @@ class GridModelTests(unittest.TestCase):
             apply_jax_defaults()
             self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "true")
             self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.80")
-            self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "cuda_malloc_async")
+            self.assertNotIn("TF_GPU_ALLOCATOR", os.environ)
             self.assertIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
+            self.assertIn("--xla_gpu_enable_latency_hiding_scheduler=true", os.environ["XLA_FLAGS"].split())
 
     def test_solved_rate_metric(self) -> None:
         class FixedModel:
@@ -73,8 +75,8 @@ class GridModelTests(unittest.TestCase):
             "given_mask": jnp.asarray([[False, False, True, True], [False, False, True, True]], dtype=bool),
         }
         _, metrics = loss_and_metrics(FixedModel(), batch, False, None)
-        self.assertAlmostEqual(float(metrics["blank_cell_accuracy"]), 0.75, places=6)
-        self.assertAlmostEqual(float(metrics["solved_rate"]), 0.5, places=6)
+        self.assertAlmostEqual(float(metrics["accuracy"]), 0.75, places=6)
+        self.assertAlmostEqual(float(metrics["exact_accuracy"]), 0.5, places=6)
 
     def test_create_model_supports_trm_and_brc(self) -> None:
         trm_config = ExperimentConfig(
@@ -124,6 +126,17 @@ class GridModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "brc_sudoku"):
             create_model(invalid)
 
+    def test_stablemax_forward_backward_are_finite(self) -> None:
+        logits = jnp.asarray([[100.0, -100.0, 0.0], [-2.0, 3.0, 0.5]], dtype=jnp.float32)
+        targets = jnp.asarray([0, 1], dtype=jnp.int32)
+
+        def objective(x):
+            return jnp.mean(stablemax_cross_entropy_with_integer_labels(x, targets))
+
+        loss, grad = jax.value_and_grad(objective)(logits)
+        self.assertTrue(bool(jnp.isfinite(loss)))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
+
     def test_trm_forward_and_losses_are_finite(self) -> None:
         model = TinyRecursiveModel(
             ModelConfig(
@@ -157,7 +170,7 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(diagnostics["halt_logits"].shape, (2, 1))
         self.assertEqual(diagnostics["hidden_delta_mean"].shape, (2,))
         _, metrics = loss_and_metrics(model, batch, True, jax.random.key(2), halt_loss_weight=0.1)
-        for key in ("loss", "halt_loss", "halt_selected_blank_ce_loss", "blank_cell_accuracy"):
+        for key in ("loss", "halt_loss", "selected_lm_loss", "accuracy"):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
         dense_loss, dense_metrics = trm_dense_unroll_loss_and_metrics(
@@ -166,13 +179,13 @@ class GridModelTests(unittest.TestCase):
             True,
             jax.random.key(3),
         )
-        self.assertIn("step_weighted_ce_loss", dense_metrics)
+        self.assertIn("lm_loss", dense_metrics)
         self.assertIn("step_loss_weights", dense_metrics)
         self.assertEqual(dense_metrics["step_loss_weights"].shape, (2,))
-        self.assertTrue(bool(jnp.isfinite(dense_metrics["step_weighted_ce_loss"])))
+        self.assertTrue(bool(jnp.isfinite(dense_metrics["lm_loss"])))
         self.assertAlmostEqual(
             float(dense_loss),
-            float(dense_metrics["step_weighted_ce_loss"]),
+            float(dense_metrics["lm_loss"]),
             places=5,
         )
 
@@ -274,12 +287,24 @@ class GridModelTests(unittest.TestCase):
             True,
             jax.random.key(33),
         )
-        for key in (
-            "loss",
+        legacy_keys = {
             "blank_ce_loss",
             "step_weighted_ce_loss",
             "final_blank_ce_loss",
             "mean_blank_ce_loss",
+            "blank_cell_accuracy",
+            "solved_rate",
+            "solved_count",
+            "verifier_ranking_accuracy",
+            "invalid_board_rate",
+            "conflict_count",
+        }
+        self.assertFalse(legacy_keys & set(metrics))
+        for key in (
+            "loss",
+            "lm_loss",
+            "final_lm_loss",
+            "mean_lm_loss",
             "latent_fit_loss",
             "fit_given_loss",
             "fit_energy",
@@ -290,10 +315,10 @@ class GridModelTests(unittest.TestCase):
             "latent_step_norm",
             "meta_outer_loss",
             "verifier_loss",
-            "verifier_ranking_accuracy",
+            "verifier_accuracy",
             "given_consistency",
-            "invalid_board_rate",
-            "conflict_count",
+            "invalid_rate",
+            "conflicts",
             "belief_init_noise_rate",
             "belief_init_uniform_rate",
             "belief_init_teacher_rate",
@@ -397,7 +422,7 @@ class GridModelTests(unittest.TestCase):
                 block_layers=1,
                     num_heads=3,
                     mlp_ratio=2,
-                    puzzle_emb_len=0,
+                    puzzle_embed_len=0,
                     position_encoding="rel2d",
                 ),
             ),
@@ -434,7 +459,7 @@ class GridModelTests(unittest.TestCase):
                 block_layers=1,
                     num_heads=3,
                     mlp_ratio=2,
-                    puzzle_emb_len=0,
+                    puzzle_embed_len=0,
                     position_encoding="rel2d",
                     local_mixing=True,
                     local_mixing_kernel=3,
@@ -492,12 +517,15 @@ class GridModelTests(unittest.TestCase):
                 trm=TRMConfig(
                 deep_recursion=1,
                 latent_recursion=1,
-                block_layers=1, num_heads=3, mlp_ratio=2, puzzle_emb_len=2),
+                block_layers=1, num_heads=3, mlp_ratio=2, puzzle_embed_len=2),
             ),
             optimizer=OptimizerConfig(
+                optimizer_type="adam_atan2",
                 learning_rate=1e-4,
+                puzzle_embed_learning_rate=1e-4,
                 lr_min_ratio=1.0,
                 weight_decay=1.0,
+                puzzle_embed_weight_decay=1.0,
                 warmup_steps=1,
             ),
             train=TrainConfig(batch_size=2, max_steps=2, halt_loss_weight=0.5),
@@ -526,7 +554,7 @@ class GridModelTests(unittest.TestCase):
             ),
             "puzzle_identifiers": jnp.asarray([0, 0], dtype=jnp.int32),
         }
-        before = model.puzzle_emb.weights[...]
+        before = model.puzzle_embed.weights[...]
         metrics, _carry = train_step(
             model,
             optimizer,
@@ -534,7 +562,7 @@ class GridModelTests(unittest.TestCase):
             batch,
             jax.random.key(0),
         )
-        after = model.puzzle_emb.weights[...]
+        after = model.puzzle_embed.weights[...]
 
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
         self.assertGreater(float(jnp.sum(jnp.abs(after - before))), 0.0)
@@ -556,8 +584,8 @@ class GridModelTests(unittest.TestCase):
                 block_layers=1,
                     num_heads=3,
                     mlp_ratio=2,
-                    puzzle_emb_ndim=12,
-                    puzzle_emb_len=2,
+                    puzzle_embed_ndim=12,
+                    puzzle_embed_len=2,
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -565,7 +593,7 @@ class GridModelTests(unittest.TestCase):
         )
         params = nnx.state(model, nnx.Param)
         self.assertEqual(model.prefix_len, 2)
-        self.assertEqual(model.puzzle_emb.weights[...].shape, (5, 12))
+        self.assertEqual(model.puzzle_embed.weights[...].shape, (5, 12))
         self.assertNotIn("state_init", str(params))
 
     def test_halt_selected_metrics_use_first_positive_halt_step(self) -> None:
@@ -589,9 +617,9 @@ class GridModelTests(unittest.TestCase):
             "given_mask": jnp.asarray([[False, False, True, True]], dtype=bool),
         }
         _, metrics = loss_and_metrics(HaltSelectedModel(), batch, False, None, halt_loss_weight=0.1)
-        self.assertAlmostEqual(float(metrics["blank_cell_accuracy"]), 1.0, places=6)
-        self.assertAlmostEqual(float(metrics["halt_selected_blank_cell_accuracy"]), 0.5, places=6)
-        self.assertAlmostEqual(float(metrics["halt_selected_step"]), 1.0, places=6)
+        self.assertAlmostEqual(float(metrics["accuracy"]), 1.0, places=6)
+        self.assertAlmostEqual(float(metrics["selected_accuracy"]), 0.5, places=6)
+        self.assertAlmostEqual(float(metrics["selected_step"]), 1.0, places=6)
 
     def test_clamp_logits_to_given_uses_given_mask_not_blank_id(self) -> None:
         logits = jnp.zeros((2, 1, 4, 6), dtype=jnp.float32)
