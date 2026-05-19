@@ -104,7 +104,14 @@ ALLOWED_SECTION_KEYS = {
         "checkpoint_dir",
         "ema",
     },
-    "runtime": {"compute_dtype", "data_parallel_devices"},
+    "runtime": {
+        "compute_dtype",
+        "data_parallel_devices",
+        "profile_enabled",
+        "profile_start_step",
+        "profile_steps",
+        "profile_dir",
+    },
     "wandb": {"enabled", "project", "entity", "name", "mode"},
 }
 ALLOWED_NESTED_KEYS = {
@@ -339,6 +346,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Number of local devices for data parallelism. Use 0 for all visible devices.",
     )
+    parser.add_argument("--profile-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--profile-start-step",
+        type=int,
+        default=20,
+        help="Optimizer step at which to start the default JAX profiler trace.",
+    )
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=20,
+        help="Number of optimizer steps to capture in the default JAX profiler trace.",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default="profile",
+        help="Profile directory relative to the checkpoint run directory, or an absolute path.",
+    )
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument(
         "--resume-from",
@@ -471,6 +497,10 @@ def build_config(
     runtime = RuntimeConfig(
         compute_dtype=args.compute_dtype,
         data_parallel_devices=args.data_parallel_devices,
+        profile_enabled=args.profile_enabled,
+        profile_start_step=args.profile_start_step,
+        profile_steps=args.profile_steps,
+        profile_dir=args.profile_dir,
     )
     wandb = WandbConfig(
         enabled=args.wandb_enabled,
@@ -615,6 +645,39 @@ def init_wandb(config: ExperimentConfig, *, run_dir: Path, resume_run_id: str | 
     wandb_run_id_path(run_dir).write_text(run.id + "\n", encoding="utf-8")
     wandb.config.update({"checkpoint_dir": str(run_dir)}, allow_val_change=True)
     return run
+
+
+def resolve_profile_dir(config: ExperimentConfig, checkpoint_dir: Path) -> Path:
+    profile_dir = Path(config.runtime.profile_dir)
+    if profile_dir.is_absolute():
+        return profile_dir
+    return checkpoint_dir / profile_dir
+
+
+def patch_wandb_tensorboard(wandb_run, profile_dir: Path) -> None:
+    if wandb_run is None:
+        return
+    with suppress(Exception):
+        import wandb
+
+        wandb.tensorboard.patch(root_logdir=str(profile_dir), save=True)
+
+
+def upload_wandb_profile(wandb_run, profile_dir: Path, *, step: int) -> None:
+    if wandb_run is None or not profile_dir.exists():
+        return
+    with suppress(Exception):
+        import wandb
+
+        artifact = wandb.Artifact(
+            name=f"{wandb_run.id}-jax-profile-step-{step}",
+            type="jax-profile",
+            metadata={"step": step, "profile_dir": str(profile_dir)},
+        )
+        artifact.add_dir(str(profile_dir))
+        wandb_run.log_artifact(artifact)
+    with suppress(Exception):
+        wandb_run.save(str(profile_dir / "**" / "*"), base_path=str(profile_dir.parent), policy="now")
 
 
 def sample_device_batch(
@@ -813,6 +876,11 @@ def main() -> None:
         raise ValueError("eval_epochs must be positive")
     if config.optimizer.lr_warmup_steps <= 0:
         raise ValueError("lr_warmup_steps must be positive")
+    if config.runtime.profile_enabled:
+        if config.runtime.profile_start_step <= 0:
+            raise ValueError("profile_start_step must be positive when profiling is enabled")
+        if config.runtime.profile_steps <= 0:
+            raise ValueError("profile_steps must be positive when profiling is enabled")
     if config.model.model_type not in ("trm", "urm") and config.train.trm_train_mode != "act":
         raise ValueError("trm_train_mode is only supported for model_type='trm' or 'urm'")
     mesh = data_parallel_mesh(config)
@@ -840,6 +908,10 @@ def main() -> None:
         checkpoint_dir = build_run_checkpoint_dir(args.config, config.train.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     wandb_run = init_wandb(config, run_dir=checkpoint_dir, resume_run_id=resume_run_id)
+    profile_dir = resolve_profile_dir(config, checkpoint_dir)
+    if config.runtime.profile_enabled:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        patch_wandb_tensorboard(wandb_run, profile_dir)
 
     model = create_model(config)
     optimizer = create_optimizer(model, config)
@@ -911,6 +983,10 @@ def main() -> None:
         "resume_step=", resume_step,
         "data_parallel_devices=", data_parallel_size,
         "data_sharding=", data_sharding,
+        "profile_enabled=", config.runtime.profile_enabled,
+        "profile_start_step=", config.runtime.profile_start_step,
+        "profile_steps=", config.runtime.profile_steps,
+        "profile_dir=", profile_dir if config.runtime.profile_enabled else None,
         "XLA_PYTHON_CLIENT_PREALLOCATE=", os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE"),
         "XLA_PYTHON_CLIENT_MEM_FRACTION=", os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION"),
         "XLA_PYTHON_CLIENT_ALLOCATOR=", os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR"),
@@ -941,9 +1017,23 @@ def main() -> None:
         else None
     )
     eval_interval = eval_interval_updates(config)
+    profile_active = False
+    profile_finished = False
+    profile_stop_step = config.runtime.profile_start_step + config.runtime.profile_steps - 1
+    last_step = resume_step
 
     try:
         for step in range(resume_step + 1, config.train.optimizer_updates + 1):
+            last_step = step
+            if (
+                config.runtime.profile_enabled
+                and not profile_active
+                and not profile_finished
+                and step >= config.runtime.profile_start_step
+            ):
+                print(f"[profile] start step={step} dir={profile_dir}", flush=True)
+                jax.profiler.start_trace(str(profile_dir))
+                profile_active = True
             is_eval_step = step % eval_interval == 0 or step == config.train.optimizer_updates
             metrics = None
             for microbatch_index in range(config.train.gradient_accumulation_steps):
@@ -1076,7 +1166,18 @@ def main() -> None:
                 else:
                     run_eval_and_log(model, "eval", "eval", commit=True)
                 save_checkpoint(str(checkpoint_dir), model, optimizer, step, ema_model=ema_model)
+            if profile_active and step >= profile_stop_step:
+                jax.profiler.stop_trace()
+                profile_active = False
+                profile_finished = True
+                print(f"[profile] stop step={step} dir={profile_dir}", flush=True)
+                upload_wandb_profile(wandb_run, profile_dir, step=step)
     finally:
+        if profile_active:
+            with suppress(Exception):
+                jax.profiler.stop_trace()
+            with suppress(Exception):
+                upload_wandb_profile(wandb_run, profile_dir, step=last_step)
         with suppress(Exception):
             prefetcher.close()
 

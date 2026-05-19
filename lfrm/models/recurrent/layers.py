@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import jax
 import jax.numpy as jnp
@@ -37,16 +38,28 @@ def dot_product_attention(
     """Scaled dot-product attention in JAX's fused-friendly layout.
 
     Inputs and output use the public JAX SDPA layout `(batch, seq, heads,
-    head_dim)`. JAX chooses the best supported implementation for the active
-    backend, falling back to XLA when cuDNN fused attention is not applicable.
+    head_dim)`. Attention defaults to cuDNN fused attention because XLA's auto
+    choice can still lower to explicit dot/softmax on some JAX/CUDA stacks. Set
+    `LFRM_ATTENTION_IMPLEMENTATION=auto|cudnn|xla` to override this selection.
     """
     attention_bias = None if bias is None else bias[None, :, :, :].astype(jnp.float32)
+    requested = os.environ.get("LFRM_ATTENTION_IMPLEMENTATION", "cudnn").strip().lower()
+    implementation: str | None
+    if requested in ("", "auto", "none"):
+        implementation = "cudnn" if attention_bias is None and jax.default_backend() == "gpu" else None
+    elif requested in ("cudnn", "xla"):
+        implementation = requested
+    else:
+        raise ValueError(
+            "LFRM_ATTENTION_IMPLEMENTATION must be one of auto, cudnn, or xla; "
+            f"got {requested!r}"
+        )
     return jax.nn.dot_product_attention(
         query,
         key,
         value,
         bias=attention_bias,
-        implementation=None,
+        implementation=implementation,
     )
 
 

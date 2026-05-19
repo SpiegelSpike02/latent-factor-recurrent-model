@@ -104,6 +104,14 @@ set `LFRM_RESPECT_EXTERNAL_JAX_ENV=true` to preserve externally supplied JAX
 memory settings. Experimental XLA flags are not enabled by default because
 unsupported flags are fatal at process startup; append local experiments with
 `LFRM_EXTRA_XLA_FLAGS="--flag=value"` when testing a specific `jaxlib` build.
+TRM/URM attention uses JAX SDPA with cuDNN fused attention by default. Override
+with `LFRM_ATTENTION_IMPLEMENTATION=auto|cudnn|xla`; `auto` uses cuDNN for GPU
+no-bias attention and keeps rel2d/bias attention on JAX's default lowering.
+Training also captures a short JAX profiler window by default (`runtime.profile_start_step=20`,
+`runtime.profile_steps=20`) into the run checkpoint directory under `profile/`.
+When WandB is enabled, the TensorBoard profile directory is patched and uploaded
+as a `jax-profile` artifact. Disable with `--no-profile-enabled` or
+`profile_enabled = false` under `[runtime]`.
 
 ## Notes
 
