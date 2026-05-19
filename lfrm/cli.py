@@ -841,6 +841,11 @@ def main() -> None:
         "checkpoint_dir=", checkpoint_dir,
         "resume_checkpoint=", resume_checkpoint,
         "resume_step=", resume_step,
+        "XLA_PYTHON_CLIENT_PREALLOCATE=", os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE"),
+        "XLA_PYTHON_CLIENT_MEM_FRACTION=", os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION"),
+        "XLA_PYTHON_CLIENT_ALLOCATOR=", os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR"),
+        "TF_GPU_ALLOCATOR=", os.environ.get("TF_GPU_ALLOCATOR"),
+        "XLA_FLAGS=", os.environ.get("XLA_FLAGS"),
     )
 
     def sample_train_batch():

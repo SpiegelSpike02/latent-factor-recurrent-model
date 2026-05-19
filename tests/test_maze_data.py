@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from lfrm.datasets import build_maze_dataset, load_dataset, sample_batch
+from lfrm.datasets.maze import _maze_transforms
 from lfrm.scripts.build_maze_dataset import build_parser
 
 
@@ -61,6 +62,31 @@ class MazeDatasetTests(unittest.TestCase):
             self.assertEqual(batch["labels"].shape, (2, 9))
             self.assertEqual(batch["given_mask"].shape, (2, 9))
             self.assertEqual(batch["puzzle_identifiers"].shape, (2,))
+
+    def test_maze_transforms_match_official_dihedral_order(self) -> None:
+        grid = np.arange(9).reshape(3, 3)
+        transforms = _maze_transforms(grid)
+        self.assertEqual(len(transforms), 8)
+        np.testing.assert_array_equal(transforms[0], grid)
+        np.testing.assert_array_equal(transforms[1], np.rot90(grid, 1))
+        np.testing.assert_array_equal(transforms[2], np.rot90(grid, 2))
+        np.testing.assert_array_equal(transforms[3], np.rot90(grid, 3))
+        np.testing.assert_array_equal(transforms[4], np.fliplr(grid))
+        np.testing.assert_array_equal(transforms[5], np.flipud(grid))
+        np.testing.assert_array_equal(transforms[6], grid.T)
+        np.testing.assert_array_equal(transforms[7], np.fliplr(np.rot90(grid, 1)))
+        self.assertEqual({tuple(transform.reshape(-1)) for transform in transforms}, {
+            tuple(transform.reshape(-1)) for transform in (
+                grid,
+                np.rot90(grid, 1),
+                np.rot90(grid, 2),
+                np.rot90(grid, 3),
+                np.fliplr(grid),
+                np.flipud(grid),
+                grid.T,
+                np.fliplr(np.rot90(grid, 1)),
+            )
+        })
 
     def test_build_maze_parser_exposes_progress_every(self) -> None:
         parser = build_parser()

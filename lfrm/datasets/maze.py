@@ -84,7 +84,7 @@ def _maze_transforms(grid: np.ndarray) -> tuple[np.ndarray, ...]:
         np.fliplr(grid),
         np.flipud(grid),
         np.transpose(grid),
-        np.fliplr(np.transpose(grid)),
+        np.fliplr(np.rot90(grid, 1)),
     )
 
 
