@@ -51,6 +51,7 @@ class GridModelTests(unittest.TestCase):
                 "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.80",
                 "XLA_PYTHON_CLIENT_ALLOCATOR": "platform",
                 "XLA_FLAGS": "--some_existing_flag=true",
+                "LFRM_EXTRA_XLA_FLAGS": "--xla_gpu_experimental_flag_for_test=true",
             },
             clear=True,
         ):
@@ -63,6 +64,7 @@ class GridModelTests(unittest.TestCase):
             self.assertIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_enable_latency_hiding_scheduler=true", os.environ["XLA_FLAGS"].split())
+            self.assertIn("--xla_gpu_experimental_flag_for_test=true", os.environ["XLA_FLAGS"].split())
 
     def test_jax_defaults_can_respect_external_env(self) -> None:
         with mock.patch.dict(
@@ -585,7 +587,7 @@ class GridModelTests(unittest.TestCase):
         )
         model = create_model(config)
         optimizer = create_optimizer(model, config)
-        train_step = build_trm_act_train_step_runner(config.train.halt_loss_weight)
+        train_step = build_trm_act_train_step_runner(config, config.train.halt_loss_weight)
         batch = {
             "inputs": jnp.asarray(
                 [[2, 1, 3, 1, 1, 4, 1, 5, 1], [3, 1, 2, 1, 1, 5, 1, 4, 1]],
@@ -612,6 +614,7 @@ class GridModelTests(unittest.TestCase):
             carry,
             batch,
             jax.random.key(0),
+            jnp.asarray(0, dtype=jnp.int32),
         )
         metrics, _carry = train_step(
             model,
@@ -619,6 +622,7 @@ class GridModelTests(unittest.TestCase):
             carry,
             batch,
             jax.random.key(1),
+            jnp.asarray(1, dtype=jnp.int32),
         )
         after = model.puzzle_embed.weights[...]
 
@@ -693,7 +697,7 @@ class GridModelTests(unittest.TestCase):
         )
         model = create_model(config)
         optimizer = create_optimizer(model, config)
-        train_step = build_trm_act_train_step_runner(config.train.halt_loss_weight)
+        train_step = build_trm_act_train_step_runner(config, config.train.halt_loss_weight)
         batch = {
             "inputs": jnp.full((2, 16), 2, dtype=jnp.int32),
             "labels": jnp.full((2, 16), 3, dtype=jnp.int32),
@@ -707,6 +711,7 @@ class GridModelTests(unittest.TestCase):
             model.initial_carry(batch),
             batch,
             jax.random.key(0),
+            jnp.asarray(0, dtype=jnp.int32),
         )
 
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))

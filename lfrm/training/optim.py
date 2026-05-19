@@ -95,6 +95,25 @@ def _uses_puzzle_embedding(config: ExperimentConfig) -> bool:
     return False
 
 
+def uses_sparse_puzzle_embedding(config: ExperimentConfig) -> bool:
+    return (
+        config.model.model_type in ("trm", "urm")
+        and _uses_puzzle_embedding(config)
+        and config.optimizer.puzzle_embed_learning_rate > 0.0
+        and config.train.trm_train_mode == "act"
+    )
+
+
+def trainable_param_filter(config: ExperimentConfig):
+    if uses_sparse_puzzle_embedding(config):
+        from flax import nnx
+
+        return nnx.All(nnx.Param, nnx.Not(nnx.PathContains("puzzle_embed")))
+    from flax import nnx
+
+    return nnx.Param
+
+
 def _adam_atan2_optimizer(config: ExperimentConfig, schedule) -> optax.GradientTransformation:
     transforms: list[optax.GradientTransformation] = []
     transforms.append(scale_by_adam_atan2(b1=config.optimizer.beta1, b2=config.optimizer.beta2))
@@ -166,6 +185,7 @@ def build_optimizer(config: ExperimentConfig, model: object | None = None) -> op
     if (
         model is not None
         and _uses_puzzle_embedding(config)
+        and not uses_sparse_puzzle_embedding(config)
         and config.optimizer.puzzle_embed_learning_rate > 0.0
     ):
         puzzle_schedule = scheduled_lr(

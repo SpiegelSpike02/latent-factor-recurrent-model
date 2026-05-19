@@ -12,6 +12,7 @@ DEFAULT_JAX_ENV = {
 }
 
 RESPECT_EXTERNAL_ENV_FLAG = "LFRM_RESPECT_EXTERNAL_JAX_ENV"
+EXTRA_XLA_FLAGS_ENV = "LFRM_EXTRA_XLA_FLAGS"
 DEFAULT_UNSET_ENV = (
     "XLA_PYTHON_CLIENT_MEM_FRACTION",
     "XLA_PYTHON_CLIENT_ALLOCATOR",
@@ -45,7 +46,8 @@ def apply_jax_defaults() -> None:
     if not respect_external_env:
         for name in DEFAULT_UNSET_ENV:
             os.environ.pop(name, None)
+    extra_xla_flags = tuple(os.environ.get(EXTRA_XLA_FLAGS_ENV, "").split())
     os.environ["XLA_FLAGS"] = _append_missing_xla_flags(
         os.environ.get("XLA_FLAGS", ""),
-        DEFAULT_XLA_FLAGS,
+        (*DEFAULT_XLA_FLAGS, *extra_xla_flags),
     )

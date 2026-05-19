@@ -95,13 +95,15 @@ ranking accuracy, and belief/refinement diagnostics.
 
 The package also applies project-level JAX defaults before JAX initializes:
 Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, the XLA GPU
-latency hiding scheduler and async collectives are enabled, fixed GPU
-preallocation is disabled with `XLA_PYTHON_CLIENT_PREALLOCATE=false`, and
+latency hiding scheduler is enabled, fixed GPU preallocation is disabled with
+`XLA_PYTHON_CLIENT_PREALLOCATE=false`, and
 `TF_GPU_ALLOCATOR=cuda_malloc_async` selects CUDA's growing async memory pool.
 For single-host multi-GPU runs, the documented NCCL `LL/LL128/SIMPLE` protocol
 flags are also set. These defaults intentionally override stale shell values;
 set `LFRM_RESPECT_EXTERNAL_JAX_ENV=true` to preserve externally supplied JAX
-memory settings.
+memory settings. Experimental XLA flags are not enabled by default because
+unsupported flags are fatal at process startup; append local experiments with
+`LFRM_EXTRA_XLA_FLAGS="--flag=value"` when testing a specific `jaxlib` build.
 
 ## Notes
 

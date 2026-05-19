@@ -12,6 +12,7 @@ from lfrm.models.recurrent.layers import (
     CastedEmbedding,
     casted_linear_init,
     compute_dtype,
+    dot_product_attention,
     maybe_cast,
     rms_norm as _rms_norm,
     rotate_half as _rotate_half,
@@ -58,20 +59,14 @@ class URMAttention(nnx.Module):
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        q = jnp.swapaxes(q, 1, 2)
-        k = jnp.swapaxes(k, 1, 2)
-        v = jnp.swapaxes(v, 1, 2)
 
-        cos = rope_cos[None, None, :seq_len, :].astype(q.dtype)
-        sin = rope_sin[None, None, :seq_len, :].astype(q.dtype)
+        cos = rope_cos[None, :seq_len, None, :].astype(q.dtype)
+        sin = rope_sin[None, :seq_len, None, :].astype(q.dtype)
         q = (q * cos) + (_rotate_half(q) * sin)
         k = (k * cos) + (_rotate_half(k) * sin)
 
-        scores = jnp.einsum("bhnd,bhmd->bhnm", q, k, preferred_element_type=jnp.float32)
-        scores = scores / math.sqrt(self.head_dim)
-        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(h.dtype)
-        output = jnp.einsum("bhnm,bhmd->bhnd", weights, v, preferred_element_type=jnp.float32)
-        output = jnp.swapaxes(output, 1, 2).reshape(batch_size, seq_len, d_model)
+        output = dot_product_attention(q, k, v)
+        output = output.reshape(batch_size, seq_len, d_model)
         return self.out(output)
 
 
@@ -224,15 +219,23 @@ class UnifiedReasoningModel(nnx.Module):
             trunc_normal(rngs.params(), (config.d_model,), std=1.0, dtype=self.dtype)
         )
 
-    def _input_embeddings(self, tokens: Array, puzzle_identifiers: Array | None) -> Array:
+    def _input_embeddings(
+        self,
+        tokens: Array,
+        puzzle_identifiers: Array | None,
+        puzzle_embeddings: Array | None = None,
+    ) -> Array:
         token_emb = self.token_embed(tokens.astype(jnp.int32)).astype(self.dtype) * self.embed_scale
         if not self.has_puzzle_embed:
             return token_emb
-        if puzzle_identifiers is None:
-            puzzle_identifiers = jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
-        if not hasattr(self, "puzzle_embed"):
-            raise ValueError("URM puzzle embedding table is not initialized")
-        prefix = self.puzzle_embed(puzzle_identifiers, train=True)
+        if puzzle_embeddings is None:
+            if puzzle_identifiers is None:
+                puzzle_identifiers = jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
+            if not hasattr(self, "puzzle_embed"):
+                raise ValueError("URM puzzle embedding table is not initialized")
+            prefix = self.puzzle_embed(puzzle_identifiers, train=True)
+        else:
+            prefix = puzzle_embeddings
         prefix = prefix.reshape(tokens.shape[0], self.puzzle_embed_len, self.config.d_model)
         return jnp.concatenate((prefix, token_emb), axis=1)
 
@@ -293,7 +296,6 @@ class UnifiedReasoningModel(nnx.Module):
         dropout_key: Array | None = None,
         puzzle_embeddings: Array | None = None,
     ) -> tuple[dict[str, Array], Array, dict[str, Array]]:
-        del puzzle_embeddings
         if dropout_key is None:
             dropout_key = jax.random.key(0)
         reset = carry["halted"]
@@ -306,7 +308,7 @@ class UnifiedReasoningModel(nnx.Module):
         hidden = jnp.where(reset_hidden, self._reset_hidden(inputs.shape[0]), carry["hidden"])
         steps = jnp.where(reset, 0, carry["steps"])
 
-        input_embeddings = self._input_embeddings(inputs, puzzle_ids)
+        input_embeddings = self._input_embeddings(inputs, puzzle_ids, puzzle_embeddings)
         previous_hidden = hidden
         hidden = self._inner_update(hidden, input_embeddings, train=train, dropout_key=dropout_key)
         logits, halt_logits = self._logits_and_halt(hidden)

@@ -4,7 +4,7 @@ from flax import nnx
 
 from lfrm.config import ExperimentConfig
 from lfrm.models import BRCSudokuModel, TinyRecursiveModel, UnifiedReasoningModel
-from lfrm.training.optim import build_optimizer
+from lfrm.training.optim import build_optimizer, trainable_param_filter
 
 
 GridReasoningModel = BRCSudokuModel | TinyRecursiveModel | UnifiedReasoningModel
@@ -33,7 +33,7 @@ def create_model(config: ExperimentConfig) -> GridReasoningModel:
 
 
 def create_optimizer(model: GridReasoningModel, config: ExperimentConfig) -> nnx.Optimizer:
-    return nnx.Optimizer(model, build_optimizer(config, model), wrt=nnx.Param)
+    return nnx.Optimizer(model, build_optimizer(config, model), wrt=trainable_param_filter(config))
 
 
 def create_ema_model(model: GridReasoningModel, config: ExperimentConfig) -> GridReasoningModel:

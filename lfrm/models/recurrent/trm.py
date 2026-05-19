@@ -12,6 +12,7 @@ from lfrm.models.recurrent.layers import (
     CastedEmbedding,
     casted_linear_init,
     compute_dtype,
+    dot_product_attention,
     maybe_cast,
     rms_norm as _rms_norm,
     rotate_half as _rotate_half,
@@ -170,16 +171,8 @@ class Attention(nnx.Module):
         v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         if rope_cos is not None and rope_sin is not None:
             q, k = _apply_rope(q, k, rope_cos, rope_sin)
-        q = jnp.swapaxes(q, 1, 2)
-        k = jnp.swapaxes(k, 1, 2)
-        v = jnp.swapaxes(v, 1, 2)
-        scores = jnp.einsum("bhqd,bhkd->bhqk", q, k, preferred_element_type=jnp.float32)
-        scores = scores / math.sqrt(self.head_dim)
-        if attention_bias is not None:
-            scores = scores + attention_bias[None, :, :, :].astype(jnp.float32)
-        weights = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(x.dtype)
-        attended = jnp.einsum("bhqk,bhkd->bhqd", weights, v, preferred_element_type=jnp.float32)
-        attended = jnp.swapaxes(attended, 1, 2).reshape(batch_size, seq_len, d_model)
+        attended = dot_product_attention(q, k, v, bias=attention_bias)
+        attended = attended.reshape(batch_size, seq_len, d_model)
         return self.out(attended)
 
 

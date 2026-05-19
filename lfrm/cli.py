@@ -11,6 +11,7 @@ import tomllib
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -839,7 +840,7 @@ def main() -> None:
                 halt_loss_weight=config.train.halt_loss_weight,
             )
         else:
-            train_step_fn = build_trm_act_train_step_runner(config.train.halt_loss_weight)
+            train_step_fn = build_trm_act_train_step_runner(config, config.train.halt_loss_weight)
         eval_step_fn = build_trm_eval_step_runner(config.train.halt_loss_weight)
     else:
         train_step_fn = build_train_step_runner(
@@ -947,6 +948,7 @@ def main() -> None:
                         train_carries[microbatch_index],
                         current_batch,
                         step_key,
+                        jnp.asarray(step - 1, dtype=jnp.int32),
                     )
                     train_carries[microbatch_index] = train_carry
                 else:

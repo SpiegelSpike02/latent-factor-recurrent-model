@@ -13,6 +13,7 @@ from lfrm.training.losses import (
     target_probability as token_target_probability,
     token_cross_entropy,
 )
+from lfrm.training.optim import scheduled_lr, trainable_param_filter, uses_sparse_puzzle_embedding
 
 
 def _path_metrics(predictions: jax.Array, targets: jax.Array, loss_mask: jax.Array) -> dict[str, jax.Array]:
@@ -884,6 +885,49 @@ def trm_act_loss_and_metrics(
     return loss, (metrics, new_carry)
 
 
+def _act_sparse_puzzle_ids(
+    carry: dict[str, jax.Array],
+    batch: dict[str, jax.Array],
+) -> jax.Array:
+    return jnp.where(carry["halted"], batch["puzzle_identifiers"], carry["current_puzzle_identifiers"])
+
+
+def _sparse_puzzle_embeddings(model, puzzle_ids: jax.Array) -> jax.Array:
+    return jax.lax.stop_gradient(model.puzzle_embed(puzzle_ids, train=True))
+
+
+def _update_sparse_puzzle_embeddings(
+    model,
+    puzzle_ids: jax.Array,
+    puzzle_embedding_grads: jax.Array,
+    *,
+    learning_rate: jax.Array,
+    weight_decay: float,
+) -> None:
+    ids = puzzle_ids.reshape(-1).astype(jnp.int32)
+    grads = puzzle_embedding_grads.reshape((ids.shape[0], puzzle_embedding_grads.shape[-1])).astype(jnp.float32)
+    unique_ids, inverse = jnp.unique(
+        ids,
+        return_inverse=True,
+        size=ids.shape[0],
+        fill_value=0,
+    )
+    grad_sums = jnp.zeros(
+        (ids.shape[0], grads.shape[-1]),
+        dtype=jnp.float32,
+    ).at[inverse].add(grads)
+    counts = jnp.zeros((ids.shape[0],), dtype=jnp.int32).at[inverse].add(1)
+    valid = counts > 0
+
+    weights = model.puzzle_embed.weights[...]
+    old_rows = jnp.take(weights, unique_ids, axis=0)
+    lr = learning_rate.astype(jnp.float32)
+    new_rows = old_rows.astype(jnp.float32) * (1.0 - lr * weight_decay)
+    new_rows = new_rows - lr * jnp.sign(grad_sums)
+    row_delta = jnp.where(valid[:, None], new_rows.astype(weights.dtype) - old_rows, jnp.zeros_like(old_rows))
+    model.puzzle_embed.weights[...] = weights.at[unique_ids].add(row_delta)
+
+
 def trm_dense_unroll_loss_and_metrics(
     model: TinyRecursiveModel,
     batch: dict[str, jax.Array],
@@ -1139,15 +1183,32 @@ def build_train_step_runner(
     return nnx.jit(train_step_with_weight)
 
 
-def build_trm_act_train_step_runner(halt_loss_weight: float = 0.5):
+def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
+    use_sparse_puzzle_embed = uses_sparse_puzzle_embedding(config)
+    puzzle_lr_schedule = scheduled_lr(
+        peak_value=config.optimizer.puzzle_embed_learning_rate,
+        min_ratio=config.optimizer.lr_min_ratio,
+        warmup_steps=max(1, config.optimizer.lr_warmup_steps),
+        optimizer_updates=max(1, config.train.optimizer_updates),
+    )
+    diff_filter = trainable_param_filter(config)
+
     def train_step(
         model: TinyRecursiveModel,
         optimizer: nnx.Optimizer,
         carry: dict[str, jax.Array],
         batch: dict[str, jax.Array],
         dropout_key: jax.Array,
+        optimizer_step: jax.Array,
     ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
-        def objective(model, carry, batch, train, dropout_key):
+        puzzle_ids = _act_sparse_puzzle_ids(carry, batch)
+        puzzle_embeddings = (
+            _sparse_puzzle_embeddings(model, puzzle_ids)
+            if use_sparse_puzzle_embed
+            else None
+        )
+
+        def objective(model, puzzle_embeddings, carry, batch, train, dropout_key):
             return trm_act_loss_and_metrics(
                 model,
                 carry,
@@ -1155,16 +1216,46 @@ def build_trm_act_train_step_runner(halt_loss_weight: float = 0.5):
                 train,
                 dropout_key,
                 halt_loss_weight,
+                puzzle_embeddings=puzzle_embeddings,
             )
 
-        (_, (metrics, new_carry)), grads = nnx.value_and_grad(objective, has_aux=True)(
+        grad_argnums = (
+            (nnx.DiffState(0, diff_filter), 1)
+            if use_sparse_puzzle_embed
+            else nnx.DiffState(0, diff_filter)
+        )
+        (_, (metrics, new_carry)), grads = nnx.value_and_grad(
+            objective,
+            argnums=grad_argnums,
+            has_aux=True,
+        )(
             model,
+            puzzle_embeddings,
             carry,
             batch,
             True,
             dropout_key,
         )
-        optimizer.update(model, grads)
+        if use_sparse_puzzle_embed:
+            model_grads, puzzle_embedding_grads = grads
+        else:
+            model_grads = grads
+        if use_sparse_puzzle_embed:
+            optimizer.update(model, model_grads)
+            _update_sparse_puzzle_embeddings(
+                model,
+                puzzle_ids,
+                puzzle_embedding_grads,
+                learning_rate=puzzle_lr_schedule(optimizer_step),
+                weight_decay=config.optimizer.puzzle_embed_weight_decay,
+            )
+            metrics["puzzle_embed_learning_rate"] = puzzle_lr_schedule(optimizer_step)
+            metrics["puzzle_embed_touched_rows"] = jnp.sum(
+                jnp.unique(puzzle_ids.reshape(-1), size=puzzle_ids.size, fill_value=0)
+                != 0
+            ).astype(jnp.float32)
+        else:
+            optimizer.update(model, model_grads)
         return metrics, new_carry
 
     return nnx.jit(train_step)
