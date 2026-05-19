@@ -125,6 +125,7 @@ class EMAConfig:
 class TrainConfig:
     batch_size: int = 16
     eval_batch_size: int = 0
+    gradient_accumulation_steps: int = 1
     epochs: int = 0
     max_steps: int = 500
     log_every: int = 10

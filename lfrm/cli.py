@@ -91,6 +91,7 @@ ALLOWED_SECTION_KEYS = {
     "train": {
         "batch_size",
         "eval_batch_size",
+        "gradient_accumulation_steps",
         "epochs",
         "max_steps",
         "log_every",
@@ -226,6 +227,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid-height", type=int, default=9)
     parser.add_argument("--grid-width", type=int, default=9)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Accumulate this many micro-batches before each optimizer update.",
+    )
     parser.add_argument(
         "--eval-batch-size",
         type=int,
@@ -449,6 +456,7 @@ def build_config(
     train = TrainConfig(
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         epochs=args.epochs,
         max_steps=args.max_steps,
         log_every=args.log_every,
@@ -549,6 +557,10 @@ def eval_interval_steps(config: ExperimentConfig) -> int:
     return max(1, config.train.eval_every)
 
 
+def effective_train_batch_size(config: ExperimentConfig) -> int:
+    return config.train.batch_size * config.train.gradient_accumulation_steps
+
+
 def steps_from_epochs(dataset, batch_size: int, epochs: int) -> int:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
@@ -569,13 +581,15 @@ def apply_epoch_budget(config: ExperimentConfig, dataset) -> ExperimentConfig:
     if config.train.epochs <= 0:
         return config
     eval_every = config.train.eval_every
+    effective_batch_size = effective_train_batch_size(config)
     if config.train.eval_epochs > 0:
-        eval_every = steps_from_epochs(dataset, config.train.batch_size, config.train.eval_epochs)
+        eval_every = steps_from_epochs(dataset, effective_batch_size, config.train.eval_epochs)
     train = TrainConfig(
         batch_size=config.train.batch_size,
         eval_batch_size=config.train.eval_batch_size,
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps,
         epochs=config.train.epochs,
-        max_steps=steps_from_epochs(dataset, config.train.batch_size, config.train.epochs),
+        max_steps=steps_from_epochs(dataset, effective_batch_size, config.train.epochs),
         log_every=config.train.log_every,
         eval_epochs=config.train.eval_epochs,
         eval_every=eval_every,
@@ -758,6 +772,8 @@ def main() -> None:
     config = apply_epoch_budget(config, dataset)
     if config.train.batch_size < 1:
         raise ValueError("batch_size must be at least 1")
+    if config.train.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
     if config.train.eval_batch_size < 0:
         raise ValueError("eval_batch_size must be non-negative")
     if config.train.epochs < 0:
@@ -827,6 +843,8 @@ def main() -> None:
         "train_examples=", overview["train_examples"],
         "eval_examples=", overview["eval_examples"],
         "batch_size=", config.train.batch_size,
+        "gradient_accumulation_steps=", config.train.gradient_accumulation_steps,
+        "effective_batch_size=", effective_train_batch_size(config),
         "eval_batch_size=", config.train.eval_batch_size or config.train.batch_size,
         "epochs=", config.train.epochs,
         "max_steps=", config.train.max_steps,
@@ -867,23 +885,27 @@ def main() -> None:
     try:
         for step in range(resume_step + 1, config.train.max_steps + 1):
             is_eval_step = step % eval_interval == 0 or step == config.train.max_steps
-            train_key, step_key = jax.random.split(train_key)
-            if use_trm_act:
-                metrics, train_carry = train_step_fn(
-                    model,
-                    optimizer,
-                    train_carry,
-                    current_batch,
-                    step_key,
-                )
-            else:
-                metrics = train_step_fn(
-                    model,
-                    optimizer,
-                    current_batch,
-                    step_key,
-                )
-            current_batch = prefetcher.next()
+            metrics = None
+            for _ in range(config.train.gradient_accumulation_steps):
+                train_key, step_key = jax.random.split(train_key)
+                if use_trm_act:
+                    metrics, train_carry = train_step_fn(
+                        model,
+                        optimizer,
+                        train_carry,
+                        current_batch,
+                        step_key,
+                    )
+                else:
+                    metrics = train_step_fn(
+                        model,
+                        optimizer,
+                        current_batch,
+                        step_key,
+                    )
+                current_batch = prefetcher.next()
+            if metrics is None:
+                raise RuntimeError("No training micro-batches were processed")
 
             if ema_model is not None and ema_update_fn is not None:
                 ema_update_fn(ema_model, model)
