@@ -83,7 +83,6 @@ class ModelConfig:
     dropout_rate: float = 0.0
     loss_type: str = "softmax"
     clamp_given: bool = False
-    path_loss_weight: float = 1.0
     trm: TRMConfig | None = None
     brc: BRCSudokuConfig | None = None
     urm: URMConfig | None = None

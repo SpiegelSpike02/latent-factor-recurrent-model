@@ -60,7 +60,7 @@ NESTED_SECTIONS = {
 }
 ALLOWED_SECTION_KEYS = {
     "data": {"dataset_path"},
-    "task": {"type", "supervision", "clamp_given", "path_loss_weight"},
+    "task": {"type", "supervision", "clamp_given"},
     "model": {
         "model_type",
         "seq_len",
@@ -271,7 +271,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout-rate", type=float, default=0.0)
     parser.add_argument("--loss-type", choices=("softmax", "stablemax"), default="softmax")
     parser.add_argument("--clamp-given", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--path-loss-weight", type=float, default=1.0)
     parser.add_argument("--trm-deep-recursion", type=int, default=3)
     parser.add_argument("--trm-latent-recursion", type=int, default=6)
     parser.add_argument("--trm-block-layers", type=int, default=2)
@@ -371,7 +370,6 @@ def build_config(
         dropout_rate=args.dropout_rate,
         loss_type=args.loss_type,
         clamp_given=args.clamp_given,
-        path_loss_weight=args.path_loss_weight,
         trm=TRMConfig(
             deep_recursion=args.trm_deep_recursion,
             latent_recursion=args.trm_latent_recursion,

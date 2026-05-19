@@ -5,7 +5,6 @@ dataset_path = "data/maze-30x30-hard-1k-aug"
 type = "maze"
 supervision = "full_grid"
 clamp_given = false
-path_loss_weight = 1.0
 
 [model]
 model_type = "trm"

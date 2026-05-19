@@ -51,15 +51,6 @@ def masked_token_ce(model: object, logits: jax.Array, targets: jax.Array, mask: 
     return jnp.sum(token_loss * mask_f32) / normalizer
 
 
-def target_loss_weights(model: object, targets: jax.Array) -> jax.Array:
-    if getattr(getattr(model, "config", None), "task_type", "sudoku") != "maze":
-        return jnp.asarray(1.0, dtype=jnp.float32)
-    path_weight = getattr(getattr(model, "config", None), "path_loss_weight", 1.0)
-    if path_weight == 1.0:
-        return jnp.asarray(1.0, dtype=jnp.float32)
-    return jnp.where(targets == 5, jnp.asarray(path_weight, dtype=jnp.float32), 1.0)
-
-
 def loss_mask_from_given(model: object, given_mask: jax.Array) -> jax.Array:
     supervision = getattr(getattr(model, "config", None), "supervision", "unknown_only")
     if supervision == "unknown_only":
@@ -67,7 +58,3 @@ def loss_mask_from_given(model: object, given_mask: jax.Array) -> jax.Array:
     if supervision == "full_grid":
         return jnp.ones_like(given_mask, dtype=jnp.float32)
     raise ValueError(f"Unsupported supervision mode: {supervision}")
-
-
-def weighted_mask_normalizer(mask: jax.Array, weights: jax.Array) -> jax.Array:
-    return jnp.maximum(jnp.sum(mask.astype(jnp.float32) * weights.astype(jnp.float32)), 1.0)

@@ -10,10 +10,8 @@ from lfrm.training.factory import GridReasoningModel
 from lfrm.training.losses import (
     loss_mask_from_given,
     masked_token_ce,
-    target_loss_weights,
     target_probability as token_target_probability,
     token_cross_entropy,
-    weighted_mask_normalizer,
 )
 
 
@@ -639,9 +637,7 @@ def loss_and_metrics(
     targets = batch["labels"]
     given_mask = batch["given_mask"]
     loss_mask = loss_mask_from_given(model, given_mask)
-    loss_weights = target_loss_weights(model, targets)
-    weighted_loss_mask = loss_mask * loss_weights
-    normalizer = weighted_mask_normalizer(loss_mask, loss_weights)
+    normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
 
     model_key = dropout_key
@@ -666,11 +662,11 @@ def loss_and_metrics(
         else step_logits
     )
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
-    step_loss_mask = weighted_loss_mask[None, :, :]
+    step_loss_mask = loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
     token_loss = token_cross_entropy(model, effective_step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
-    per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
+    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
     per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
 
     rollout_steps = effective_step_logits.shape[0]
@@ -726,7 +722,7 @@ def loss_and_metrics(
     exact_count = jnp.sum(exact_examples.astype(jnp.float32))
     if halt_loss_weight != 0.0:
         selected_token_loss = token_cross_entropy(model, selected_logits, targets)
-        selected_ce_loss = jnp.sum(selected_token_loss * weighted_loss_mask) / normalizer
+        selected_ce_loss = jnp.sum(selected_token_loss * loss_mask) / normalizer
         selected_predictions = jnp.argmax(selected_logits, axis=-1)
         selected_correct = (selected_predictions == targets).astype(jnp.float32) * loss_mask
         selected_accuracy = jnp.sum(selected_correct) / metric_normalizer
@@ -818,16 +814,14 @@ def trm_act_loss_and_metrics(
     targets = new_carry["current_labels"]
     given_mask = new_carry["current_given_mask"]
     loss_mask = loss_mask_from_given(model, given_mask)
-    loss_weights = target_loss_weights(model, targets)
-    weighted_loss_mask = loss_mask * loss_weights
-    normalizer = weighted_mask_normalizer(loss_mask, loss_weights)
+    normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
-    per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
+    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
     if _should_clamp_given(model):
         logits = _clamp_logits_to_given(logits, new_carry["current_inputs"], given_mask, model.config.vocab_size)
 
     token_loss = token_cross_entropy(model, logits, targets)
-    per_example_loss = jnp.sum(token_loss * weighted_loss_mask, axis=-1) / per_example_normalizer
+    per_example_loss = jnp.sum(token_loss * loss_mask, axis=-1) / per_example_normalizer
     lm_loss_value = jnp.mean(per_example_loss)
 
     predictions = jnp.argmax(logits, axis=-1)
@@ -902,11 +896,9 @@ def trm_dense_unroll_loss_and_metrics(
     targets = batch["labels"]
     given_mask = batch["given_mask"]
     loss_mask = loss_mask_from_given(model, given_mask)
-    loss_weights = target_loss_weights(model, targets)
-    weighted_loss_mask = loss_mask * loss_weights
-    normalizer = weighted_mask_normalizer(loss_mask, loss_weights)
+    normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
-    per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
+    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
 
     model_forward_kwargs = {"puzzle_identifiers": batch["puzzle_identifiers"]}
     if isinstance(model, TinyRecursiveModel):
@@ -920,7 +912,7 @@ def trm_dense_unroll_loss_and_metrics(
     if _should_clamp_given(model):
         step_logits = _clamp_logits_to_given(step_logits, inputs, given_mask, model.config.vocab_size)
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
-    step_loss_mask = weighted_loss_mask[None, :, :]
+    step_loss_mask = loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
     token_loss = token_cross_entropy(model, step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
@@ -997,11 +989,9 @@ def trm_eval_loss_and_metrics(
     targets = batch["labels"]
     given_mask = batch["given_mask"]
     loss_mask = loss_mask_from_given(model, given_mask)
-    loss_weights = target_loss_weights(model, targets)
-    weighted_loss_mask = loss_mask * loss_weights
-    normalizer = weighted_mask_normalizer(loss_mask, loss_weights)
+    normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
-    per_example_normalizer = jnp.maximum(jnp.sum(weighted_loss_mask, axis=-1), 1.0)
+    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
 
     model_forward_kwargs = {"puzzle_identifiers": batch["puzzle_identifiers"]}
     if isinstance(model, TinyRecursiveModel):
@@ -1015,7 +1005,7 @@ def trm_eval_loss_and_metrics(
     if _should_clamp_given(model):
         step_logits = _clamp_logits_to_given(step_logits, inputs, given_mask, model.config.vocab_size)
     step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
-    step_loss_mask = weighted_loss_mask[None, :, :]
+    step_loss_mask = loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
     token_loss = token_cross_entropy(model, step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
@@ -1040,7 +1030,7 @@ def trm_eval_loss_and_metrics(
         axis=0,
     ).squeeze(0)
     selected_token_loss = token_cross_entropy(model, selected_logits, targets)
-    lm_loss_value = jnp.sum(selected_token_loss * weighted_loss_mask) / normalizer
+    lm_loss_value = jnp.sum(selected_token_loss * loss_mask) / normalizer
     selected_exact_targets = jnp.take_along_axis(
         per_step_example_solved.astype(jnp.float32),
         selected_step[None, :],
@@ -1061,7 +1051,7 @@ def trm_eval_loss_and_metrics(
     q_halt_accuracy = jnp.mean(selected_q_halt_correct.astype(jnp.float32))
     final_logits = step_logits[-1]
     final_token_loss = token_cross_entropy(model, final_logits, targets)
-    final_lm_loss_value = jnp.sum(final_token_loss * weighted_loss_mask) / normalizer
+    final_lm_loss_value = jnp.sum(final_token_loss * loss_mask) / normalizer
     final_predictions = jnp.argmax(final_logits, axis=-1)
     final_correct = (final_predictions == targets).astype(jnp.float32) * loss_mask
     final_cell_accuracy = jnp.sum(final_correct) / metric_normalizer
