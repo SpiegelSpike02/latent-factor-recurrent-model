@@ -738,6 +738,12 @@ def place_module_replicated(module, sharding: NamedSharding | None) -> None:
     nnx.update(module, jax.device_put(nnx.state(module), sharding))
 
 
+def place_tree(tree, sharding: NamedSharding | None):
+    if sharding is None:
+        return tree
+    return jax.device_put(tree, sharding)
+
+
 class BatchPrefetcher:
     def __init__(self, sample_fn, *, depth: int = 2) -> None:
         if depth < 1:
@@ -1012,7 +1018,7 @@ def main() -> None:
     use_trm_act = config.model.model_type in ("trm", "urm") and config.train.trm_train_mode == "act"
     console_model_label = "brc" if config.model.model_type == "brc_sudoku" else config.model.model_type
     train_carries = (
-        [model.initial_carry(batch) for batch in current_batches]
+        [place_tree(model.initial_carry(batch), data_sharding) for batch in current_batches]
         if use_trm_act
         else None
     )
