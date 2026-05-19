@@ -1135,8 +1135,8 @@ def trm_eval_loss_and_metrics(
         "per_step_halt_probability": jax.nn.sigmoid(jnp.mean(halt_logits, axis=1)),
         "unroll_steps": jnp.asarray(step_logits.shape[0], dtype=jnp.int32),
     }
-    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
     selected_path_metrics = _maybe_path_metrics(model, predictions, targets, loss_mask)
+    metrics.update(selected_path_metrics)
     metrics.update(
         {
             f"selected_{key}": value

@@ -592,7 +592,6 @@ class TinyRecursiveModel(nnx.Module):
         dropout_key, exploration_key, min_step_key = jax.random.split(dropout_key, 3)
         current_batch = self._current_batch(carry, batch)
         inputs = current_batch["inputs"]
-        condition_mask = self._condition_mask(inputs)
         input_embeddings = self._input_embeddings(
             inputs,
             current_batch["puzzle_identifiers"],
@@ -601,7 +600,6 @@ class TinyRecursiveModel(nnx.Module):
             puzzle_embeddings=puzzle_embeddings,
         )
         state = self._reset_carry_state(carry)
-        prev_data = state["y"][:, self.prefix_len :]
         next_state = self._act_step(state, input_embeddings)
         state_data = next_state["y"][:, self.prefix_len :]
         logits = self._logits_from_state(state_data)
@@ -625,8 +623,6 @@ class TinyRecursiveModel(nnx.Module):
         else:
             halted = is_last_step
 
-        delta = jnp.linalg.norm((state_data - prev_data).astype(jnp.float32), axis=-1, keepdims=True)
-        hidden_delta = self._blank_mean(delta, condition_mask)
         new_carry = {
             "y": jax.lax.stop_gradient(next_state["y"]),
             "z": jax.lax.stop_gradient(next_state["z"]),
@@ -638,7 +634,6 @@ class TinyRecursiveModel(nnx.Module):
             "current_puzzle_identifiers": current_batch["puzzle_identifiers"],
         }
         diagnostics = {
-            "hidden_delta_mean": hidden_delta,
             "halt_logits": halt_logits,
             "act_step": jnp.mean(new_steps.astype(jnp.float32)),
             "halted_rate": jnp.mean(halted.astype(jnp.float32)),

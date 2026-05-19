@@ -309,7 +309,6 @@ class UnifiedReasoningModel(nnx.Module):
         steps = jnp.where(reset, 0, carry["steps"])
 
         input_embeddings = self._input_embeddings(inputs, puzzle_ids, puzzle_embeddings)
-        previous_hidden = hidden
         hidden = self._inner_update(hidden, input_embeddings, train=train, dropout_key=dropout_key)
         logits, halt_logits = self._logits_and_halt(hidden)
 
@@ -340,13 +339,11 @@ class UnifiedReasoningModel(nnx.Module):
             "current_given_mask": given_mask,
             "current_puzzle_identifiers": puzzle_ids,
         }
-        hidden_delta = jnp.mean(jnp.linalg.norm((hidden - previous_hidden).astype(jnp.float32), axis=-1))
         diagnostics = {
             "halt_logits": halt_logits,
             "act_step": jnp.mean(new_steps.astype(jnp.float32)),
             "halted_rate": jnp.mean(halted.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
-            "hidden_delta_mean": hidden_delta,
         }
         return new_carry, logits, diagnostics
 
