@@ -220,8 +220,9 @@ class UnifiedReasoningModel(nnx.Module):
         self.rope_cos = nnx.data(jnp.cos(rope))
         self.rope_sin = nnx.data(jnp.sin(rope))
 
-        init_hidden = trunc_normal(rngs.params(), (config.d_model,), std=1.0, dtype=jnp.float32)
-        self.init_hidden = nnx.Param(init_hidden)
+        self.init_hidden = nnx.data(
+            trunc_normal(rngs.params(), (config.d_model,), std=1.0, dtype=self.dtype)
+        )
 
     def _input_embeddings(self, tokens: Array, puzzle_identifiers: Array | None) -> Array:
         token_emb = self.token_embed(tokens.astype(jnp.int32)).astype(self.dtype) * self.embed_scale
@@ -311,23 +312,27 @@ class UnifiedReasoningModel(nnx.Module):
         logits, halt_logits = self._logits_and_halt(hidden)
 
         new_steps = steps + 1
-        halted = new_steps >= self.recurrent_steps
-        if train and self.recurrent_steps > 1 and self.urm.halt_exploration_prob > 0.0:
-            explore_key, min_step_key = jax.random.split(dropout_key)
-            use_random_min = jax.random.uniform(explore_key, (inputs.shape[0],)) < self.urm.halt_exploration_prob
-            random_min_steps = jax.random.randint(
-                min_step_key,
-                (inputs.shape[0],),
-                minval=2,
-                maxval=self.recurrent_steps + 1,
-            )
-            min_steps = jnp.where(use_random_min, random_min_steps, 1)
-            halted = halted | ((halt_logits > 0.0) & (new_steps >= min_steps))
+        is_last_step = new_steps >= self.recurrent_steps
+        if train:
+            halted = is_last_step | (halt_logits > 0.0)
+            if self.recurrent_steps > 1 and self.urm.halt_exploration_prob > 0.0:
+                explore_key, min_step_key = jax.random.split(dropout_key)
+                use_random_min = jax.random.uniform(explore_key, (inputs.shape[0],)) < self.urm.halt_exploration_prob
+                random_min_steps = jax.random.randint(
+                    min_step_key,
+                    (inputs.shape[0],),
+                    minval=2,
+                    maxval=self.recurrent_steps + 1,
+                )
+                min_steps = jnp.where(use_random_min, random_min_steps, 1)
+                halted = halted & (new_steps >= min_steps)
+        else:
+            halted = is_last_step
 
         new_carry = {
             "hidden": jax.lax.stop_gradient(hidden),
-            "steps": new_steps,
-            "halted": halted,
+            "steps": jax.lax.stop_gradient(new_steps),
+            "halted": jax.lax.stop_gradient(halted),
             "current_inputs": inputs,
             "current_labels": labels,
             "current_given_mask": given_mask,

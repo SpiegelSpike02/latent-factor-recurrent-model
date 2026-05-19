@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from lfrm.datasets import build_maze_dataset, load_dataset, sample_batch
+from lfrm.datasets import DatasetSpec, GridBatchSampler, GridDataset, build_maze_dataset, load_dataset, sample_batch
 from lfrm.datasets.maze import _maze_transforms
 from lfrm.scripts.build_maze_dataset import build_parser
 
@@ -63,6 +63,16 @@ class MazeDatasetTests(unittest.TestCase):
             self.assertEqual(batch["given_mask"].shape, (2, 9))
             self.assertEqual(batch["puzzle_identifiers"].shape, (2,))
 
+            sampler = GridBatchSampler(np.random.default_rng(0), dataset)
+            grouped_batch = sampler.sample(batch_size=2, seq_len=9, split="train")
+            selected_indices = []
+            for row in grouped_batch["inputs"]:
+                matches = np.where(np.all(dataset.train_inputs == row[None, :], axis=1))[0]
+                self.assertGreater(matches.size, 0)
+                selected_indices.append(int(matches[0]))
+            selected_groups = {0 if index < 8 else 1 for index in selected_indices}
+            self.assertEqual(selected_groups, {0, 1})
+
     def test_maze_transforms_match_official_dihedral_order(self) -> None:
         grid = np.arange(9).reshape(3, 3)
         transforms = _maze_transforms(grid)
@@ -87,6 +97,47 @@ class MazeDatasetTests(unittest.TestCase):
                 np.fliplr(np.rot90(grid, 1)),
             )
         })
+
+    def test_grouped_sampler_packs_multiple_examples_from_selected_puzzle(self) -> None:
+        inputs = np.asarray([[10, 11], [20, 21], [30, 31]], dtype=np.int32)
+        labels = inputs + 100
+        given_mask = np.zeros_like(inputs, dtype=bool)
+        puzzle_identifiers = np.asarray([7, 7, 7], dtype=np.int32)
+        dataset = GridDataset(
+            train_inputs=inputs,
+            train_labels=labels,
+            eval_inputs=inputs[:1],
+            eval_labels=labels[:1],
+            train_given_mask=given_mask,
+            eval_given_mask=given_mask[:1],
+            train_puzzle_identifiers=puzzle_identifiers,
+            eval_puzzle_identifiers=puzzle_identifiers[:1],
+            train_puzzle_indices=np.asarray([0, 3], dtype=np.int32),
+            eval_puzzle_indices=None,
+            train_group_indices=np.asarray([0, 1], dtype=np.int32),
+            eval_group_indices=None,
+            spec=DatasetSpec(
+                kind="arc",
+                task_type="classification",
+                vocab_size=128,
+                num_puzzle_identifiers=8,
+                total_groups=1,
+                total_puzzles=1,
+                mean_puzzle_examples=3.0,
+                seq_len=2,
+                grid_height=1,
+                grid_width=2,
+                train_examples=3,
+                eval_examples=1,
+            ),
+        )
+        batch = GridBatchSampler(np.random.default_rng(0), dataset).sample(
+            batch_size=3,
+            seq_len=2,
+            split="train",
+        )
+        self.assertEqual({tuple(row) for row in batch["inputs"]}, {tuple(row) for row in inputs})
+        np.testing.assert_array_equal(batch["puzzle_identifiers"], np.asarray([7, 7, 7], dtype=np.int32))
 
     def test_build_maze_parser_exposes_progress_every(self) -> None:
         parser = build_parser()

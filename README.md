@@ -54,6 +54,27 @@ Build an offline Maze dataset in the HRM/TRM format:
 uv run lfrm-build-maze --output-dir data/maze-30x30-hard-1k-aug --aug
 ```
 
+Build ARC-AGI datasets in the official TRM/URM format. The `input-file-prefix`
+points to files such as `arc-agi_training_challenges.json` and
+`arc-agi_training_solutions.json`:
+
+```bash
+uv run lfrm-build-arc \
+  --input-file-prefix kaggle/combined/arc-agi \
+  --output-dir data/arc1concept-aug-1000 \
+  --subsets training evaluation concept \
+  --test-set-name evaluation \
+  --num-aug 1000
+
+uv run lfrm-build-arc \
+  --input-file-prefix kaggle/combined/arc-agi \
+  --output-dir data/arc2concept-aug-1000 \
+  --subsets training2 evaluation2 concept \
+  --test-set-name evaluation2 \
+  --test-set-name2 evaluation \
+  --num-aug 1000
+```
+
 Train BRC-Sudoku:
 
 ```bash
@@ -66,20 +87,22 @@ CLI flags override config values:
 uv run lfrm-train --config configs/sudoku_brc.toml --learning-rate 1e-4 --batch-size 16
 ```
 
-BRC-Sudoku and TRM dense-unroll recurrent supervision are controlled by
-`model.brc.step_loss_weights` and `model.trm.step_loss_weights`: BRC uses one
-relative CE weight per recurrent step, while TRM uses one relative CE weight per
-rollout/output step. The weights are normalized internally. BRC-Sudoku additionally
-reports given consistency, invalid-board rate, row/column/box conflict count,
-verifier ranking accuracy, and belief/refinement diagnostics.
+BRC-Sudoku recurrent supervision is controlled by `model.brc.step_loss_weights`,
+one relative CE weight per recurrent step. The weights are normalized internally.
+TRM/URM official ACT configs do not use step-weighted dense supervision; dense
+unroll remains a separate experimental path. BRC-Sudoku additionally reports
+given consistency, invalid-board rate, row/column/box conflict count, verifier
+ranking accuracy, and belief/refinement diagnostics.
 
 The package also applies project-level JAX defaults before JAX initializes:
 Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, the XLA GPU
 latency hiding scheduler is enabled, GPU preallocation is set to 95% with
 `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`, and preallocation is explicitly enabled.
-Values already set in the shell are preserved. `TF_GPU_ALLOCATOR` is not set by
-default because JAX documents `cuda_malloc_async` as a growing memory pool rather
-than the fixed preallocation behavior expected for these training runs.
+These defaults intentionally override stale shell values; set
+`LFRM_RESPECT_EXTERNAL_JAX_ENV=true` to preserve externally supplied JAX memory
+settings. `TF_GPU_ALLOCATOR` is not set by default because JAX documents
+`cuda_malloc_async` as a growing memory pool rather than the fixed preallocation
+behavior expected for these training runs.
 
 ## Notes
 

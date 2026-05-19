@@ -58,3 +58,10 @@ def loss_mask_from_given(model: object, given_mask: jax.Array) -> jax.Array:
     if supervision == "full_grid":
         return jnp.ones_like(given_mask, dtype=jnp.float32)
     raise ValueError(f"Unsupported supervision mode: {supervision}")
+
+
+def supervised_loss_mask(model: object, given_mask: jax.Array, targets: jax.Array) -> jax.Array:
+    mask = loss_mask_from_given(model, given_mask)
+    # ARC-style datasets use label 0 as padding / ignore_label_id. Sudoku and Maze
+    # labels are non-zero, so this keeps their behavior unchanged.
+    return mask * (targets != 0).astype(jnp.float32)

@@ -5,7 +5,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, replace
 from datetime import datetime
-import math
 import os
 from pathlib import Path
 import tomllib
@@ -27,7 +26,7 @@ from lfrm.config import (
     URMConfig,
     WandbConfig,
 )
-from lfrm.datasets import dataset_overview, load_dataset, sample_batch
+from lfrm.datasets import GridBatchSampler, dataset_overview, load_dataset, sample_batch
 from lfrm.training import (
     build_ema_update_runner,
     build_eval_step_runner,
@@ -211,8 +210,8 @@ def load_toml_config(path: str | None) -> dict[str, object]:
         raise ValueError("Only supervision='unknown_only' or 'full_grid' is supported")
     if flat.get("loss_type", "softmax") not in ("softmax", "stablemax"):
         raise ValueError("Only loss_type='softmax' or loss_type='stablemax' is supported")
-    if flat.get("optimizer_type", "adamw") not in ("adamw", "adam_atan2"):
-        raise ValueError("Only optimizer_type='adamw' or optimizer_type='adam_atan2' is supported")
+    if flat.get("optimizer_type", "adamw") not in ("adamw", "adam_atan2", "muon"):
+        raise ValueError("Only optimizer_type='adamw', optimizer_type='adam_atan2', or optimizer_type='muon' is supported")
     return flat
 
 
@@ -319,7 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--urm-rope-theta", type=float, default=10000.0)
     parser.add_argument("--urm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--urm-step-loss-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--optimizer-type", choices=("adamw", "adam_atan2"), default="adamw")
+    parser.add_argument("--optimizer-type", choices=("adamw", "adam_atan2", "muon"), default="adamw")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--puzzle-embed-learning-rate", type=float, default=0.0)
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
@@ -524,7 +523,7 @@ def read_wandb_run_id(run_dir: Path) -> str | None:
 
 
 def schedule_learning_rate(config: ExperimentConfig, step: int) -> float:
-    optimizer_step = max(1, step)
+    optimizer_step = max(0, step - 1)
     optimizer_updates = max(1, config.train.optimizer_updates)
     warmup_steps = max(1, config.optimizer.lr_warmup_steps)
     peak = config.optimizer.learning_rate
@@ -552,7 +551,7 @@ def updates_from_epochs(dataset, batch_size: int, epochs: int) -> int:
         raise ValueError("batch_size must be at least 1")
     return max(
         1,
-        math.ceil(
+        int(
             epochs
             * dataset.spec.total_groups
             * dataset.spec.mean_puzzle_examples
@@ -607,20 +606,23 @@ def init_wandb(config: ExperimentConfig, *, run_dir: Path, resume_run_id: str | 
 
 
 def sample_device_batch(
-    rng: np.random.Generator,
+    rng: np.random.Generator | GridBatchSampler,
     dataset,
     *,
     config: ExperimentConfig,
     split: str,
     device: jax.Device,
 ) -> dict[str, jax.Array]:
-    batch = sample_batch(
-        rng,
-        dataset,
-        batch_size=config.train.batch_size,
-        seq_len=config.model.seq_len,
-        split=split,
-    )
+    if isinstance(rng, GridBatchSampler):
+        batch = rng.sample(batch_size=config.train.batch_size, seq_len=config.model.seq_len, split=split)
+    else:
+        batch = sample_batch(
+            rng,
+            dataset,
+            batch_size=config.train.batch_size,
+            seq_len=config.model.seq_len,
+            split=split,
+        )
     return jax.device_put(batch, device=device)
 
 
@@ -798,6 +800,7 @@ def main() -> None:
             resume_step = restored_step
 
     train_rng = np.random.default_rng(config.train.seed + resume_step)
+    train_sampler = GridBatchSampler(train_rng, dataset)
     train_key = jax.random.fold_in(jax.random.key(config.train.seed), resume_step)
     scalar_metrics = scalar_metric_names(config)
 
@@ -839,7 +842,7 @@ def main() -> None:
 
     def sample_train_batch():
         return sample_device_batch(
-            train_rng,
+            train_sampler,
             dataset,
             config=config,
             split="train",
@@ -848,26 +851,36 @@ def main() -> None:
 
     prefetcher = BatchPrefetcher(sample_train_batch, depth=2)
 
-    current_batch = prefetcher.next()
+    current_batches = [
+        prefetcher.next()
+        for _ in range(config.train.gradient_accumulation_steps)
+    ]
     use_trm_act = config.model.model_type in ("trm", "urm") and config.train.trm_train_mode == "act"
     console_model_label = "brc" if config.model.model_type == "brc_sudoku" else config.model.model_type
-    train_carry = model.initial_carry(current_batch) if use_trm_act else None
+    train_carries = (
+        [model.initial_carry(batch) for batch in current_batches]
+        if use_trm_act
+        else None
+    )
     eval_interval = eval_interval_updates(config)
 
     try:
         for step in range(resume_step + 1, config.train.optimizer_updates + 1):
             is_eval_step = step % eval_interval == 0 or step == config.train.optimizer_updates
             metrics = None
-            for _ in range(config.train.gradient_accumulation_steps):
+            for microbatch_index in range(config.train.gradient_accumulation_steps):
                 train_key, step_key = jax.random.split(train_key)
+                current_batch = current_batches[microbatch_index]
                 if use_trm_act:
+                    assert train_carries is not None
                     metrics, train_carry = train_step_fn(
                         model,
                         optimizer,
-                        train_carry,
+                        train_carries[microbatch_index],
                         current_batch,
                         step_key,
                     )
+                    train_carries[microbatch_index] = train_carry
                 else:
                     metrics = train_step_fn(
                         model,
@@ -875,7 +888,7 @@ def main() -> None:
                         current_batch,
                         step_key,
                     )
-                current_batch = prefetcher.next()
+                current_batches[microbatch_index] = prefetcher.next()
             if metrics is None:
                 raise RuntimeError("No training micro-batches were processed")
 

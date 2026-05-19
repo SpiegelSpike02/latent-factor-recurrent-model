@@ -3,6 +3,7 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import optax
+import optax.contrib
 
 from lfrm.config import ExperimentConfig
 
@@ -53,11 +54,30 @@ def scheduled_lr(
         decay_steps=max(optimizer_updates, warmup_steps + 1),
         end_value=peak_value * min_ratio,
     )
-    return lambda count: schedule(count + jnp.asarray(1, dtype=count.dtype))
+    return schedule
 
 
 def _is_puzzle_embedding_path(path: tuple[object, ...]) -> bool:
     return any(getattr(entry, "key", None) == "puzzle_embed" for entry in path)
+
+
+def _path_keys(path: tuple[object, ...]) -> tuple[str, ...]:
+    return tuple(str(getattr(entry, "key", entry)) for entry in path)
+
+
+def _is_muon_matrix_path(path: tuple[object, ...], value) -> bool:
+    if getattr(value, "ndim", None) != 2:
+        return False
+    keys = _path_keys(path)
+    return "puzzle_embed" not in keys
+
+
+def _muon_dimension_numbers(params):
+    dim_nums = optax.contrib.MuonDimensionNumbers()
+    return jax.tree_util.tree_map_with_path(
+        lambda path, value: dim_nums if _is_muon_matrix_path(path, value) else None,
+        params,
+    )
 
 
 def _optimizer_param_labels(params):
@@ -84,7 +104,27 @@ def _adam_atan2_optimizer(config: ExperimentConfig, schedule) -> optax.GradientT
     return optax.chain(*transforms)
 
 
+def _muon_optimizer(config: ExperimentConfig, schedule) -> optax.GradientTransformation:
+    transforms: list[optax.GradientTransformation] = []
+    if config.optimizer.grad_clip_norm > 0.0:
+        transforms.append(optax.clip_by_global_norm(config.optimizer.grad_clip_norm))
+    transforms.append(
+        optax.contrib.muon(
+            learning_rate=schedule,
+            beta=config.optimizer.beta2,
+            weight_decay=config.optimizer.weight_decay,
+            adam_b1=config.optimizer.beta1,
+            adam_b2=config.optimizer.beta2,
+            adam_weight_decay=0.0,
+            muon_weight_dimension_numbers=_muon_dimension_numbers,
+        )
+    )
+    return optax.chain(*transforms)
+
+
 def _default_optimizer(config: ExperimentConfig, schedule) -> optax.GradientTransformation:
+    if config.optimizer.optimizer_type == "muon":
+        return _muon_optimizer(config, schedule)
     transforms: list[optax.GradientTransformation] = []
     if config.optimizer.grad_clip_norm > 0.0:
         transforms.append(optax.clip_by_global_norm(config.optimizer.grad_clip_norm))

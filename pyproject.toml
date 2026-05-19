@@ -12,7 +12,7 @@ dependencies = [
   "flax>=0.11.1",
   "huggingface-hub>=0.30.0",
   "jax[cuda13]>=0.10.0",
-  "optax>=0.2.4",
+  "optax>=0.2.8",
   "orbax-checkpoint>=0.11.5",
   "pytest>=9.0.3",
   "wandb>=0.19.0",
@@ -22,6 +22,7 @@ dependencies = [
 lfrm-train = "lfrm.cli:main"
 lfrm-build-sudoku = "lfrm.scripts.build_sudoku_dataset:main"
 lfrm-build-maze = "lfrm.scripts.build_maze_dataset:main"
+lfrm-build-arc = "lfrm.scripts.build_arc_dataset:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["lfrm"]

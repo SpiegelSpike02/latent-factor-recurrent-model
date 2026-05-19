@@ -145,13 +145,68 @@ def sample_batch(
     else:
         indices = rng.integers(total, size=batch_size, endpoint=False)
 
-    batch_given_mask = np.asarray(given_mask[indices], dtype=bool)
-    return {
-        "inputs": np.asarray(inputs[indices], dtype=np.int32),
-        "labels": np.asarray(labels[indices], dtype=np.int32),
-        "given_mask": batch_given_mask,
-        "puzzle_identifiers": np.asarray(puzzle_identifiers[indices], dtype=np.int32),
-    }
+    return _make_batch(inputs, labels, given_mask, puzzle_identifiers, indices)
+
+
+class GridBatchSampler:
+    """Stateful sampler matching the official grouped epoch order.
+
+    Training groups are shuffled without replacement and consumed in order. Each
+    selected group contributes one randomly selected puzzle, and as many examples
+    from that puzzle as fit in the batch. The group order is reshuffled after all
+    groups have been visited.
+    """
+
+    def __init__(self, rng: np.random.Generator, dataset: GridDataset) -> None:
+        self.rng = rng
+        self.dataset = dataset
+        self._group_order: np.ndarray | None = None
+        self._group_cursor = 0
+
+    def sample(self, *, batch_size: int, seq_len: int, split: str) -> dict[str, np.ndarray]:
+        if self.dataset.spec.seq_len != seq_len:
+            raise ValueError(f"Requested seq_len={seq_len}, but dataset seq_len={self.dataset.spec.seq_len}")
+        if split == "train" and self.dataset.train_puzzle_indices is not None and self.dataset.train_group_indices is not None:
+            indices = self._sample_grouped_train_indices(batch_size)
+            return _make_batch(
+                self.dataset.train_inputs,
+                self.dataset.train_labels,
+                self.dataset.train_given_mask,
+                self.dataset.train_puzzle_identifiers,
+                indices,
+            )
+        return sample_batch(self.rng, self.dataset, batch_size, seq_len, split=split)
+
+    def _reset_group_order(self) -> None:
+        group_count = int(self.dataset.train_group_indices.size - 1)  # type: ignore[union-attr]
+        self._group_order = self.rng.permutation(group_count).astype(np.int64, copy=False)
+        self._group_cursor = 0
+
+    def _sample_grouped_train_indices(self, batch_size: int) -> np.ndarray:
+        puzzle_indices = self.dataset.train_puzzle_indices
+        group_indices = self.dataset.train_group_indices
+        if puzzle_indices is None or group_indices is None:
+            raise ValueError("Grouped train sampling requires puzzle_indices and group_indices")
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        batches: list[np.ndarray] = []
+        remaining = batch_size
+        while remaining > 0:
+            if self._group_order is None or self._group_cursor >= self._group_order.size:
+                self._reset_group_order()
+            assert self._group_order is not None
+            group_id = int(self._group_order[self._group_cursor])
+            self._group_cursor += 1
+            puzzle_low = int(group_indices[group_id])
+            puzzle_high = int(group_indices[group_id + 1])
+            puzzle_id = int(self.rng.integers(puzzle_low, puzzle_high, endpoint=False))
+            example_start = int(puzzle_indices[puzzle_id])
+            example_size = int(puzzle_indices[puzzle_id + 1] - example_start)
+            append_size = min(example_size, remaining)
+            example_offsets = self.rng.choice(example_size, append_size, replace=False)
+            batches.append((example_start + example_offsets).astype(np.int64, copy=False))
+            remaining -= append_size
+        return np.concatenate(batches).astype(np.int64, copy=False)
 
 
 def dataset_overview(dataset: GridDataset) -> dict[str, Any]:
@@ -172,7 +227,13 @@ def dataset_overview(dataset: GridDataset) -> dict[str, Any]:
 
 
 def _split_path(split_dir: Path, name: str) -> Path:
-    return split_dir / f"{name}.npy"
+    direct_path = split_dir / f"{name}.npy"
+    if direct_path.is_file():
+        return direct_path
+    official_all_path = split_dir / f"all__{name}.npy"
+    if official_all_path.is_file():
+        return official_all_path
+    return direct_path
 
 
 def _load_split_array(split_dir: Path, name: str) -> np.ndarray:
@@ -233,6 +294,21 @@ def _sample_grouped_indices(
     example_lows = puzzle_indices[puzzle_ids]
     example_highs = puzzle_indices[puzzle_ids + 1]
     return rng.integers(example_lows, example_highs, endpoint=False).astype(np.int64, copy=False)
+
+
+def _make_batch(
+    inputs: np.ndarray,
+    labels: np.ndarray,
+    given_mask: np.ndarray,
+    puzzle_identifiers: np.ndarray,
+    indices: np.ndarray,
+) -> dict[str, np.ndarray]:
+    return {
+        "inputs": np.asarray(inputs[indices], dtype=np.int32),
+        "labels": np.asarray(labels[indices], dtype=np.int32),
+        "given_mask": np.asarray(given_mask[indices], dtype=bool),
+        "puzzle_identifiers": np.asarray(puzzle_identifiers[indices], dtype=np.int32),
+    }
 
 
 def _validate_indices(

@@ -28,13 +28,10 @@ puzzle_embed_len = 1
 rms_norm_eps = 1e-5
 rope_theta = 10000.0
 halt_exploration_prob = 0.1
-step_loss_weights = [
-  1, 2, 3, 4, 5, 6, 7, 8,
-  9, 10, 11, 12, 13, 14, 15, 16,
-]
+
 
 [optimizer]
-optimizer_type = "adam_atan2"
+optimizer_type = "muon"
 learning_rate = 1e-4
 puzzle_embed_learning_rate = 1e-4
 lr_min_ratio = 1.0

@@ -8,8 +8,8 @@ from flax import nnx
 from lfrm.models import BRCSudokuModel, TinyRecursiveModel, UnifiedReasoningModel
 from lfrm.training.factory import GridReasoningModel
 from lfrm.training.losses import (
-    loss_mask_from_given,
     masked_token_ce,
+    supervised_loss_mask,
     target_probability as token_target_probability,
     token_cross_entropy,
 )
@@ -437,7 +437,7 @@ def brc_loss_and_metrics(
         train=train,
     )
     given_mask = inputs != 1
-    loss_mask = loss_mask_from_given(model, given_mask)
+    loss_mask = supervised_loss_mask(model, given_mask, targets)
     brc = model.brc
     zero = jnp.asarray(0.0, dtype=jnp.float32)
 
@@ -636,7 +636,7 @@ def loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = loss_mask_from_given(model, given_mask)
+    loss_mask = supervised_loss_mask(model, given_mask, targets)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
 
@@ -813,7 +813,7 @@ def trm_act_loss_and_metrics(
     )
     targets = new_carry["current_labels"]
     given_mask = new_carry["current_given_mask"]
-    loss_mask = loss_mask_from_given(model, given_mask)
+    loss_mask = supervised_loss_mask(model, given_mask, targets)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
@@ -895,7 +895,7 @@ def trm_dense_unroll_loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = loss_mask_from_given(model, given_mask)
+    loss_mask = supervised_loss_mask(model, given_mask, targets)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
@@ -988,7 +988,7 @@ def trm_eval_loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = loss_mask_from_given(model, given_mask)
+    loss_mask = supervised_loss_mask(model, given_mask, targets)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
@@ -1030,7 +1030,7 @@ def trm_eval_loss_and_metrics(
         axis=0,
     ).squeeze(0)
     selected_token_loss = token_cross_entropy(model, selected_logits, targets)
-    lm_loss_value = jnp.sum(selected_token_loss * loss_mask) / normalizer
+    selected_lm_loss_value = jnp.sum(selected_token_loss * loss_mask) / normalizer
     selected_exact_targets = jnp.take_along_axis(
         per_step_example_solved.astype(jnp.float32),
         selected_step[None, :],
@@ -1038,7 +1038,10 @@ def trm_eval_loss_and_metrics(
     ).squeeze(0)
     selected_exact_count = jnp.sum(selected_exact_targets)
     halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(halt_logits, jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))))
-    loss = lm_loss_value + halt_loss_weight * halt_loss
+    final_logits = step_logits[-1]
+    final_token_loss = token_cross_entropy(model, final_logits, targets)
+    final_lm_loss_value = jnp.sum(final_token_loss * loss_mask) / normalizer
+    loss = final_lm_loss_value + halt_loss_weight * halt_loss
 
     predictions = jnp.argmax(selected_logits, axis=-1)
     target_probability = token_target_probability(model, selected_logits, targets)
@@ -1049,9 +1052,6 @@ def trm_eval_loss_and_metrics(
     selected_q_halt_logits = jnp.take_along_axis(halt_logits, selected_step[None, :], axis=0).squeeze(0)
     selected_q_halt_correct = (selected_q_halt_logits >= 0.0) == selected_exact_targets.astype(bool)
     q_halt_accuracy = jnp.mean(selected_q_halt_correct.astype(jnp.float32))
-    final_logits = step_logits[-1]
-    final_token_loss = token_cross_entropy(model, final_logits, targets)
-    final_lm_loss_value = jnp.sum(final_token_loss * loss_mask) / normalizer
     final_predictions = jnp.argmax(final_logits, axis=-1)
     final_correct = (final_predictions == targets).astype(jnp.float32) * loss_mask
     final_cell_accuracy = jnp.sum(final_correct) / metric_normalizer
@@ -1065,20 +1065,20 @@ def trm_eval_loss_and_metrics(
     oracle_step = jnp.argmin(per_step_example_loss, axis=0)
     metrics = {
         "loss": loss,
-        "lm_loss": lm_loss_value,
+        "lm_loss": final_lm_loss_value,
         "q_halt_loss": halt_loss,
         "count": jnp.asarray(inputs.shape[0], dtype=jnp.float32),
-        "accuracy": cell_accuracy,
-        "exact_accuracy": exact_accuracy,
+        "accuracy": final_cell_accuracy,
+        "exact_accuracy": jnp.mean(final_exact_examples.astype(jnp.float32)),
         "q_halt_accuracy": q_halt_accuracy,
-        "steps": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
+        "steps": jnp.asarray(step_logits.shape[0], dtype=jnp.float32),
         "halt_loss": halt_loss,
         "final_lm_loss": final_lm_loss_value,
         "final_accuracy": final_cell_accuracy,
         "final_exact_accuracy": jnp.mean(final_exact_examples.astype(jnp.float32)),
         "halted_target_probability": target_probability,
-        "exact_count": selected_exact_count,
-        "selected_lm_loss": lm_loss_value,
+        "exact_count": final_exact_count,
+        "selected_lm_loss": selected_lm_loss_value,
         "selected_accuracy": cell_accuracy,
         "selected_exact_accuracy": exact_accuracy,
         "selected_exact_count": selected_exact_count,

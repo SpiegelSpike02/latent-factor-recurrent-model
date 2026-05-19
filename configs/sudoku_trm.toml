@@ -34,12 +34,7 @@ rms_norm_eps = 1e-5
 halt_exploration_prob = 0.1
 # Matches official no_ACT_continue=True: halt uses one sigmoid logit, no continue Q loss.
 no_act_continue = true
-step_loss_weights = [
-  1, 2, 3, 4,
-  5, 6, 7, 8,
-  9, 10, 11, 12,
-  13, 14, 15, 16,
-]
+
 
 [optimizer]
 optimizer_type = "adam_atan2"

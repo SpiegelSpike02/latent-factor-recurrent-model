@@ -1,8 +1,8 @@
 [data]
-dataset_path = "data/maze-30x30-hard-1k-aug"
+dataset_path = "data/arc1concept-aug-1000"
 
 [task]
-type = "maze"
+type = "arc"
 supervision = "full_grid"
 clamp_given = false
 
@@ -17,8 +17,7 @@ dropout_rate = 0.0
 loss_type = "stablemax"
 
 [model.trm]
-# Official TRM naming: deep_recursion = H_cycles, latent_recursion = L_cycles,
-# block_layers = L_layers. Official Maze attention config uses 3/4/2.
+# Official TRM ARC config: H_cycles=3, L_cycles=4, L_layers=2.
 deep_recursion = 3
 latent_recursion = 4
 block_layers = 2
@@ -31,31 +30,30 @@ puzzle_embed_ndim = 512
 puzzle_embed_len = 16
 position_encoding = "rope"
 rms_norm_eps = 1e-5
+rope_theta = 10000.0
 halt_exploration_prob = 0.1
-# Matches official no_ACT_continue=True: halt uses one sigmoid logit, no continue Q loss.
 no_act_continue = true
 
 
 [optimizer]
 optimizer_type = "adam_atan2"
 learning_rate = 1e-4
-puzzle_embed_learning_rate = 1e-4
+puzzle_embed_learning_rate = 1e-2
 lr_min_ratio = 1.0
 beta1 = 0.9
 beta2 = 0.95
-weight_decay = 1.0
-puzzle_embed_weight_decay = 1.0
+weight_decay = 0.1
+puzzle_embed_weight_decay = 0.1
 lr_warmup_steps = 2000
 grad_clip_norm = 1.0
 flatten_optimizer = false
 
 [train]
-batch_size = 256
-gradient_accumulation_steps = 3
+batch_size = 768
 eval_batch_size = 768
-epochs = 50000
+epochs = 100000
 log_epochs = 10
-eval_epochs = 5000
+eval_epochs = 10000
 trm_train_mode = "act"
 halt_loss_weight = 0.5
 seed = 0
@@ -71,5 +69,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-trm-official-rope-act-stablemax-b768-70k"
+name = "arc1-trm-official-rope-act-stablemax"
 mode = "online"

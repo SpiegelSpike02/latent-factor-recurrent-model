@@ -5,13 +5,14 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from lfrm.cli import load_toml_config, resolve_resume_checkpoint
+from lfrm.cli import load_toml_config, resolve_resume_checkpoint, schedule_learning_rate, updates_from_epochs
 from lfrm.config import (
     DataConfig,
     ExperimentConfig,
@@ -21,6 +22,7 @@ from lfrm.config import (
     RuntimeConfig,
     TRMConfig,
     TrainConfig,
+    URMConfig,
     WandbConfig,
 )
 from lfrm.models import BRCSudokuModel, TinyRecursiveModel
@@ -36,6 +38,7 @@ from lfrm.training import (
     stablemax_cross_entropy_with_integer_labels,
     trm_dense_unroll_loss_and_metrics,
 )
+from lfrm.training.optim import scheduled_lr
 from lfrm.training.steps import _clamp_logits_to_given
 
 
@@ -71,6 +74,31 @@ class GridModelTests(unittest.TestCase):
             apply_jax_defaults()
             self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
             self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.80")
+
+    def test_updates_from_epochs_matches_official_floor_conversion(self) -> None:
+        dataset = SimpleNamespace(
+            spec=SimpleNamespace(total_groups=1000, mean_puzzle_examples=1.0)
+        )
+        self.assertEqual(updates_from_epochs(dataset, batch_size=768, epochs=5000), 6510)
+
+    def test_lr_schedule_matches_official_zero_based_warmup(self) -> None:
+        schedule = scheduled_lr(
+            peak_value=1e-4,
+            min_ratio=1.0,
+            warmup_steps=2000,
+            optimizer_updates=10000,
+        )
+        self.assertEqual(float(schedule(jnp.asarray(0, dtype=jnp.int32))), 0.0)
+        self.assertAlmostEqual(float(schedule(jnp.asarray(1, dtype=jnp.int32))), 5e-8, places=12)
+        config = ExperimentConfig(
+            model=ModelConfig(vocab_size=11),
+            optimizer=OptimizerConfig(learning_rate=1e-4, lr_min_ratio=1.0, lr_warmup_steps=2000),
+            train=TrainConfig(optimizer_updates=10000),
+            data=DataConfig(dataset_path="unused"),
+            runtime=RuntimeConfig(),
+            wandb=WandbConfig(),
+        )
+        self.assertEqual(schedule_learning_rate(config, 1), 0.0)
 
     def test_solved_rate_metric(self) -> None:
         class FixedModel:
@@ -373,6 +401,7 @@ class GridModelTests(unittest.TestCase):
             wandb=WandbConfig(),
         )
         model = create_model(config)
+        self.assertNotIn("init_hidden", str(nnx.state(model, nnx.Param)))
         optimizer = create_optimizer(model, config)
         train_step = build_train_step_runner()
         puzzle = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
@@ -387,6 +416,7 @@ class GridModelTests(unittest.TestCase):
         }
         before = model.z_global[...]
         metrics = train_step(model, optimizer, batch, jax.random.key(34))
+        metrics = train_step(model, optimizer, batch, jax.random.key(35))
         after = model.z_global[...]
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
         self.assertTrue(bool(jnp.isfinite(metrics["meta_outer_loss"])))
@@ -570,12 +600,20 @@ class GridModelTests(unittest.TestCase):
             "puzzle_identifiers": jnp.asarray([0, 0], dtype=jnp.int32),
         }
         before = model.puzzle_embed.weights[...]
+        carry = model.initial_carry(batch)
+        metrics, carry = train_step(
+            model,
+            optimizer,
+            carry,
+            batch,
+            jax.random.key(0),
+        )
         metrics, _carry = train_step(
             model,
             optimizer,
-            model.initial_carry(batch),
+            carry,
             batch,
-            jax.random.key(0),
+            jax.random.key(1),
         )
         after = model.puzzle_embed.weights[...]
 
@@ -610,6 +648,63 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(model.prefix_len, 2)
         self.assertEqual(model.puzzle_embed.weights[...].shape, (5, 12))
         self.assertNotIn("state_init", str(params))
+
+    def test_urm_muon_train_step_finite(self) -> None:
+        config = ExperimentConfig(
+            model=ModelConfig(
+                vocab_size=12,
+                task_type="arc",
+                supervision="full_grid",
+                model_type="urm",
+                num_puzzle_identifiers=1,
+                seq_len=16,
+                grid_height=4,
+                grid_width=4,
+                d_model=8,
+                urm=URMConfig(
+                    recurrent_steps=2,
+                    deep_recursion=1,
+                    latent_recursion=1,
+                    block_layers=1,
+                    num_heads=2,
+                    mlp_ratio=2,
+                    conv_kernel=2,
+                    puzzle_embed_ndim=8,
+                    puzzle_embed_len=1,
+                ),
+            ),
+            optimizer=OptimizerConfig(
+                optimizer_type="muon",
+                learning_rate=1e-4,
+                puzzle_embed_learning_rate=1e-2,
+                lr_min_ratio=1.0,
+                beta2=0.95,
+                lr_warmup_steps=1,
+            ),
+            train=TrainConfig(batch_size=2, epochs=2, optimizer_updates=2, halt_loss_weight=0.5),
+            data=DataConfig(),
+            runtime=RuntimeConfig(compute_dtype="float32"),
+            wandb=WandbConfig(),
+        )
+        model = create_model(config)
+        optimizer = create_optimizer(model, config)
+        train_step = build_trm_act_train_step_runner(config.train.halt_loss_weight)
+        batch = {
+            "inputs": jnp.full((2, 16), 2, dtype=jnp.int32),
+            "labels": jnp.full((2, 16), 3, dtype=jnp.int32),
+            "given_mask": jnp.zeros((2, 16), dtype=bool),
+            "puzzle_identifiers": jnp.asarray([0, 0], dtype=jnp.int32),
+        }
+
+        metrics, _carry = train_step(
+            model,
+            optimizer,
+            model.initial_carry(batch),
+            batch,
+            jax.random.key(0),
+        )
+
+        self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
 
     def test_halt_selected_metrics_use_first_positive_halt_step(self) -> None:
         class HaltSelectedModel:
