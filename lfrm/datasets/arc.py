@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -17,7 +18,8 @@ PUZZLE_ID_SEPARATOR = "|||"
 ARC_NETWORK_SOURCES = {
     "samsung-trm-hf": (
         "https://huggingface.co",
-        "datasets/wtfmahe/Samsung-TRM/resolve/main/kaggle/combined",
+        "wtfmahe/Samsung-TRM",
+        "kaggle/combined",
     ),
 }
 
@@ -148,20 +150,34 @@ def ensure_arc_source_files(
 ) -> None:
     if source not in ARC_NETWORK_SOURCES:
         raise ValueError(f"Unsupported ARC download source: {source!r}")
-    default_endpoint, repo_path = ARC_NETWORK_SOURCES[source]
+    default_endpoint, repo_id, repo_dir = ARC_NETWORK_SOURCES[source]
     endpoint = os.environ.get("HF_ENDPOINT", default_endpoint).rstrip("/")
-    base_url = f"{endpoint}/{repo_path}"
+    base_url = f"{endpoint}/{repo_id}/resolve/main/{repo_dir}"
     for subset in subsets:
         for kind in ("challenges", "solutions"):
             output_path = _arc_file_path(input_file_prefix, subset, kind)
             if output_path.exists() and output_path.stat().st_size > 0 and not overwrite:
                 continue
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            url = f"{base_url}/arc-agi_{subset}_{kind}.json"
-            print(f"[arc] downloading {url} -> {output_path}", flush=True)
             tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+            filename = f"arc-agi_{subset}_{kind}.json"
+            repo_filename = f"{repo_dir}/{filename}"
+            url = f"{base_url}/{filename}"
+            print(f"[arc] downloading {repo_id}/{repo_filename} -> {output_path}", flush=True)
             try:
-                urlretrieve(url, tmp_path)
+                try:
+                    from huggingface_hub import hf_hub_download
+
+                    downloaded = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=repo_filename,
+                        repo_type="model",
+                        endpoint=endpoint,
+                    )
+                    shutil.copyfile(downloaded, tmp_path)
+                except Exception as hub_error:
+                    print(f"[arc] huggingface_hub download failed ({hub_error}); falling back to {url}", flush=True)
+                    urlretrieve(url, tmp_path)
                 tmp_path.replace(output_path)
             finally:
                 if tmp_path.exists():
