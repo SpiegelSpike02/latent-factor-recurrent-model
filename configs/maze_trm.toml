@@ -50,7 +50,7 @@ beta1 = 0.9
 beta2 = 0.95
 weight_decay = 1.0
 puzzle_embed_weight_decay = 1.0
-warmup_epochs = 1536
+lr_warmup_steps = 2000
 grad_clip_norm = 1.0
 flatten_optimizer = false
 

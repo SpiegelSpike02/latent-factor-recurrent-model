@@ -84,7 +84,7 @@ ALLOWED_SECTION_KEYS = {
         "beta2",
         "weight_decay",
         "puzzle_embed_weight_decay",
-        "warmup_epochs",
+        "lr_warmup_steps",
         "grad_clip_norm",
         "flatten_optimizer",
     },
@@ -327,7 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--puzzle-embed-weight-decay", type=float, default=0.0)
-    parser.add_argument("--warmup-epochs", type=int, default=100)
+    parser.add_argument("--lr-warmup-steps", type=int, default=100)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--flatten-optimizer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compute-dtype", choices=("bfloat16", "float32"), default="bfloat16")
@@ -438,7 +438,7 @@ def build_config(
         beta2=args.beta2,
         weight_decay=args.weight_decay,
         puzzle_embed_weight_decay=args.puzzle_embed_weight_decay,
-        warmup_epochs=args.warmup_epochs,
+        lr_warmup_steps=args.lr_warmup_steps,
         grad_clip_norm=args.grad_clip_norm,
         flatten_optimizer=args.flatten_optimizer,
     )
@@ -526,13 +526,13 @@ def read_wandb_run_id(run_dir: Path) -> str | None:
 def schedule_learning_rate(config: ExperimentConfig, step: int) -> float:
     optimizer_step = max(1, step)
     optimizer_updates = max(1, config.train.optimizer_updates)
-    warmup_updates = max(1, config.optimizer.warmup_updates)
+    warmup_steps = max(1, config.optimizer.lr_warmup_steps)
     peak = config.optimizer.learning_rate
     end = peak * config.optimizer.lr_min_ratio
-    decay_updates = max(optimizer_updates, warmup_updates + 1)
-    if optimizer_step <= warmup_updates:
-        return peak * optimizer_step / max(warmup_updates, 1)
-    progress = min(max((optimizer_step - warmup_updates) / max(decay_updates - warmup_updates, 1), 0.0), 1.0)
+    decay_updates = max(optimizer_updates, warmup_steps + 1)
+    if optimizer_step <= warmup_steps:
+        return peak * optimizer_step / max(warmup_steps, 1)
+    progress = min(max((optimizer_step - warmup_steps) / max(decay_updates - warmup_steps, 1), 0.0), 1.0)
     cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
     return float(end + (peak - end) * cosine)
 
@@ -569,13 +569,9 @@ def apply_epoch_budget(config: ExperimentConfig, dataset) -> ExperimentConfig:
         log_interval_updates=updates_from_epochs(dataset, effective_batch_size, config.train.log_epochs),
         eval_interval_updates=updates_from_epochs(dataset, effective_batch_size, config.train.eval_epochs),
     )
-    optimizer = replace(
-        config.optimizer,
-        warmup_updates=updates_from_epochs(dataset, effective_batch_size, config.optimizer.warmup_epochs),
-    )
     return ExperimentConfig(
         model=config.model,
-        optimizer=optimizer,
+        optimizer=config.optimizer,
         train=train,
         data=config.data,
         runtime=config.runtime,
@@ -754,8 +750,8 @@ def main() -> None:
         raise ValueError("log_epochs must be positive")
     if config.train.eval_epochs <= 0:
         raise ValueError("eval_epochs must be positive")
-    if config.optimizer.warmup_epochs <= 0:
-        raise ValueError("warmup_epochs must be positive")
+    if config.optimizer.lr_warmup_steps <= 0:
+        raise ValueError("lr_warmup_steps must be positive")
     if config.model.model_type not in ("trm", "urm") and config.train.trm_train_mode != "act":
         raise ValueError("trm_train_mode is only supported for model_type='trm' or 'urm'")
 
@@ -826,8 +822,7 @@ def main() -> None:
         "log_interval=", config.train.log_interval_updates,
         "eval_epochs=", config.train.eval_epochs,
         "eval_interval=", eval_interval_updates(config),
-        "warmup_epochs=", config.optimizer.warmup_epochs,
-        "warmup_updates=", config.optimizer.warmup_updates,
+        "lr_warmup_steps=", config.optimizer.lr_warmup_steps,
         "trm_train_mode=", config.train.trm_train_mode,
         "seq_len=", config.model.seq_len,
         "grid_height=", config.model.grid_height,

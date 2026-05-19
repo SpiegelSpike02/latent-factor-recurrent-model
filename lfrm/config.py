@@ -110,8 +110,7 @@ class OptimizerConfig:
     beta2: float = 0.999
     weight_decay: float = 0.1
     puzzle_embed_weight_decay: float = 0.0
-    warmup_epochs: int = 100
-    warmup_updates: int = 0
+    lr_warmup_steps: int = 100
     grad_clip_norm: float = 1.0
     flatten_optimizer: bool = False
 
