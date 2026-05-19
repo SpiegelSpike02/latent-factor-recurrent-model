@@ -213,7 +213,8 @@ class TRMBlock(nnx.Module):
             self.attention = Attention(config, prefix_len, dtype, rngs=rngs)
         if trm.local_mixing:
             self.local_mixing = LocalConvSwiGLU(config, prefix_len, dtype, rngs=rngs)
-        self.channel_mlp = SwiGLU(config.d_model, trm.mlp_ratio, dtype, rngs=rngs)
+        if not trm.mlp_t:
+            self.channel_mlp = SwiGLU(config.d_model, trm.mlp_ratio, dtype, rngs=rngs)
 
     def __call__(
         self,
@@ -225,7 +226,7 @@ class TRMBlock(nnx.Module):
         if self.trm.mlp_t:
             mixed = jnp.swapaxes(hidden_states, 1, 2)
             mixed = _rms_norm(mixed + self.token_mlp(mixed), self.trm.rms_norm_eps)
-            hidden_states = jnp.swapaxes(mixed, 1, 2)
+            return jnp.swapaxes(mixed, 1, 2)
         else:
             attention_out = self.attention(hidden_states, rope_cos, rope_sin, attention_bias)
             hidden_states = _rms_norm(
@@ -415,7 +416,7 @@ class TinyRecursiveModel(nnx.Module):
         )
         self.halt_head = nnx.Linear(
             config.d_model,
-            1,
+            2,
             dtype=dtype,
             param_dtype=jnp.float32,
             kernel_init=nnx.initializers.zeros,

@@ -12,7 +12,7 @@ grid_height = 9
 grid_width = 9
 d_model = 512
 rollout_steps = 16
-dropout_rate = 0.05
+dropout_rate = 0.0
 loss_type = "stablemax"
 
 [model.trm]
@@ -56,10 +56,10 @@ flatten_optimizer = false
 
 [train]
 batch_size = 768
-eval_batch_size = 2048
-max_steps = 65104
+eval_batch_size = 8192
+epochs = 50000
 log_every = 10
-eval_count = 10
+eval_epochs = 5000
 trm_train_mode = "act"
 halt_loss_weight = 0.5
 seed = 0
