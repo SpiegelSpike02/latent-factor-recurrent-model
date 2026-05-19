@@ -50,7 +50,7 @@ flatten_optimizer = false
 [train]
 batch_size = 128
 eval_batch_size = 256
-max_steps = 30000
+epochs = 50000
 log_every = 10
 eval_every = 2500
 trm_train_mode = "act"

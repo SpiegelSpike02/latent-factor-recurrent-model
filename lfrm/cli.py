@@ -80,6 +80,7 @@ ALLOWED_SECTION_KEYS = {
     "train": {
         "batch_size",
         "eval_batch_size",
+        "epochs",
         "max_steps",
         "log_every",
         "eval_every",
@@ -220,6 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Eval batch size. Uses --batch-size when set to 0.",
     )
     parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=0,
+        help="Official-style grouped dataset epochs. When >0, max_steps is derived from dataset metadata.",
+    )
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument(
         "--eval-count",
@@ -426,6 +433,7 @@ def build_config(
     train = TrainConfig(
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
+        epochs=args.epochs,
         max_steps=args.max_steps,
         log_every=args.log_every,
         eval_every=args.eval_every,
@@ -522,6 +530,50 @@ def eval_interval_steps(config: ExperimentConfig) -> int:
     if config.train.eval_count > 0:
         return max(1, math.ceil(config.train.max_steps / config.train.eval_count))
     return max(1, config.train.eval_every)
+
+
+def steps_from_epochs(dataset, batch_size: int, epochs: int) -> int:
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    return max(
+        1,
+        math.ceil(
+            epochs
+            * dataset.spec.total_groups
+            * dataset.spec.mean_puzzle_examples
+            / batch_size
+        ),
+    )
+
+
+def apply_epoch_budget(config: ExperimentConfig, dataset) -> ExperimentConfig:
+    if config.train.epochs <= 0:
+        return config
+    train = TrainConfig(
+        batch_size=config.train.batch_size,
+        eval_batch_size=config.train.eval_batch_size,
+        epochs=config.train.epochs,
+        max_steps=steps_from_epochs(dataset, config.train.batch_size, config.train.epochs),
+        log_every=config.train.log_every,
+        eval_every=config.train.eval_every,
+        eval_count=config.train.eval_count,
+        trm_train_mode=config.train.trm_train_mode,
+        halt_loss_weight=config.train.halt_loss_weight,
+        terminal_residual_weight=config.train.terminal_residual_weight,
+        seed=config.train.seed,
+        checkpoint_dir=config.train.checkpoint_dir,
+        ema=config.train.ema,
+    )
+    return ExperimentConfig(
+        model=config.model,
+        optimizer=config.optimizer,
+        train=train,
+        data=config.data,
+        runtime=config.runtime,
+        wandb=config.wandb,
+    )
 
 
 def config_to_dict(config: ExperimentConfig) -> dict[str, Any]:
@@ -1150,10 +1202,13 @@ def main() -> None:
         num_puzzle_identifiers=dataset.spec.num_puzzle_identifiers,
         seq_len=dataset.spec.seq_len,
     )
+    config = apply_epoch_budget(config, dataset)
     if config.train.batch_size < 1:
         raise ValueError("batch_size must be at least 1")
     if config.train.eval_batch_size < 0:
         raise ValueError("eval_batch_size must be non-negative")
+    if config.train.epochs < 0:
+        raise ValueError("epochs must be non-negative")
     if config.train.eval_count < 0:
         raise ValueError("eval_count must be non-negative")
     if config.model.model_type not in ("trm", "urm") and config.train.trm_train_mode != "act":
@@ -1218,6 +1273,8 @@ def main() -> None:
         "eval_examples=", overview["eval_examples"],
         "batch_size=", config.train.batch_size,
         "eval_batch_size=", config.train.eval_batch_size or config.train.batch_size,
+        "epochs=", config.train.epochs,
+        "max_steps=", config.train.max_steps,
         "eval_interval=", eval_interval_steps(config),
         "eval_count=", config.train.eval_count,
         "trm_train_mode=", config.train.trm_train_mode,
