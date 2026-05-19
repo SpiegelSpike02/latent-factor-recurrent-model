@@ -8,6 +8,8 @@ DEFAULT_JAX_ENV = {
     "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.95",
 }
 
+RESPECT_EXTERNAL_ENV_FLAG = "LFRM_RESPECT_EXTERNAL_JAX_ENV"
+
 DEFAULT_XLA_FLAGS = (
     "--xla_gpu_triton_gemm_any=true",
     "--xla_gpu_enable_latency_hiding_scheduler=true",
@@ -27,8 +29,12 @@ def _append_missing_xla_flags(existing: str, defaults: tuple[str, ...]) -> str:
 
 def apply_jax_defaults() -> None:
     """Apply project-level JAX/XLA defaults before JAX initializes."""
+    respect_external_env = os.environ.get(RESPECT_EXTERNAL_ENV_FLAG, "").lower() in {"1", "true", "yes"}
     for name, value in DEFAULT_JAX_ENV.items():
-        os.environ.setdefault(name, value)
+        if respect_external_env:
+            os.environ.setdefault(name, value)
+        else:
+            os.environ[name] = value
     os.environ["XLA_FLAGS"] = _append_missing_xla_flags(
         os.environ.get("XLA_FLAGS", ""),
         DEFAULT_XLA_FLAGS,

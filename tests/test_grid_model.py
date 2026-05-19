@@ -40,10 +40,11 @@ from lfrm.training.steps import _clamp_logits_to_given
 
 
 class GridModelTests(unittest.TestCase):
-    def test_jax_defaults_set_gpu_startup_flags_without_overriding_user_values(self) -> None:
+    def test_jax_defaults_set_gpu_startup_flags(self) -> None:
         with mock.patch.dict(
             os.environ,
             {
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                 "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.80",
                 "XLA_FLAGS": "--some_existing_flag=true",
             },
@@ -51,11 +52,25 @@ class GridModelTests(unittest.TestCase):
         ):
             apply_jax_defaults()
             self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "true")
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.80")
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.95")
             self.assertNotIn("TF_GPU_ALLOCATOR", os.environ)
             self.assertIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_enable_latency_hiding_scheduler=true", os.environ["XLA_FLAGS"].split())
+
+    def test_jax_defaults_can_respect_external_env(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LFRM_RESPECT_EXTERNAL_JAX_ENV": "true",
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.80",
+            },
+            clear=True,
+        ):
+            apply_jax_defaults()
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.80")
 
     def test_solved_rate_metric(self) -> None:
         class FixedModel:
