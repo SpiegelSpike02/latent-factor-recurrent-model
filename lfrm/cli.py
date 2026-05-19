@@ -703,7 +703,7 @@ def eval_device_batch(
     config: ExperimentConfig,
     start: int,
     stop: int,
-    device: jax.Device,
+    device: jax.Device | NamedSharding,
 ) -> dict[str, jax.Array]:
     if dataset.spec.seq_len != config.model.seq_len:
         raise ValueError(f"Requested seq_len={config.model.seq_len}, but dataset seq_len={dataset.spec.seq_len}")
@@ -718,7 +718,10 @@ def eval_device_batch(
 
 def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[str, Any]:
     mesh = data_parallel_mesh(config)
-    device = batch_sharding(mesh) or jax.devices()[0]
+    sharded_device = batch_sharding(mesh)
+    primary_device = jax.devices()[0]
+    device = sharded_device or primary_device
+    data_parallel_size = 1 if mesh is None else int(mesh.shape["data"])
     reduced: dict[str, Any] | None = None
     total = dataset.eval_inputs.shape[0]
     if total == 0:
@@ -737,12 +740,18 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
     )
     for batch_index, start in enumerate(range(0, total, batch_size), start=1):
         stop = min(start + batch_size, total)
+        actual_batch_size = stop - start
+        batch_device = (
+            device
+            if actual_batch_size % data_parallel_size == 0
+            else primary_device
+        )
         batch = eval_device_batch(
             dataset,
             config=config,
             start=start,
             stop=stop,
-            device=device,
+            device=batch_device,
         )
         metrics = jax.device_get(eval_step_fn(model, batch))
         weight = float(stop - start)
