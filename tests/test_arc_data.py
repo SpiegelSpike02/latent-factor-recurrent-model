@@ -46,7 +46,8 @@ class ARCDataTests(unittest.TestCase):
             self.assertEqual(dataset.spec.vocab_size, 12)
             self.assertEqual(dataset.train_inputs.shape[1], 900)
             self.assertEqual(dataset.eval_inputs.shape[1], 900)
-            self.assertTrue((output_dir / "train" / "all__inputs.npy").is_file())
+            self.assertEqual(dataset.train_inputs.dtype.name, "uint8")
+            self.assertEqual(dataset.train_labels.dtype.name, "uint8")
             self.assertTrue((output_dir / "train" / "inputs.npy").is_file())
 
 

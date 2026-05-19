@@ -634,6 +634,9 @@ def sample_device_batch(
             seq_len=config.model.seq_len,
             split=split,
         )
+    batch["inputs"] = np.asarray(batch["inputs"], dtype=np.int32)
+    batch["labels"] = np.asarray(batch["labels"], dtype=np.int32)
+    batch["puzzle_identifiers"] = np.asarray(batch["puzzle_identifiers"], dtype=np.int32)
     return jax.device_put(batch, device=device)
 
 

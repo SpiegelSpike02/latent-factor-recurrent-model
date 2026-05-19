@@ -226,25 +226,15 @@ def dataset_overview(dataset: GridDataset) -> dict[str, Any]:
     }
 
 
-def _split_path(split_dir: Path, name: str) -> Path:
-    direct_path = split_dir / f"{name}.npy"
-    if direct_path.is_file():
-        return direct_path
-    official_all_path = split_dir / f"all__{name}.npy"
-    if official_all_path.is_file():
-        return official_all_path
-    return direct_path
-
-
 def _load_split_array(split_dir: Path, name: str) -> np.ndarray:
-    path = _split_path(split_dir, name)
+    path = split_dir / f"{name}.npy"
     if not path.is_file():
         raise FileNotFoundError(f"Missing {name}: {path}")
     return np.load(path, mmap_mode="r")
 
 
 def _load_optional_split_array(split_dir: Path, name: str) -> np.ndarray | None:
-    path = _split_path(split_dir, name)
+    path = split_dir / f"{name}.npy"
     if not path.is_file():
         return None
     return np.load(path, mmap_mode=None)
@@ -258,7 +248,7 @@ def _load_given_mask(split_dir: Path, inputs: np.ndarray) -> np.ndarray:
 
 
 def _load_puzzle_identifiers(split_dir: Path, num_examples: int, puzzle_indices: np.ndarray | None) -> np.ndarray:
-    path = _split_path(split_dir, "puzzle_identifiers")
+    path = split_dir / "puzzle_identifiers.npy"
     if not path.is_file():
         return np.zeros((num_examples,), dtype=np.int32)
     identifiers = np.load(path, mmap_mode="r")

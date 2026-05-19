@@ -120,7 +120,7 @@ def _encode_arc_pair(
         if eos_col < ARC_MAX_GRID_SIZE:
             padded[pad_row:eos_row, eos_col] = 1
         encoded.append(padded.reshape(-1).astype(np.int32, copy=False))
-    return encoded[0], encoded[1]
+    return encoded[0].astype(np.uint8, copy=False), encoded[1].astype(np.uint8, copy=False)
 
 
 def _resolve_arc_file(input_file_prefix: str, subset: str, kind: str) -> Path:
@@ -311,8 +311,9 @@ def _write_split(
     total_examples = 0
     total_puzzles = 0
     total_groups = 0
-    sets = list(split.keys())
     for set_name, groups in split.items():
+        if set_name != "all":
+            raise ValueError(f"ARC writer only supports the canonical set name 'all', got {set_name!r}")
         inputs: list[np.ndarray] = []
         labels: list[np.ndarray] = []
         puzzle_identifiers: list[int] = []
@@ -342,16 +343,14 @@ def _write_split(
             total_groups += 1
 
         arrays = {
-            "inputs": np.stack(inputs, axis=0).astype(np.int32, copy=False),
-            "labels": np.stack(labels, axis=0).astype(np.int32, copy=False),
+            "inputs": np.stack(inputs, axis=0).astype(np.uint8, copy=False),
+            "labels": np.stack(labels, axis=0).astype(np.uint8, copy=False),
             "puzzle_identifiers": np.asarray(puzzle_identifiers, dtype=np.int32),
             "puzzle_indices": np.asarray(puzzle_indices, dtype=np.int32),
             "group_indices": np.asarray(group_indices, dtype=np.int32),
         }
         for key, value in arrays.items():
-            np.save(split_dir / f"{set_name}__{key}.npy", value)
-            if set_name == "all":
-                np.save(split_dir / f"{key}.npy", value)
+            np.save(split_dir / f"{key}.npy", value)
 
     metadata = {
         "kind": "arc",
@@ -368,7 +367,7 @@ def _write_split(
         "mean_puzzle_examples": total_examples / max(total_puzzles, 1),
         "total_puzzles": total_puzzles,
         "num_examples": total_examples,
-        "sets": sets,
+        "sets": ["all"],
     }
     (split_dir / "dataset.json").write_text(json.dumps(metadata), encoding="utf-8")
 
