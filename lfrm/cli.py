@@ -694,7 +694,7 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
             stop=stop,
             device=device,
         )
-        metrics = eval_step_fn(model, batch)
+        metrics = jax.device_get(eval_step_fn(model, batch))
         weight = float(stop - start)
         if reduced is None:
             reduced = {
@@ -702,7 +702,7 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
                 for key, value in metrics.items()
             }
         for key, value in metrics.items():
-            value_array = np.asarray(jax.device_get(value), dtype=np.float64)
+            value_array = np.asarray(value, dtype=np.float64)
             if key == "count" or key.endswith("_count"):
                 reduced[key] += value_array
             else:
@@ -896,38 +896,39 @@ def main() -> None:
                 ema_update_fn(ema_model, model)
 
             if step % config.train.log_interval_updates == 0 or step == 1:
+                host_metrics = jax.device_get(metrics)
                 train_log = {
-                    "train/loss": float(metrics["loss"]),
+                    "train/loss": float(host_metrics["loss"]),
                     "train/learning_rate": schedule_learning_rate(config, step),
                 }
                 train_log.update(
                     optional_scalar_log(
                         "train",
-                        metrics,
+                        host_metrics,
                         scalar_metrics,
                         exclude_history=WANDB_HISTORY_EXCLUDED_SCALAR_METRICS,
                     )
                 )
-                train_summary = optional_summary_log("train", metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
-                if "per_step_loss" in metrics:
+                train_summary = optional_summary_log("train", host_metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
+                if "per_step_loss" in host_metrics:
                     train_log.update(
                         flatten_step_metrics(
                             "train/loss_by_step",
-                            list(jax.device_get(metrics["per_step_loss"])),
+                            list(host_metrics["per_step_loss"]),
                         )
                     )
-                if "per_step_accuracy" in metrics:
+                if "per_step_accuracy" in host_metrics:
                     train_log.update(
                         flatten_step_metrics(
                             "train/accuracy_by_step",
-                            list(jax.device_get(metrics["per_step_accuracy"])),
+                            list(host_metrics["per_step_accuracy"]),
                         )
                     )
                 if wandb_run is not None:
                     wandb_run.log(train_log, step=step, commit=not is_eval_step)
                     for key, value in train_summary.items():
                         wandb_run.summary[key] = value
-                summary = grouped_scalar_summary(metrics, scalar_metrics, config.model.model_type)
+                summary = grouped_scalar_summary(host_metrics, scalar_metrics, config.model.model_type)
                 print(f"[train/{console_model_label}] step={step} lr={schedule_learning_rate(config, step):.2e}")
                 if summary:
                     print(summary)

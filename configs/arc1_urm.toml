@@ -65,5 +65,5 @@ compute_dtype = "bfloat16"
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "arc1-urm-official-rope-act-stablemax-muon"
+name = "arc1-urm-official-rope-act-stablemax"
 mode = "online"
