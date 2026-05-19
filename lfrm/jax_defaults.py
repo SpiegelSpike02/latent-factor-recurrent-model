@@ -20,7 +20,6 @@ DEFAULT_UNSET_ENV = (
 DEFAULT_XLA_FLAGS = (
     "--xla_gpu_triton_gemm_any=true",
     "--xla_gpu_enable_latency_hiding_scheduler=true",
-    "--xla_gpu_enable_async_collectives=true",
 )
 
 

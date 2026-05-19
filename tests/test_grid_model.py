@@ -63,7 +63,6 @@ class GridModelTests(unittest.TestCase):
             self.assertIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_enable_latency_hiding_scheduler=true", os.environ["XLA_FLAGS"].split())
-            self.assertIn("--xla_gpu_enable_async_collectives=true", os.environ["XLA_FLAGS"].split())
 
     def test_jax_defaults_can_respect_external_env(self) -> None:
         with mock.patch.dict(
