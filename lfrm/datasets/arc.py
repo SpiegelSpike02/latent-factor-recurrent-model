@@ -17,7 +17,7 @@ PUZZLE_ID_SEPARATOR = "|||"
 ARC_NETWORK_SOURCES = {
     "samsung-trm-hf": (
         "https://huggingface.co",
-        "wtfmahe/Samsung-TRM/resolve/main/kaggle/combined",
+        "datasets/wtfmahe/Samsung-TRM/resolve/main/kaggle/combined",
     ),
 }
 
@@ -154,12 +154,18 @@ def ensure_arc_source_files(
     for subset in subsets:
         for kind in ("challenges", "solutions"):
             output_path = _arc_file_path(input_file_prefix, subset, kind)
-            if output_path.exists() and not overwrite:
+            if output_path.exists() and output_path.stat().st_size > 0 and not overwrite:
                 continue
             output_path.parent.mkdir(parents=True, exist_ok=True)
             url = f"{base_url}/arc-agi_{subset}_{kind}.json"
             print(f"[arc] downloading {url} -> {output_path}", flush=True)
-            urlretrieve(url, output_path)
+            tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+            try:
+                urlretrieve(url, tmp_path)
+                tmp_path.replace(output_path)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
 
 
 def _load_subset(input_file_prefix: str, subset: str) -> dict[str, dict]:

@@ -65,6 +65,7 @@ decay = 0.999
 
 [runtime]
 compute_dtype = "bfloat16"
+data_parallel_devices = 0
 
 [wandb]
 enabled = true
