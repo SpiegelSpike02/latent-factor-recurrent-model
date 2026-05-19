@@ -51,6 +51,8 @@ class SudokuDataTests(unittest.TestCase):
             self.assertEqual(dataset.spec.seq_len, 81)
             self.assertEqual(dataset.train_inputs.shape, (2, 81))
             self.assertEqual(dataset.eval_inputs.shape, (1, 81))
+            self.assertEqual(dataset.train_inputs.dtype.name, "uint8")
+            self.assertEqual(dataset.train_labels.dtype.name, "uint8")
             self.assertEqual(dataset.train_puzzle_identifiers.shape, (2,))
             self.assertEqual(dataset.eval_puzzle_identifiers.shape, (1,))
             self.assertEqual(dataset.train_puzzle_indices.tolist(), [0, 1, 2])

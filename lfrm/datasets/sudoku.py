@@ -96,7 +96,7 @@ def shuffle_sudoku(board: np.ndarray, solution: np.ndarray, *, rng: np.random.Ge
 def _encode_sudoku_example(board: np.ndarray) -> np.ndarray:
     if not np.all((board >= 0) & (board <= 9)):
         raise ValueError("Sudoku array contains values outside [0, 9]")
-    return board.reshape(-1).astype(np.int32) + 1
+    return (board.reshape(-1) + 1).astype(np.uint8, copy=False)
 
 
 def build_sudoku_dataset(
@@ -148,7 +148,7 @@ def build_sudoku_dataset(
         num_augments = num_aug if split_name == "train" else 0
         num_examples = selected_examples * (num_augments + 1)
         bytes_estimate = num_examples * (
-            81 * np.dtype(np.int32).itemsize * 2
+            81 * np.dtype(np.uint8).itemsize * 2
             + np.dtype(np.int32).itemsize * 2
         ) + (selected_examples + 1) * np.dtype(np.int32).itemsize
         _progress(
@@ -160,8 +160,8 @@ def build_sudoku_dataset(
 
         split_dir = output_root / split_name
         split_dir.mkdir(parents=True, exist_ok=True)
-        encoded_inputs = open_memmap(split_dir / "inputs.npy", mode="w+", dtype=np.int32, shape=(num_examples, 81))
-        encoded_labels = open_memmap(split_dir / "labels.npy", mode="w+", dtype=np.int32, shape=(num_examples, 81))
+        encoded_inputs = open_memmap(split_dir / "inputs.npy", mode="w+", dtype=np.uint8, shape=(num_examples, 81))
+        encoded_labels = open_memmap(split_dir / "labels.npy", mode="w+", dtype=np.uint8, shape=(num_examples, 81))
         puzzle_indices = open_memmap(
             split_dir / "puzzle_indices.npy",
             mode="w+",

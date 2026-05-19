@@ -4,15 +4,23 @@ import os
 
 
 DEFAULT_JAX_ENV = {
-    "XLA_PYTHON_CLIENT_PREALLOCATE": "true",
-    "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.95",
+    "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    "TF_GPU_ALLOCATOR": "cuda_malloc_async",
+    "NCCL_LL128_BUFFSIZE": "-2",
+    "NCCL_LL_BUFFSIZE": "-2",
+    "NCCL_PROTO": "SIMPLE,LL,LL128",
 }
 
 RESPECT_EXTERNAL_ENV_FLAG = "LFRM_RESPECT_EXTERNAL_JAX_ENV"
+DEFAULT_UNSET_ENV = (
+    "XLA_PYTHON_CLIENT_MEM_FRACTION",
+    "XLA_PYTHON_CLIENT_ALLOCATOR",
+)
 
 DEFAULT_XLA_FLAGS = (
     "--xla_gpu_triton_gemm_any=true",
     "--xla_gpu_enable_latency_hiding_scheduler=true",
+    "--xla_gpu_enable_async_collectives=true",
 )
 
 
@@ -35,6 +43,9 @@ def apply_jax_defaults() -> None:
             os.environ.setdefault(name, value)
         else:
             os.environ[name] = value
+    if not respect_external_env:
+        for name in DEFAULT_UNSET_ENV:
+            os.environ.pop(name, None)
     os.environ["XLA_FLAGS"] = _append_missing_xla_flags(
         os.environ.get("XLA_FLAGS", ""),
         DEFAULT_XLA_FLAGS,

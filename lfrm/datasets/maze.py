@@ -135,7 +135,7 @@ def build_maze_dataset(
         num_variants = 8 if split_name == "train" and aug else 1
         num_examples = selected_examples * num_variants
         bytes_estimate = num_examples * (
-            seq_len * np.dtype(np.int32).itemsize * 2
+            seq_len * np.dtype(np.uint8).itemsize * 2
             + np.dtype(np.int32).itemsize * 2
         ) + (selected_examples + 1) * np.dtype(np.int32).itemsize
         _progress(
@@ -150,13 +150,13 @@ def build_maze_dataset(
         encoded_inputs = open_memmap(
             split_dir / "inputs.npy",
             mode="w+",
-            dtype=np.int32,
+            dtype=np.uint8,
             shape=(num_examples, seq_len),
         )
         encoded_labels = open_memmap(
             split_dir / "labels.npy",
             mode="w+",
-            dtype=np.int32,
+            dtype=np.uint8,
             shape=(num_examples, seq_len),
         )
         given_mask = open_memmap(

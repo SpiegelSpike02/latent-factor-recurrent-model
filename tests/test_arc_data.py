@@ -48,6 +48,10 @@ class ARCDataTests(unittest.TestCase):
             self.assertEqual(dataset.eval_inputs.shape[1], 900)
             self.assertEqual(dataset.train_inputs.dtype.name, "uint8")
             self.assertEqual(dataset.train_labels.dtype.name, "uint8")
+            self.assertEqual(dataset.train_puzzle_indices[0], 0)
+            self.assertEqual(dataset.train_puzzle_indices[-1], dataset.train_inputs.shape[0])
+            self.assertEqual(dataset.train_group_indices[0], 0)
+            self.assertEqual(dataset.train_group_indices[-1], len(dataset.train_puzzle_indices) - 1)
             self.assertTrue((output_dir / "train" / "inputs.npy").is_file())
 
 

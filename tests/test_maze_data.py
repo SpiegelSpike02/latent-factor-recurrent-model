@@ -45,6 +45,8 @@ class MazeDatasetTests(unittest.TestCase):
             self.assertEqual(dataset.spec.seq_len, 9)
             self.assertEqual(dataset.train_inputs.shape, (16, 9))
             self.assertEqual(dataset.eval_inputs.shape, (1, 9))
+            self.assertEqual(dataset.train_inputs.dtype.name, "uint8")
+            self.assertEqual(dataset.train_labels.dtype.name, "uint8")
             self.assertEqual(dataset.train_puzzle_indices.tolist(), list(range(17)))
             self.assertEqual(dataset.train_group_indices.tolist(), [0, 8, 16])
             self.assertTrue(np.all(dataset.train_puzzle_identifiers == 0))

@@ -95,13 +95,13 @@ ranking accuracy, and belief/refinement diagnostics.
 
 The package also applies project-level JAX defaults before JAX initializes:
 Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, the XLA GPU
-latency hiding scheduler is enabled, GPU preallocation is set to 95% with
-`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`, and preallocation is explicitly enabled.
-These defaults intentionally override stale shell values; set
-`LFRM_RESPECT_EXTERNAL_JAX_ENV=true` to preserve externally supplied JAX memory
-settings. `TF_GPU_ALLOCATOR` is not set by default because JAX documents
-`cuda_malloc_async` as a growing memory pool rather than the fixed preallocation
-behavior expected for these training runs.
+latency hiding scheduler and async collectives are enabled, fixed GPU
+preallocation is disabled with `XLA_PYTHON_CLIENT_PREALLOCATE=false`, and
+`TF_GPU_ALLOCATOR=cuda_malloc_async` selects CUDA's growing async memory pool.
+For single-host multi-GPU runs, the documented NCCL `LL/LL128/SIMPLE` protocol
+flags are also set. These defaults intentionally override stale shell values;
+set `LFRM_RESPECT_EXTERNAL_JAX_ENV=true` to preserve externally supplied JAX
+memory settings.
 
 ## Notes
 

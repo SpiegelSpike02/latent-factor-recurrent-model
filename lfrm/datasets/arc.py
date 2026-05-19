@@ -10,6 +10,7 @@ from typing import Iterable
 from urllib.request import urlretrieve
 
 import numpy as np
+from numpy.lib.format import open_memmap
 
 
 ARC_MAX_GRID_SIZE = 30
@@ -308,49 +309,71 @@ def _write_split(
     split_dir.mkdir(parents=True, exist_ok=True)
     enable_translation = split_name == "train"
 
-    total_examples = 0
-    total_puzzles = 0
-    total_groups = 0
-    for set_name, groups in split.items():
-        if set_name != "all":
-            raise ValueError(f"ARC writer only supports the canonical set name 'all', got {set_name!r}")
-        inputs: list[np.ndarray] = []
-        labels: list[np.ndarray] = []
-        puzzle_identifiers: list[int] = []
-        puzzle_indices = [0]
-        group_indices = [0]
-        example_id = 0
-        puzzle_id = 0
-        for group in groups:
-            for puzzle in group:
-                no_aug_id = int(rng.integers(0, len(puzzle.examples)))
-                for example_idx, (input_grid, output_grid) in enumerate(puzzle.examples):
-                    encoded_input, encoded_output = _encode_arc_pair(
-                        input_grid,
-                        output_grid,
-                        do_translation=enable_translation and example_idx != no_aug_id,
-                        rng=rng,
-                    )
-                    inputs.append(encoded_input)
-                    labels.append(encoded_output)
-                    example_id += 1
-                    total_examples += 1
-                puzzle_indices.append(example_id)
-                puzzle_identifiers.append(identifier_map[puzzle.puzzle_id])
-                puzzle_id += 1
-                total_puzzles += 1
-            group_indices.append(puzzle_id)
-            total_groups += 1
+    if set(split.keys()) != {"all"}:
+        raise ValueError(f"ARC writer only supports the canonical set name 'all', got {sorted(split)}")
+    groups = split["all"]
+    total_groups = len(groups)
+    total_puzzles = sum(len(group) for group in groups)
+    total_examples = sum(len(puzzle.examples) for group in groups for puzzle in group)
 
-        arrays = {
-            "inputs": np.stack(inputs, axis=0).astype(np.uint8, copy=False),
-            "labels": np.stack(labels, axis=0).astype(np.uint8, copy=False),
-            "puzzle_identifiers": np.asarray(puzzle_identifiers, dtype=np.int32),
-            "puzzle_indices": np.asarray(puzzle_indices, dtype=np.int32),
-            "group_indices": np.asarray(group_indices, dtype=np.int32),
-        }
-        for key, value in arrays.items():
-            np.save(split_dir / f"{key}.npy", value)
+    inputs = open_memmap(
+        split_dir / "inputs.npy",
+        mode="w+",
+        dtype=np.uint8,
+        shape=(total_examples, ARC_MAX_GRID_SIZE * ARC_MAX_GRID_SIZE),
+    )
+    labels = open_memmap(
+        split_dir / "labels.npy",
+        mode="w+",
+        dtype=np.uint8,
+        shape=(total_examples, ARC_MAX_GRID_SIZE * ARC_MAX_GRID_SIZE),
+    )
+    puzzle_identifiers = open_memmap(
+        split_dir / "puzzle_identifiers.npy",
+        mode="w+",
+        dtype=np.int32,
+        shape=(total_puzzles,),
+    )
+    puzzle_indices = open_memmap(
+        split_dir / "puzzle_indices.npy",
+        mode="w+",
+        dtype=np.int32,
+        shape=(total_puzzles + 1,),
+    )
+    group_indices = open_memmap(
+        split_dir / "group_indices.npy",
+        mode="w+",
+        dtype=np.int32,
+        shape=(total_groups + 1,),
+    )
+
+    example_id = 0
+    puzzle_id = 0
+    puzzle_indices[0] = 0
+    group_indices[0] = 0
+    for group_idx, group in enumerate(groups):
+        for puzzle in group:
+            no_aug_id = int(rng.integers(0, len(puzzle.examples)))
+            for example_idx, (input_grid, output_grid) in enumerate(puzzle.examples):
+                encoded_input, encoded_output = _encode_arc_pair(
+                    input_grid,
+                    output_grid,
+                    do_translation=enable_translation and example_idx != no_aug_id,
+                    rng=rng,
+                )
+                inputs[example_id] = encoded_input
+                labels[example_id] = encoded_output
+                example_id += 1
+            puzzle_indices[puzzle_id + 1] = example_id
+            puzzle_identifiers[puzzle_id] = identifier_map[puzzle.puzzle_id]
+            puzzle_id += 1
+        group_indices[group_idx + 1] = puzzle_id
+
+    inputs.flush()
+    labels.flush()
+    puzzle_identifiers.flush()
+    puzzle_indices.flush()
+    group_indices.flush()
 
     metadata = {
         "kind": "arc",
