@@ -1058,6 +1058,16 @@ def main() -> None:
 
     device = data_sharding or jax.devices()[0]
     overview = dataset_overview(dataset)
+    jax_env_echo = " ; ".join(
+        f"echo {name}={os.environ.get(name, '<unset>')}"
+        for name in (
+            "XLA_PYTHON_CLIENT_PREALLOCATE",
+            "XLA_PYTHON_CLIENT_MEM_FRACTION",
+            "XLA_PYTHON_CLIENT_ALLOCATOR",
+            "TF_GPU_ALLOCATOR",
+            "XLA_FLAGS",
+        )
+    )
     print(
         "device=", device,
         "dataset_kind=", overview["kind"],
@@ -1094,11 +1104,7 @@ def main() -> None:
         "profile_start_step=", config.runtime.profile_start_step,
         "profile_steps=", config.runtime.profile_steps,
         "profile_dir=", profile_dir if config.runtime.profile_enabled else None,
-        "XLA_PYTHON_CLIENT_PREALLOCATE=", os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE"),
-        "XLA_PYTHON_CLIENT_MEM_FRACTION=", os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION"),
-        "XLA_PYTHON_CLIENT_ALLOCATOR=", os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR"),
-        "TF_GPU_ALLOCATOR=", os.environ.get("TF_GPU_ALLOCATOR"),
-        "XLA_FLAGS=", os.environ.get("XLA_FLAGS"),
+        "jax_env_echo=", jax_env_echo,
     )
 
     def sample_train_batch():
