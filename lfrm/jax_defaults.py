@@ -4,18 +4,16 @@ import os
 
 
 DEFAULT_JAX_ENV = {
-    "XLA_PYTHON_CLIENT_PREALLOCATE": "true",
-    "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.95",
+    "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    "TF_GPU_ALLOCATOR": "cuda_malloc_async",
     "NCCL_LL128_BUFFSIZE": "-2",
     "NCCL_LL_BUFFSIZE": "-2",
     "NCCL_PROTO": "SIMPLE,LL,LL128",
 }
 
-RESPECT_EXTERNAL_ENV_FLAG = "LFRM_RESPECT_EXTERNAL_JAX_ENV"
-EXTRA_XLA_FLAGS_ENV = "LFRM_EXTRA_XLA_FLAGS"
 DEFAULT_UNSET_ENV = (
+    "XLA_PYTHON_CLIENT_MEM_FRACTION",
     "XLA_PYTHON_CLIENT_ALLOCATOR",
-    "TF_GPU_ALLOCATOR",
 )
 
 DEFAULT_XLA_FLAGS = (
@@ -24,30 +22,14 @@ DEFAULT_XLA_FLAGS = (
 )
 
 
-def _append_missing_xla_flags(existing: str, defaults: tuple[str, ...]) -> str:
-    current_flags = existing.split()
-    current_names = {flag.split("=", maxsplit=1)[0] for flag in current_flags}
-    missing_flags = [
-        flag
-        for flag in defaults
-        if flag.split("=", maxsplit=1)[0] not in current_names
-    ]
-    return " ".join((*current_flags, *missing_flags))
-
-
 def apply_jax_defaults() -> None:
-    """Apply project-level JAX/XLA defaults before JAX initializes."""
-    respect_external_env = os.environ.get(RESPECT_EXTERNAL_ENV_FLAG, "").lower() in {"1", "true", "yes"}
+    """Apply project-level JAX/XLA defaults before JAX initializes.
+
+    These defaults intentionally overwrite the shell environment so training
+    behavior is controlled by the repository, not by stale terminal exports.
+    """
     for name, value in DEFAULT_JAX_ENV.items():
-        if respect_external_env:
-            os.environ.setdefault(name, value)
-        else:
-            os.environ[name] = value
-    if not respect_external_env:
-        for name in DEFAULT_UNSET_ENV:
-            os.environ.pop(name, None)
-    extra_xla_flags = tuple(os.environ.get(EXTRA_XLA_FLAGS_ENV, "").split())
-    os.environ["XLA_FLAGS"] = _append_missing_xla_flags(
-        os.environ.get("XLA_FLAGS", ""),
-        (*DEFAULT_XLA_FLAGS, *extra_xla_flags),
-    )
+        os.environ[name] = value
+    for name in DEFAULT_UNSET_ENV:
+        os.environ.pop(name, None)
+    os.environ["XLA_FLAGS"] = " ".join(DEFAULT_XLA_FLAGS)

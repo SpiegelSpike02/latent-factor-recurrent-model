@@ -56,17 +56,17 @@ class GridModelTests(unittest.TestCase):
             clear=True,
         ):
             apply_jax_defaults()
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "true")
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.95")
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
+            self.assertNotIn("XLA_PYTHON_CLIENT_MEM_FRACTION", os.environ)
             self.assertNotIn("XLA_PYTHON_CLIENT_ALLOCATOR", os.environ)
-            self.assertNotIn("TF_GPU_ALLOCATOR", os.environ)
+            self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "cuda_malloc_async")
             self.assertEqual(os.environ["NCCL_PROTO"], "SIMPLE,LL,LL128")
-            self.assertIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
+            self.assertNotIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_enable_latency_hiding_scheduler=true", os.environ["XLA_FLAGS"].split())
-            self.assertIn("--xla_gpu_experimental_flag_for_test=true", os.environ["XLA_FLAGS"].split())
+            self.assertNotIn("--xla_gpu_experimental_flag_for_test=true", os.environ["XLA_FLAGS"].split())
 
-    def test_jax_defaults_can_respect_external_env(self) -> None:
+    def test_jax_defaults_ignore_external_env(self) -> None:
         with mock.patch.dict(
             os.environ,
             {
@@ -78,9 +78,9 @@ class GridModelTests(unittest.TestCase):
             clear=True,
         ):
             apply_jax_defaults()
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "true")
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.80")
-            self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "custom_allocator")
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
+            self.assertNotIn("XLA_PYTHON_CLIENT_MEM_FRACTION", os.environ)
+            self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "cuda_malloc_async")
 
     def test_updates_from_epochs_matches_official_floor_conversion(self) -> None:
         dataset = SimpleNamespace(
