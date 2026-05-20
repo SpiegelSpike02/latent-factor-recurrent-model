@@ -332,6 +332,7 @@ class UnifiedReasoningModel(nnx.Module):
         train: bool,
         dropout_key: Array | None = None,
         puzzle_identifiers: Array | None = None,
+        collect_diagnostics: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
         if dropout_key is None:
             dropout_key = jax.random.key(0)
@@ -340,10 +341,14 @@ class UnifiedReasoningModel(nnx.Module):
         dropout_keys = jax.random.split(dropout_key, self.recurrent_steps)
 
         def scan_step(h: Array, step_key: Array) -> tuple[Array, tuple[Array, Array, Array]]:
-            prev_h = h
+            prev_h = h if collect_diagnostics else None
             h = self._inner_update(h, input_embeddings, train=train, dropout_key=step_key)
             logits, halt_logits = self._logits_and_halt(h)
-            hidden_delta = jnp.mean(jnp.linalg.norm((h - prev_h).astype(jnp.float32), axis=-1))
+            if collect_diagnostics:
+                assert prev_h is not None
+                hidden_delta = jnp.mean(jnp.linalg.norm((h - prev_h).astype(jnp.float32), axis=-1))
+            else:
+                hidden_delta = jnp.asarray(0.0, dtype=jnp.float32)
             return h, (logits, halt_logits, hidden_delta)
 
         _hidden, (step_logits, halt_logits, hidden_delta) = jax.lax.scan(scan_step, hidden, dropout_keys)

@@ -44,6 +44,7 @@ beta1 = 0.9
 beta2 = 0.95
 weight_decay = 0.1
 puzzle_embed_weight_decay = 0.1
+puzzle_embed_coalesce_updates = false
 lr_warmup_steps = 2000
 grad_clip_norm = 1.0
 flatten_optimizer = false

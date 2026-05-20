@@ -907,9 +907,19 @@ def _update_sparse_puzzle_embeddings(
     *,
     learning_rate: jax.Array,
     weight_decay: float,
+    coalesce_updates: bool,
 ) -> jax.Array:
     ids = puzzle_ids.reshape(-1).astype(jnp.int32)
     grads = puzzle_embedding_grads.reshape((ids.shape[0], puzzle_embedding_grads.shape[-1])).astype(jnp.float32)
+    weights = model.puzzle_embed.weights[...]
+    lr = learning_rate.astype(jnp.float32)
+    if not coalesce_updates:
+        old_rows = jnp.take(weights, ids, axis=0)
+        new_rows = old_rows.astype(jnp.float32) * (1.0 - lr * weight_decay)
+        new_rows = new_rows - lr * jnp.sign(grads)
+        model.puzzle_embed.weights[...] = weights.at[ids].add(new_rows.astype(weights.dtype) - old_rows)
+        return jnp.asarray(ids.shape[0], dtype=jnp.float32)
+
     unique_ids, inverse = jnp.unique(
         ids,
         return_inverse=True,
@@ -923,9 +933,7 @@ def _update_sparse_puzzle_embeddings(
     counts = jnp.zeros((ids.shape[0],), dtype=jnp.int32).at[inverse].add(1)
     valid = counts > 0
 
-    weights = model.puzzle_embed.weights[...]
     old_rows = jnp.take(weights, unique_ids, axis=0)
-    lr = learning_rate.astype(jnp.float32)
     new_rows = old_rows.astype(jnp.float32) * (1.0 - lr * weight_decay)
     new_rows = new_rows - lr * jnp.sign(grad_sums)
     row_delta = jnp.where(valid[:, None], new_rows.astype(weights.dtype) - old_rows, jnp.zeros_like(old_rows))
@@ -1042,6 +1050,8 @@ def trm_eval_loss_and_metrics(
     model: TinyRecursiveModel,
     batch: dict[str, jax.Array],
     halt_loss_weight: float = 0.5,
+    *,
+    collect_diagnostics: bool = False,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     inputs = batch["inputs"]
     targets = batch["labels"]
@@ -1055,7 +1065,10 @@ def trm_eval_loss_and_metrics(
     model_forward_kwargs = {"puzzle_identifiers": batch["puzzle_identifiers"]}
     if isinstance(model, TinyRecursiveModel):
         model_forward_kwargs["compute_terminal_residual"] = False
-    step_logits, diagnostics = model.forward_all_steps_with_diagnostics(
+        model_forward_kwargs["collect_diagnostics"] = collect_diagnostics
+    elif isinstance(model, UnifiedReasoningModel):
+        model_forward_kwargs["collect_diagnostics"] = collect_diagnostics
+    step_logits, model_diagnostics = model.forward_all_steps_with_diagnostics(
         inputs,
         train=False,
         dropout_key=None,
@@ -1067,12 +1080,9 @@ def trm_eval_loss_and_metrics(
     step_loss_mask = loss_mask[None, :, :]
     metric_step_loss_mask = loss_mask[None, :, :]
     token_loss = token_cross_entropy(model, step_logits, step_targets)
-    per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
-    per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
 
     step_predictions = jnp.argmax(step_logits, axis=-1)
     step_correct = (step_predictions == step_targets).astype(jnp.float32) * metric_step_loss_mask
-    per_step_accuracy = jnp.sum(step_correct, axis=(1, 2)) / metric_normalizer
     step_correct_per_example = jnp.sum(step_correct, axis=-1)
     supervised_cells_per_example = jnp.sum(loss_mask, axis=-1)
     per_step_example_solved = jnp.where(
@@ -1080,7 +1090,7 @@ def trm_eval_loss_and_metrics(
         step_correct_per_example == supervised_cells_per_example[None, :],
         True,
     )
-    halt_logits = diagnostics["halt_logits"]
+    halt_logits = model_diagnostics["halt_logits"]
     selected_step = _trm_selected_step(halt_logits)
     gather_index = selected_step[None, :, None, None]
     selected_logits = jnp.take_along_axis(
@@ -1129,7 +1139,6 @@ def trm_eval_loss_and_metrics(
     )
     final_exact_f32 = final_exact_examples.astype(jnp.float32)
     final_exact_count = jnp.sum(final_exact_f32 * example_mask)
-    oracle_step = jnp.argmin(per_step_example_loss, axis=0)
     count = jnp.sum(example_mask)
     metrics = {
         "loss": loss,
@@ -1151,17 +1160,26 @@ def trm_eval_loss_and_metrics(
         "selected_exact_accuracy": exact_accuracy,
         "selected_exact_count": selected_exact_count,
         "selected_step": _masked_example_mean(selected_step.astype(jnp.float32) + 1.0, example_mask),
-        "oracle_step": _masked_example_mean(oracle_step.astype(jnp.float32) + 1.0, example_mask),
         "final_exact_count": final_exact_count,
-        "per_step_loss": per_step_loss,
-        "per_step_accuracy": per_step_accuracy,
-        "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
-        "per_step_halt_probability": (
-            jnp.sum(jax.nn.sigmoid(halt_logits) * example_mask[None, :], axis=1)
-            / jnp.maximum(count, 1.0)
-        ),
         "unroll_steps": jnp.asarray(step_logits.shape[0], dtype=jnp.int32),
     }
+    if collect_diagnostics:
+        per_step_loss = jnp.sum(token_loss * step_loss_mask, axis=(1, 2)) / normalizer
+        per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
+        per_step_accuracy = jnp.sum(step_correct, axis=(1, 2)) / metric_normalizer
+        oracle_step = jnp.argmin(per_step_example_loss, axis=0)
+        metrics.update(
+            {
+                "oracle_step": _masked_example_mean(oracle_step.astype(jnp.float32) + 1.0, example_mask),
+                "per_step_loss": per_step_loss,
+                "per_step_accuracy": per_step_accuracy,
+                "per_step_hidden_delta": model_diagnostics["hidden_delta_mean"],
+                "per_step_halt_probability": (
+                    jnp.sum(jax.nn.sigmoid(halt_logits) * example_mask[None, :], axis=1)
+                    / jnp.maximum(count, 1.0)
+                ),
+            }
+        )
     selected_path_metrics = _maybe_path_metrics(model, predictions, targets, loss_mask)
     metrics.update(selected_path_metrics)
     metrics.update(
@@ -1276,6 +1294,7 @@ def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
                 puzzle_embedding_grads,
                 learning_rate=puzzle_lr_schedule(optimizer_step),
                 weight_decay=config.optimizer.puzzle_embed_weight_decay,
+                coalesce_updates=config.optimizer.puzzle_embed_coalesce_updates,
             )
             metrics["puzzle_embed_learning_rate"] = puzzle_lr_schedule(optimizer_step)
             metrics["puzzle_embed_touched_rows"] = touched_rows
@@ -1338,7 +1357,7 @@ def build_eval_step_runner(
     return nnx.jit(eval_step_with_weight)
 
 
-def build_trm_eval_step_runner(halt_loss_weight: float = 0.5):
+def build_trm_eval_step_runner(halt_loss_weight: float = 0.5, *, collect_diagnostics: bool = False):
     def eval_step(
         model: TinyRecursiveModel,
         batch: dict[str, jax.Array],
@@ -1347,6 +1366,7 @@ def build_trm_eval_step_runner(halt_loss_weight: float = 0.5):
             model,
             batch,
             halt_loss_weight,
+            collect_diagnostics=collect_diagnostics,
         )
         return metrics
 

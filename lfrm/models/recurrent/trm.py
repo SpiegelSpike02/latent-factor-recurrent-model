@@ -577,8 +577,9 @@ class TinyRecursiveModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
         compute_terminal_residual: bool = True,
+        collect_diagnostics: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
-        condition_mask = self._condition_mask(tokens)
+        condition_mask = self._condition_mask(tokens) if collect_diagnostics or compute_terminal_residual else None
         input_embeddings = self._input_embeddings(
             tokens,
             puzzle_identifiers,
@@ -588,11 +589,15 @@ class TinyRecursiveModel(nnx.Module):
         state0 = self._initial_state(tokens.shape[0])
 
         def scan_step(state: State, _step_index):
-            prev_data = state["y"][:, self.prefix_len :]
+            prev_data = state["y"][:, self.prefix_len :] if collect_diagnostics else None
             next_state = self._act_step(state, input_embeddings)
             state_data = next_state["y"][:, self.prefix_len :]
-            delta = jnp.linalg.norm((state_data - prev_data).astype(jnp.float32), axis=-1, keepdims=True)
-            hidden_delta = self._blank_mean(delta, condition_mask)
+            if collect_diagnostics:
+                assert prev_data is not None and condition_mask is not None
+                delta = jnp.linalg.norm((state_data - prev_data).astype(jnp.float32), axis=-1, keepdims=True)
+                hidden_delta = self._blank_mean(delta, condition_mask)
+            else:
+                hidden_delta = jnp.asarray(0.0, dtype=jnp.float32)
             step_logits = self._logits_from_state(state_data)
             halt_logits = self._halt_logits(next_state["y"])
             carry_state = {
@@ -621,6 +626,7 @@ class TinyRecursiveModel(nnx.Module):
             "state": final_state["y"][:, self.prefix_len :],
         }
         if compute_terminal_residual:
+            assert condition_mask is not None
             final_logits = step_logits[-1]
             next_state = self._act_step(final_state, input_embeddings)
             next_logits = self._logits_from_state(next_state["y"][:, self.prefix_len :])
@@ -640,6 +646,7 @@ class TinyRecursiveModel(nnx.Module):
         train: bool,
         dropout_key: Array | None = None,
         compute_terminal_residual: bool = True,
+        collect_diagnostics: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
         return self._run_unroll(
             tokens,
@@ -647,6 +654,7 @@ class TinyRecursiveModel(nnx.Module):
             train=train,
             dropout_key=dropout_key,
             compute_terminal_residual=compute_terminal_residual,
+            collect_diagnostics=collect_diagnostics,
         )
 
     def forward_final_with_diagnostics(
@@ -657,6 +665,7 @@ class TinyRecursiveModel(nnx.Module):
         train: bool,
         dropout_key: Array | None = None,
         compute_terminal_residual: bool = True,
+        collect_diagnostics: bool = True,
     ) -> tuple[Array, dict[str, Array]]:
         return self.forward_all_steps_with_diagnostics(
             tokens,
@@ -664,6 +673,7 @@ class TinyRecursiveModel(nnx.Module):
             train=train,
             dropout_key=dropout_key,
             compute_terminal_residual=compute_terminal_residual,
+            collect_diagnostics=collect_diagnostics,
         )
 
     def forward_all_steps(

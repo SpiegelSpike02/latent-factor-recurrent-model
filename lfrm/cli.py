@@ -86,6 +86,7 @@ ALLOWED_SECTION_KEYS = {
         "beta2",
         "weight_decay",
         "puzzle_embed_weight_decay",
+        "puzzle_embed_coalesce_updates",
         "lr_warmup_steps",
         "grad_clip_norm",
         "flatten_optimizer",
@@ -109,6 +110,7 @@ ALLOWED_SECTION_KEYS = {
         "data_parallel_devices",
         "prefetch_depth",
         "prefetch_workers",
+        "eval_diagnostics",
         "profile_enabled",
         "profile_start_step",
         "profile_steps",
@@ -338,6 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--puzzle-embed-weight-decay", type=float, default=0.0)
+    parser.add_argument("--puzzle-embed-coalesce-updates", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr-warmup-steps", type=int, default=100)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--flatten-optimizer", action=argparse.BooleanOptionalAction, default=False)
@@ -359,6 +362,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="Number of background workers used for batch sampling and device placement.",
+    )
+    parser.add_argument(
+        "--eval-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compute and log per-step eval diagnostics such as hidden delta and per-step curves.",
     )
     parser.add_argument("--profile-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -486,6 +495,7 @@ def build_config(
         beta2=args.beta2,
         weight_decay=args.weight_decay,
         puzzle_embed_weight_decay=args.puzzle_embed_weight_decay,
+        puzzle_embed_coalesce_updates=args.puzzle_embed_coalesce_updates,
         lr_warmup_steps=args.lr_warmup_steps,
         grad_clip_norm=args.grad_clip_norm,
         flatten_optimizer=args.flatten_optimizer,
@@ -513,6 +523,7 @@ def build_config(
         data_parallel_devices=args.data_parallel_devices,
         prefetch_depth=args.prefetch_depth,
         prefetch_workers=args.prefetch_workers,
+        eval_diagnostics=args.eval_diagnostics,
         profile_enabled=args.profile_enabled,
         profile_start_step=args.profile_start_step,
         profile_steps=args.profile_steps,
@@ -787,12 +798,13 @@ def _device_put_batch_sharded(batch: dict[str, np.ndarray], sharding: NamedShard
 
 
 class BatchPrefetcher:
-    def __init__(self, sample_fn, *, depth: int = 4, workers: int = 2) -> None:
+    def __init__(self, sample_fn, *, depth: int = 4, workers: int = 2, refill: bool = True) -> None:
         if depth < 1:
             raise ValueError("Prefetch depth must be at least 1")
         if workers < 1:
             raise ValueError("Prefetch workers must be at least 1")
         self.sample_fn = sample_fn
+        self.refill = refill
         self.executor = ThreadPoolExecutor(max_workers=workers)
         self.futures: list[Future] = []
         for _ in range(depth):
@@ -801,7 +813,8 @@ class BatchPrefetcher:
     def next(self):
         future = self.futures.pop(0)
         batch = future.result()
-        self.futures.append(self.executor.submit(self.sample_fn))
+        if self.refill:
+            self.futures.append(self.executor.submit(self.sample_fn))
         return batch
 
     def close(self) -> None:
@@ -863,9 +876,14 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
         f"({total} examples)",
         flush=True,
     )
-    for batch_index, start in enumerate(range(0, total, batch_size), start=1):
-        stop = min(start + batch_size, total)
-        batch = eval_device_batch(
+    eval_ranges = [
+        (start, min(start + batch_size, total))
+        for start in range(0, total, batch_size)
+    ]
+
+    def make_eval_batch(batch_index: int):
+        start, stop = eval_ranges[batch_index]
+        return stop - start, eval_device_batch(
             dataset,
             config=config,
             start=start,
@@ -873,22 +891,44 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
             device=device,
             target_batch_size=batch_size,
         )
-        metrics = jax.device_get(eval_step_fn(model, batch))
-        weight = float(stop - start)
-        if reduced is None:
-            reduced = {
-                key: np.zeros(np.asarray(value).shape, dtype=np.float64)
-                for key, value in metrics.items()
-            }
-        for key, value in metrics.items():
-            value_array = np.asarray(value, dtype=np.float64)
-            if key == "count" or key.endswith("_count"):
-                reduced[key] += value_array
-            else:
-                reduced[key] += value_array * weight
-        total_weight += weight
-        if batch_index == 1 or batch_index == num_batches or batch_index % 10 == 0:
-            print(f"[eval] batch {batch_index}/{num_batches}", flush=True)
+
+    eval_executor = ThreadPoolExecutor(max_workers=config.runtime.prefetch_workers)
+    eval_futures: list[Future] = []
+    next_eval_index = 0
+
+    def submit_eval_batch() -> None:
+        nonlocal next_eval_index
+        if next_eval_index < num_batches:
+            eval_futures.append(eval_executor.submit(make_eval_batch, next_eval_index))
+            next_eval_index += 1
+
+    for _ in range(min(config.runtime.prefetch_depth, num_batches)):
+        submit_eval_batch()
+    try:
+        for batch_index in range(1, num_batches + 1):
+            future = eval_futures.pop(0)
+            weight_int, batch = future.result()
+            submit_eval_batch()
+            metrics = jax.device_get(eval_step_fn(model, batch))
+            weight = float(weight_int)
+            if reduced is None:
+                reduced = {
+                    key: np.zeros(np.asarray(value).shape, dtype=np.float64)
+                    for key, value in metrics.items()
+                }
+            for key, value in metrics.items():
+                value_array = np.asarray(value, dtype=np.float64)
+                if key == "count" or key.endswith("_count"):
+                    reduced[key] += value_array
+                else:
+                    reduced[key] += value_array * weight
+            total_weight += weight
+            if batch_index == 1 or batch_index == num_batches or batch_index % 10 == 0:
+                print(f"[eval] batch {batch_index}/{num_batches}", flush=True)
+    finally:
+        for future in eval_futures:
+            future.cancel()
+        eval_executor.shutdown(wait=False, cancel_futures=True)
     if reduced is None:
         raise ValueError("No eval batches were produced")
     scale = 1.0 / total_weight
@@ -983,7 +1023,10 @@ def main() -> None:
             )
         else:
             train_step_fn = build_trm_act_train_step_runner(config, config.train.halt_loss_weight)
-        eval_step_fn = build_trm_eval_step_runner(config.train.halt_loss_weight)
+        eval_step_fn = build_trm_eval_step_runner(
+            config.train.halt_loss_weight,
+            collect_diagnostics=config.runtime.eval_diagnostics,
+        )
     else:
         train_step_fn = build_train_step_runner(
             config.train.halt_loss_weight,
@@ -1046,6 +1089,7 @@ def main() -> None:
         "data_sharding=", data_sharding,
         "prefetch_depth=", config.runtime.prefetch_depth,
         "prefetch_workers=", config.runtime.prefetch_workers,
+        "eval_diagnostics=", config.runtime.eval_diagnostics,
         "profile_enabled=", config.runtime.profile_enabled,
         "profile_start_step=", config.runtime.profile_start_step,
         "profile_steps=", config.runtime.profile_steps,
@@ -1195,17 +1239,19 @@ def main() -> None:
                             )
                         )
                         eval_summary = optional_summary_log(prefix, eval_metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
-                        eval_log.update(flatten_step_metrics(f"{prefix}/loss_by_step", eval_metrics["per_step_loss"]))
+                        if "per_step_loss" in eval_metrics:
+                            eval_log.update(flatten_step_metrics(f"{prefix}/loss_by_step", eval_metrics["per_step_loss"]))
                         if "per_step_accuracy" in eval_metrics:
                             eval_log.update(
                                 flatten_step_metrics(f"{prefix}/accuracy_by_step", eval_metrics["per_step_accuracy"])
                             )
-                        eval_log.update(
-                            flatten_step_metrics(
-                                f"{prefix}/hidden_delta_by_step",
-                                eval_metrics["per_step_hidden_delta"],
+                        if "per_step_hidden_delta" in eval_metrics:
+                            eval_log.update(
+                                flatten_step_metrics(
+                                    f"{prefix}/hidden_delta_by_step",
+                                    eval_metrics["per_step_hidden_delta"],
+                                )
                             )
-                        )
                         if "per_step_halt_probability" in eval_metrics:
                             eval_log.update(
                                 flatten_step_metrics(
@@ -1220,17 +1266,18 @@ def main() -> None:
                     print(f"[{label}/{console_model_label}] step={step}")
                     if summary:
                         print(summary)
-                    print(
-                        "  "
-                        + " ".join(
-                            [
-                                format_step_summary("loss", eval_metrics["per_step_loss"]),
-                                format_step_summary("acc", eval_metrics.get("per_step_accuracy", [])),
-                                format_step_summary("delta", eval_metrics["per_step_hidden_delta"]),
-                                format_step_summary("halt", eval_metrics.get("per_step_halt_probability", [])),
-                            ]
+                    if "per_step_loss" in eval_metrics:
+                        print(
+                            "  "
+                            + " ".join(
+                                [
+                                    format_step_summary("loss", eval_metrics["per_step_loss"]),
+                                    format_step_summary("acc", eval_metrics.get("per_step_accuracy", [])),
+                                    format_step_summary("delta", eval_metrics.get("per_step_hidden_delta", [])),
+                                    format_step_summary("halt", eval_metrics.get("per_step_halt_probability", [])),
+                                ]
+                            )
                         )
-                    )
                     return eval_metrics
 
                 if ema_model is not None:

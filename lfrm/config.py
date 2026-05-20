@@ -110,6 +110,7 @@ class OptimizerConfig:
     beta2: float = 0.999
     weight_decay: float = 0.1
     puzzle_embed_weight_decay: float = 0.0
+    puzzle_embed_coalesce_updates: bool = True
     lr_warmup_steps: int = 100
     grad_clip_norm: float = 1.0
     flatten_optimizer: bool = False
@@ -159,6 +160,7 @@ class RuntimeConfig:
     data_parallel_devices: int = 1
     prefetch_depth: int = 4
     prefetch_workers: int = 2
+    eval_diagnostics: bool = False
     profile_enabled: bool = True
     profile_start_step: int = 1000
     profile_steps: int = 20
