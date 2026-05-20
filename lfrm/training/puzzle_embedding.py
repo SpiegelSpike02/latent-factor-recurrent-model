@@ -34,8 +34,8 @@ def update_sparse_puzzle_embeddings(
         # The embedding table is replicated, so every replica must apply the
         # same sparse rows. Replicating this small update batch is cleaner than
         # sorting/coalescing over a sharded data axis.
-        ids = jax.lax.with_sharding_constraint(ids, P(None))
-        grads = jax.lax.with_sharding_constraint(grads, P(None, None))
+        ids = jax.sharding.reshard(ids, P(None))
+        grads = jax.sharding.reshard(grads, P(None, None))
     weights = model.puzzle_embed.weights[...]
     lr = learning_rate.astype(jnp.float32)
     if not coalesce_updates:
