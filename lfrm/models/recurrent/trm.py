@@ -377,7 +377,7 @@ class TinyRecursiveModel(nnx.Module):
         dropout_key: Array | None,
         puzzle_embeddings: Array | None = None,
     ) -> Array:
-        embedding = self.token_embed(tokens.astype(jnp.int32))
+        embedding = self.token_embed(tokens.astype(jnp.int32), train=train)
         if self.puzzle_embed_ndim > 0:
             if puzzle_embeddings is not None:
                 prefix = puzzle_embeddings

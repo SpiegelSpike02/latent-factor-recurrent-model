@@ -185,7 +185,7 @@ class UnifiedReasoningModel(nnx.Module):
         puzzle_identifiers: Array | None,
         puzzle_embeddings: Array | None = None,
     ) -> Array:
-        token_emb = self.token_embed(tokens.astype(jnp.int32)).astype(self.dtype) * self.embed_scale
+        token_emb = self.token_embed(tokens.astype(jnp.int32), train=True).astype(self.dtype) * self.embed_scale
         if not self.has_puzzle_embed:
             return token_emb
         if puzzle_embeddings is None:
