@@ -914,6 +914,8 @@ def _update_sparse_puzzle_embeddings(
     weights = model.puzzle_embed.weights[...]
     lr = learning_rate.astype(jnp.float32)
     if not coalesce_updates:
+        # This path is only safe for small embedding tables. Large ARC puzzle
+        # tables can make SPMD scatter choose very large temporary buffers.
         old_rows = jnp.take(weights, ids, axis=0)
         new_rows = old_rows.astype(jnp.float32) * (1.0 - lr * weight_decay)
         new_rows = new_rows - lr * jnp.sign(grads)
