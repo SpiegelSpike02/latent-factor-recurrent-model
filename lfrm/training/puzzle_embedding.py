@@ -3,6 +3,8 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from lfrm.models.common import gather_embedding_rows
+
 
 def act_sparse_puzzle_ids(
     carry: dict[str, jax.Array],
@@ -31,7 +33,7 @@ def update_sparse_puzzle_embeddings(
     if not coalesce_updates:
         # This path is only safe for small embedding tables. Large ARC puzzle
         # tables can make SPMD scatter choose very large temporary buffers.
-        old_rows = jnp.take(weights, ids, axis=0)
+        old_rows = gather_embedding_rows(weights, ids)
         new_rows = old_rows.astype(jnp.float32) * (1.0 - lr * weight_decay)
         new_rows = new_rows - lr * jnp.sign(grads)
         model.puzzle_embed.weights[...] = weights.at[ids].add(new_rows.astype(weights.dtype) - old_rows)
@@ -50,7 +52,7 @@ def update_sparse_puzzle_embeddings(
     counts = jnp.zeros((ids.shape[0],), dtype=jnp.int32).at[inverse].add(1)
     valid = counts > 0
 
-    old_rows = jnp.take(weights, unique_ids, axis=0)
+    old_rows = gather_embedding_rows(weights, unique_ids)
     new_rows = old_rows.astype(jnp.float32) * (1.0 - lr * weight_decay)
     new_rows = new_rows - lr * jnp.sign(grad_sums)
     row_delta = jnp.where(valid[:, None], new_rows.astype(weights.dtype) - old_rows, jnp.zeros_like(old_rows))
