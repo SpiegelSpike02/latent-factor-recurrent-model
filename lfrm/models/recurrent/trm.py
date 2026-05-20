@@ -49,7 +49,7 @@ class LocalConvSwiGLU(nnx.Module):
             use_bias=False,
             dtype=dtype,
             param_dtype=jnp.float32,
-            preferred_element_type=jnp.float32,
+            preferred_element_type=dtype,
             rngs=rngs,
         )
         self.gate_up = nnx.Linear(

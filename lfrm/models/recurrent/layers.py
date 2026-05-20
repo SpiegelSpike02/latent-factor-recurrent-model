@@ -30,13 +30,11 @@ def rotate_half(x: Array) -> Array:
 
 
 def apply_rope(q: Array, k: Array, cos: Array, sin: Array) -> tuple[Array, Array]:
-    cos = cos[None, : q.shape[1], None, :].astype(jnp.float32)
-    sin = sin[None, : q.shape[1], None, :].astype(jnp.float32)
-    q_f32 = q.astype(jnp.float32)
-    k_f32 = k.astype(jnp.float32)
+    cos = cos[None, : q.shape[1], None, :].astype(q.dtype)
+    sin = sin[None, : q.shape[1], None, :].astype(q.dtype)
     return (
-        (q_f32 * cos + rotate_half(q_f32) * sin).astype(q.dtype),
-        (k_f32 * cos + rotate_half(k_f32) * sin).astype(k.dtype),
+        q * cos + rotate_half(q) * sin,
+        k * cos + rotate_half(k) * sin,
     )
 
 

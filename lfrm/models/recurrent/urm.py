@@ -49,7 +49,7 @@ class ConvSwiGLU(nnx.Module):
             use_bias=True,
             dtype=dtype,
             param_dtype=jnp.float32,
-            preferred_element_type=jnp.float32,
+            preferred_element_type=dtype,
             rngs=rngs,
         )
         self.down = nnx.Linear(
