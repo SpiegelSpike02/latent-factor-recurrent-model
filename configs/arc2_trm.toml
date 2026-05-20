@@ -50,8 +50,8 @@ grad_clip_norm = 1.0
 flatten_optimizer = false
 
 [train]
-batch_size = 2304
-eval_batch_size = 2304
+batch_size = 2176
+eval_batch_size = 2176
 epochs = 100000
 log_epochs = 10
 eval_epochs = 10000
