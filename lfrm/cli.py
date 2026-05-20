@@ -107,6 +107,8 @@ ALLOWED_SECTION_KEYS = {
     "runtime": {
         "compute_dtype",
         "data_parallel_devices",
+        "prefetch_depth",
+        "prefetch_workers",
         "profile_enabled",
         "profile_start_step",
         "profile_steps",
@@ -346,11 +348,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Number of local devices for data parallelism. Use 0 for all visible devices.",
     )
+    parser.add_argument(
+        "--prefetch-depth",
+        type=int,
+        default=4,
+        help="Number of device batches to keep queued ahead of the training loop.",
+    )
+    parser.add_argument(
+        "--prefetch-workers",
+        type=int,
+        default=2,
+        help="Number of background workers used for batch sampling and device placement.",
+    )
     parser.add_argument("--profile-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--profile-start-step",
         type=int,
-        default=20,
+        default=1000,
         help="Optimizer step at which to start the default JAX profiler trace.",
     )
     parser.add_argument(
@@ -497,6 +511,8 @@ def build_config(
     runtime = RuntimeConfig(
         compute_dtype=args.compute_dtype,
         data_parallel_devices=args.data_parallel_devices,
+        prefetch_depth=args.prefetch_depth,
+        prefetch_workers=args.prefetch_workers,
         profile_enabled=args.profile_enabled,
         profile_start_step=args.profile_start_step,
         profile_steps=args.profile_steps,
@@ -771,11 +787,13 @@ def _device_put_batch_sharded(batch: dict[str, np.ndarray], sharding: NamedShard
 
 
 class BatchPrefetcher:
-    def __init__(self, sample_fn, *, depth: int = 2) -> None:
+    def __init__(self, sample_fn, *, depth: int = 4, workers: int = 2) -> None:
         if depth < 1:
             raise ValueError("Prefetch depth must be at least 1")
+        if workers < 1:
+            raise ValueError("Prefetch workers must be at least 1")
         self.sample_fn = sample_fn
-        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.executor = ThreadPoolExecutor(max_workers=workers)
         self.futures: list[Future] = []
         for _ in range(depth):
             self.futures.append(self.executor.submit(self.sample_fn))
@@ -915,6 +933,10 @@ def main() -> None:
         raise ValueError("eval_epochs must be positive")
     if config.optimizer.lr_warmup_steps <= 0:
         raise ValueError("lr_warmup_steps must be positive")
+    if config.runtime.prefetch_depth <= 0:
+        raise ValueError("prefetch_depth must be positive")
+    if config.runtime.prefetch_workers <= 0:
+        raise ValueError("prefetch_workers must be positive")
     if config.runtime.profile_enabled:
         if config.runtime.profile_start_step <= 0:
             raise ValueError("profile_start_step must be positive when profiling is enabled")
@@ -1022,6 +1044,8 @@ def main() -> None:
         "resume_step=", resume_step,
         "data_parallel_devices=", data_parallel_size,
         "data_sharding=", data_sharding,
+        "prefetch_depth=", config.runtime.prefetch_depth,
+        "prefetch_workers=", config.runtime.prefetch_workers,
         "profile_enabled=", config.runtime.profile_enabled,
         "profile_start_step=", config.runtime.profile_start_step,
         "profile_steps=", config.runtime.profile_steps,
@@ -1042,7 +1066,11 @@ def main() -> None:
             device=device,
         )
 
-    prefetcher = BatchPrefetcher(sample_train_batch, depth=2)
+    prefetcher = BatchPrefetcher(
+        sample_train_batch,
+        depth=config.runtime.prefetch_depth,
+        workers=config.runtime.prefetch_workers,
+    )
 
     current_batches = [
         prefetcher.next()

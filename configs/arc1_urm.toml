@@ -61,6 +61,9 @@ decay = 0.999
 
 [runtime]
 compute_dtype = "bfloat16"
+data_parallel_devices = 0
+prefetch_depth = 4
+prefetch_workers = 2
 
 [wandb]
 enabled = true

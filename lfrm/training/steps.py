@@ -718,8 +718,9 @@ def loss_and_metrics(
         correct_per_example == supervised_cells_per_example,
         True,
     )
-    exact_accuracy = jnp.mean(exact_examples.astype(jnp.float32))
-    exact_count = jnp.sum(exact_examples.astype(jnp.float32))
+    exact_f32 = exact_examples.astype(jnp.float32)
+    exact_accuracy = _masked_example_mean(exact_f32, example_mask)
+    exact_count = jnp.sum(exact_f32 * example_mask)
     if halt_loss_weight != 0.0:
         selected_token_loss = token_cross_entropy(model, selected_logits, targets)
         selected_ce_loss = jnp.sum(selected_token_loss * loss_mask) / normalizer
