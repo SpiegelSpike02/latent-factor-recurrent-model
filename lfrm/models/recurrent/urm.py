@@ -17,7 +17,6 @@ from lfrm.models.recurrent.layers import (
     rms_norm as _rms_norm,
     swiglu_intermediate_size,
     trunc_normal,
-    trunc_normal_init,
 )
 
 
