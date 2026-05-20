@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
@@ -394,97 +394,99 @@ def run_training(
     profile_stop_step = config.runtime.profile_start_step + config.runtime.profile_steps - 1
     last_step = resume_step
 
+    mesh_context = jax.sharding.set_mesh(mesh) if mesh is not None else nullcontext()
     try:
-        for step in range(resume_step + 1, config.train.optimizer_updates + 1):
-            last_step = step
-            if (
-                config.runtime.profile_enabled
-                and not profile_active
-                and not profile_finished
-                and step >= config.runtime.profile_start_step
-            ):
-                print(f"[profile] start step={step} dir={profile_dir}", flush=True)
-                jax.profiler.start_trace(str(profile_dir))
-                profile_active = True
-            is_eval_step = step % eval_interval == 0 or step == config.train.optimizer_updates
-            metrics = None
-            for microbatch_index in range(config.train.gradient_accumulation_steps):
-                if use_recurrent_act:
-                    step_key = train_key
-                else:
-                    train_key, step_key = jax.random.split(train_key)
-                current_batch = current_batches[microbatch_index]
-                if use_recurrent_act:
-                    assert train_carries is not None
-                    metrics, train_carry = train_step_fn(
-                        model,
-                        optimizer,
-                        train_carries[microbatch_index],
-                        current_batch,
-                        step_key,
-                        jnp.asarray(step - 1, dtype=jnp.int32),
-                    )
-                    train_carries[microbatch_index] = train_carry
-                else:
-                    metrics = train_step_fn(
-                        model,
-                        optimizer,
-                        current_batch,
-                        step_key,
-                    )
-                current_batches[microbatch_index] = prefetcher.next()
-            if metrics is None:
-                raise RuntimeError("No training micro-batches were processed")
+        with mesh_context:
+            for step in range(resume_step + 1, config.train.optimizer_updates + 1):
+                last_step = step
+                if (
+                    config.runtime.profile_enabled
+                    and not profile_active
+                    and not profile_finished
+                    and step >= config.runtime.profile_start_step
+                ):
+                    print(f"[profile] start step={step} dir={profile_dir}", flush=True)
+                    jax.profiler.start_trace(str(profile_dir))
+                    profile_active = True
+                is_eval_step = step % eval_interval == 0 or step == config.train.optimizer_updates
+                metrics = None
+                for microbatch_index in range(config.train.gradient_accumulation_steps):
+                    if use_recurrent_act:
+                        step_key = train_key
+                    else:
+                        train_key, step_key = jax.random.split(train_key)
+                    current_batch = current_batches[microbatch_index]
+                    if use_recurrent_act:
+                        assert train_carries is not None
+                        metrics, train_carry = train_step_fn(
+                            model,
+                            optimizer,
+                            train_carries[microbatch_index],
+                            current_batch,
+                            step_key,
+                            jnp.asarray(step - 1, dtype=jnp.int32),
+                        )
+                        train_carries[microbatch_index] = train_carry
+                    else:
+                        metrics = train_step_fn(
+                            model,
+                            optimizer,
+                            current_batch,
+                            step_key,
+                        )
+                    current_batches[microbatch_index] = prefetcher.next()
+                if metrics is None:
+                    raise RuntimeError("No training micro-batches were processed")
 
-            if ema_model is not None and ema_update_fn is not None:
-                ema_update_fn(ema_model, model)
+                if ema_model is not None and ema_update_fn is not None:
+                    ema_update_fn(ema_model, model)
 
-            if step % config.train.log_interval_updates == 0 or step == 1:
-                host_metrics = jax.device_get(small_metric_items(metrics))
-                log_train_metrics(
-                    wandb_run=wandb_run,
-                    step=step,
-                    config=config,
-                    host_metrics=host_metrics,
-                    scalar_metrics=scalar_metrics,
-                    is_eval_step=is_eval_step,
-                    console_model_label=console_model_label,
-                )
-
-            if is_eval_step:
-                save_checkpoint(str(checkpoint_dir), model, optimizer, step, ema_model=ema_model)
-
-                def run_eval_and_log(eval_model, prefix: str, label: str, *, commit: bool) -> dict[str, Any]:
-                    eval_metrics = evaluate(
-                        eval_step_fn,
-                        eval_model,
-                        dataset,
-                        config=config,
-                        device=device,
-                    )
-                    log_eval_metrics(
+                if step % config.train.log_interval_updates == 0 or step == 1:
+                    host_metrics = jax.device_get(small_metric_items(metrics))
+                    log_train_metrics(
                         wandb_run=wandb_run,
                         step=step,
                         config=config,
-                        eval_metrics=eval_metrics,
+                        host_metrics=host_metrics,
                         scalar_metrics=scalar_metrics,
-                        prefix=prefix,
-                        label=label,
-                        commit=commit,
+                        is_eval_step=is_eval_step,
                         console_model_label=console_model_label,
                     )
-                    return eval_metrics
 
-                if ema_model is not None:
-                    run_eval_and_log(ema_model, "eval/ema", "eval/ema", commit=True)
-                else:
-                    run_eval_and_log(model, "eval", "eval", commit=True)
-            if profile_active and step >= profile_stop_step:
-                jax.profiler.stop_trace()
-                profile_active = False
-                profile_finished = True
-                print(f"[profile] stop step={step} dir={profile_dir}", flush=True)
-                upload_wandb_profile(wandb_run, profile_dir, step=step)
+                if is_eval_step:
+                    save_checkpoint(str(checkpoint_dir), model, optimizer, step, ema_model=ema_model)
+
+                    def run_eval_and_log(eval_model, prefix: str, label: str, *, commit: bool) -> dict[str, Any]:
+                        eval_metrics = evaluate(
+                            eval_step_fn,
+                            eval_model,
+                            dataset,
+                            config=config,
+                            device=device,
+                        )
+                        log_eval_metrics(
+                            wandb_run=wandb_run,
+                            step=step,
+                            config=config,
+                            eval_metrics=eval_metrics,
+                            scalar_metrics=scalar_metrics,
+                            prefix=prefix,
+                            label=label,
+                            commit=commit,
+                            console_model_label=console_model_label,
+                        )
+                        return eval_metrics
+
+                    if ema_model is not None:
+                        run_eval_and_log(ema_model, "eval/ema", "eval/ema", commit=True)
+                    else:
+                        run_eval_and_log(model, "eval", "eval", commit=True)
+                if profile_active and step >= profile_stop_step:
+                    jax.profiler.stop_trace()
+                    profile_active = False
+                    profile_finished = True
+                    print(f"[profile] stop step={step} dir={profile_dir}", flush=True)
+                    upload_wandb_profile(wandb_run, profile_dir, step=step)
     finally:
         if profile_active:
             with suppress(Exception):

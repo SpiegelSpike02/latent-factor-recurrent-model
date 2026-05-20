@@ -5,7 +5,7 @@ import math
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec as P
+from jax.sharding import PartitionSpec as P, get_abstract_mesh
 
 
 Array = jax.Array
@@ -23,22 +23,13 @@ def maybe_cast(x: Array, dtype: jnp.dtype) -> Array:
     return x if x.dtype == dtype else x.astype(dtype)
 
 
-def leading_axis_gather_out_sharding(indices: Array) -> NamedSharding | None:
-    sharding = getattr(indices, "sharding", None)
-    if not isinstance(sharding, NamedSharding):
-        return None
-    index_spec = tuple(sharding.spec)
-    if len(index_spec) < indices.ndim:
-        index_spec = (*index_spec, *([None] * (indices.ndim - len(index_spec))))
-    return NamedSharding(sharding.mesh, P(*index_spec, None))
-
-
 def gather_embedding_rows(weights: Array, identifiers: Array) -> Array:
     identifiers = identifiers.astype(jnp.int32)
-    out_sharding = leading_axis_gather_out_sharding(identifiers)
-    if out_sharding is None:
+    mesh = get_abstract_mesh()
+    if "data" not in mesh.axis_names:
         return weights.at[identifiers].get()
-    return weights.at[identifiers].get(out_sharding=out_sharding)
+    out_rank = identifiers.ndim + weights.ndim - 1
+    return weights.at[identifiers].get(out_sharding=P("data", *([None] * (out_rank - 1))))
 
 
 def trunc_normal(key: Array, shape: tuple[int, ...], std: float, dtype: jnp.dtype = jnp.float32) -> Array:
