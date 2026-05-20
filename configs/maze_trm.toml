@@ -76,5 +76,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-trm-official-rope-act-stablemax-b768-70k"
+name = "maze-trm-official-rope-act-stablemax-b768"
 mode = "online"

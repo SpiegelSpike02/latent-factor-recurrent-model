@@ -69,5 +69,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-urm-official-data-act-stablemax"
+name = "maze-urm-official-style-act-stablemax-b768"
 mode = "online"

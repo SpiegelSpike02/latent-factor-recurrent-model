@@ -69,5 +69,5 @@ prefetch_workers = 1
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "arc1-urm-official-rope-act-stablemax-muon"
+name = "arc1-urm-official-rope-act-stablemax-muon-b1680"
 mode = "online"

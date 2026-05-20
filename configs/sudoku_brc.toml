@@ -82,5 +82,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-trm-capacity-rel2d"
+name = "sudoku-brc-belief-rel2d-trmcap-b768"
 mode = "online"

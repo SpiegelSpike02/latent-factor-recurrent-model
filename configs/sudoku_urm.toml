@@ -68,5 +68,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-urm-unified-reasoning"
+name = "sudoku-urm-official-style-act-stablemax-b768"
 mode = "online"

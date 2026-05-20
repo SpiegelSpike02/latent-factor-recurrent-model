@@ -16,20 +16,20 @@ dropout_rate = 0.0
 loss_type = "stablemax"
 
 [model.trm]
-# Official TRM naming: deep_recursion = H_cycles, latent_recursion = L_cycles,
-# block_layers = L_layers. Official Sudoku MLP-T config uses 3/6/2,
-# mlp_t=true, and position_encoding="none".
+# Official TRM attention config: H_cycles=3, L_cycles=6, L_layers=2,
+# mlp_t=false, and RoPE positional encoding.
 deep_recursion = 3
 latent_recursion = 6
 block_layers = 2
 num_heads = 8
 mlp_ratio = 4
-mlp_t = true
+mlp_t = false
 local_mixing = false
 local_mixing_kernel = 3
 puzzle_embed_ndim = 512
 puzzle_embed_len = 16
-position_encoding = "none"
+position_encoding = "rope"
+rope_theta = 10000.0
 rms_norm_eps = 1e-5
 halt_exploration_prob = 0.1
 # Matches official no_ACT_continue=True: halt uses one sigmoid logit, no continue Q loss.
@@ -75,5 +75,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-trm-mlpt-fixed-official-act-stablemax-b768"
+name = "sudoku-trm-attn-official-rope-act-stablemax-b768"
 mode = "online"

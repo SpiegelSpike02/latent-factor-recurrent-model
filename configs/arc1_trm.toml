@@ -73,5 +73,5 @@ prefetch_workers = 1
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "arc1-trm-official-rope-act-stablemax"
+name = "arc1-trm-official-rope-act-stablemax-b2048"
 mode = "online"
