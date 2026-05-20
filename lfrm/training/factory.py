@@ -49,3 +49,8 @@ def create_ema_model(model: GridReasoningModel, config: ExperimentConfig) -> Gri
 def ema_param_filter(config: ExperimentConfig):
     del config
     return nnx.All(nnx.Param, nnx.Not(nnx.PathContains("puzzle_embed")))
+
+
+def ema_sync_filter(config: ExperimentConfig):
+    del config
+    return nnx.All(nnx.Param, nnx.PathContains("puzzle_embed"))

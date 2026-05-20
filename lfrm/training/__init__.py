@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from lfrm.training.checkpointing import build_ema_update_runner, load_checkpoint, save_checkpoint
+from lfrm.training.checkpointing import build_ema_update_runner, build_state_copy_runner, load_checkpoint, save_checkpoint
 from lfrm.training.brc import build_eval_step_runner, build_train_step_runner
 from lfrm.training.factory import (
     GridReasoningModel,
@@ -8,6 +8,7 @@ from lfrm.training.factory import (
     create_model,
     create_optimizer,
     ema_param_filter,
+    ema_sync_filter,
 )
 from lfrm.training.losses import (
     stablemax,
@@ -31,6 +32,7 @@ __all__ = [
     "GridReasoningModel",
     "brc_loss_and_metrics",
     "build_ema_update_runner",
+    "build_state_copy_runner",
     "build_eval_step_runner",
     "build_optimizer",
     "build_train_step_runner",
@@ -41,6 +43,7 @@ __all__ = [
     "create_model",
     "create_optimizer",
     "ema_param_filter",
+    "ema_sync_filter",
     "load_checkpoint",
     "loss_and_metrics",
     "save_checkpoint",

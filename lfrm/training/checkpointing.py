@@ -18,7 +18,6 @@ def build_ema_update_runner(decay: float, wrt=nnx.Param):
     def update_ema_model(ema_model: GridReasoningModel, model: GridReasoningModel) -> None:
         ema_params = nnx.state(ema_model, wrt)
         model_params = nnx.state(model, wrt)
-        nnx.update(ema_model, nnx.state(model))
         updated_params = jax.tree.map(
             lambda ema, current: decay * ema + (1.0 - decay) * current,
             ema_params,
@@ -27,6 +26,13 @@ def build_ema_update_runner(decay: float, wrt=nnx.Param):
         nnx.update(ema_model, updated_params)
 
     return nnx.jit(update_ema_model)
+
+
+def build_state_copy_runner(wrt=nnx.Param):
+    def copy_state(dst_model: GridReasoningModel, src_model: GridReasoningModel) -> None:
+        nnx.update(dst_model, nnx.state(src_model, wrt))
+
+    return nnx.jit(copy_state)
 
 
 def save_checkpoint(

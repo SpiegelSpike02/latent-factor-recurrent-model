@@ -35,6 +35,7 @@ from lfrm.runtime.sharding import (
 )
 from lfrm.training import (
     build_ema_update_runner,
+    build_state_copy_runner,
     build_eval_step_runner,
     build_train_step_runner,
     build_trm_act_train_step_runner,
@@ -44,6 +45,7 @@ from lfrm.training import (
     create_model,
     create_optimizer,
     ema_param_filter,
+    ema_sync_filter,
     load_checkpoint,
     save_checkpoint,
 )
@@ -341,6 +343,11 @@ def run_training(
         if config.train.use_ema
         else None
     )
+    ema_sync_fn = (
+        build_state_copy_runner(ema_sync_filter(config))
+        if config.train.use_ema
+        else None
+    )
     if resume_checkpoint is not None:
         restored_step = load_checkpoint(resume_checkpoint, model, optimizer, ema_model=ema_model)
         if restored_step != resume_step:
@@ -445,6 +452,8 @@ def run_training(
                     )
 
                 if is_eval_step:
+                    if ema_model is not None and ema_sync_fn is not None:
+                        ema_sync_fn(ema_model, model)
                     save_checkpoint(str(checkpoint_dir), model, optimizer, step, ema_model=ema_model)
 
                     def run_eval_and_log(eval_model, prefix: str, label: str, *, commit: bool) -> dict[str, Any]:
