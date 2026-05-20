@@ -32,7 +32,7 @@ def build_train_step_runner(
         optimizer.update(model, grads)
         return metrics
 
-    return nnx.jit(train_step_with_weight, donate_argnums=(2,))
+    return nnx.jit(train_step_with_weight)
 
 
 def build_eval_step_runner(
