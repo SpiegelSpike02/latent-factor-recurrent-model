@@ -79,6 +79,11 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("prefetch_depth must be positive")
     if config.runtime.prefetch_workers <= 0:
         raise ValueError("prefetch_workers must be positive")
+    if config.runtime.train_dispatch_chunk != 1:
+        raise ValueError(
+            "runtime.train_dispatch_chunk is reserved for a future scanned train runner; "
+            "set it to 1 for the current optimized path"
+        )
     if config.runtime.profile_enabled:
         if config.runtime.profile_start_step <= 0:
             raise ValueError("profile_start_step must be positive when profiling is enabled")
@@ -168,6 +173,7 @@ def print_run_overview(
         "data_sharding=", data_sharding,
         "prefetch_depth=", config.runtime.prefetch_depth,
         "prefetch_workers=", config.runtime.prefetch_workers,
+        "train_dispatch_chunk=", config.runtime.train_dispatch_chunk,
         "eval_diagnostics=", config.eval.diagnostics,
         "profile_enabled=", config.runtime.profile_enabled,
         "profile_start_step=", config.runtime.profile_start_step,
@@ -454,6 +460,7 @@ def run_training(
                         eval_model,
                         dataset,
                         config=config,
+                        device=device,
                     )
                     log_eval_metrics(
                         wandb_run=wandb_run,

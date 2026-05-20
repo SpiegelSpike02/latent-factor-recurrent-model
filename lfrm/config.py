@@ -182,6 +182,7 @@ class RuntimeConfig:
     data_parallel_devices: int = 1
     prefetch_depth: int = 4
     prefetch_workers: int = 2
+    train_dispatch_chunk: int = 1
     profile_enabled: bool = False
     profile_start_step: int = 1000
     profile_steps: int = 20

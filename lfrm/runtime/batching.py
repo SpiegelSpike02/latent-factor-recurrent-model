@@ -96,7 +96,12 @@ def eval_device_batch(
     return jax.device_put(batch, device=device)
 
 
-def small_metric_items(metrics: dict[str, Any], *, max_elements: int = 4096) -> dict[str, Any]:
+def small_metric_items(
+    metrics: dict[str, Any],
+    *,
+    max_elements: int = 4096,
+    verbose: bool = True,
+) -> dict[str, Any]:
     small: dict[str, Any] = {}
     skipped: list[str] = []
     for key, value in metrics.items():
@@ -106,6 +111,6 @@ def small_metric_items(metrics: dict[str, Any], *, max_elements: int = 4096) -> 
             small[key] = value
         else:
             skipped.append(f"{key}{tuple(shape)}")
-    if skipped:
+    if skipped and verbose:
         print("[metrics] skipped large metric leaves:", ", ".join(skipped), flush=True)
     return small

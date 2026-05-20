@@ -53,4 +53,4 @@ def build_eval_step_runner(
         )
         return metrics
 
-    return nnx.jit(eval_step_with_weight)
+    return nnx.jit(eval_step_with_weight, donate_argnums=(1,))

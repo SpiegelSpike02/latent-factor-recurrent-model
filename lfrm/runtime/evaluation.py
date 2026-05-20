@@ -8,14 +8,11 @@ import numpy as np
 
 from lfrm.config import ExperimentConfig
 from lfrm.runtime.batching import eval_device_batch, small_metric_items
-from lfrm.runtime.sharding import batch_sharding, data_parallel_mesh
 
 
-def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[str, Any]:
-    mesh = data_parallel_mesh(config)
-    sharded_device = batch_sharding(mesh)
-    primary_device = jax.devices()[0]
-    device = sharded_device or primary_device
+def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, device=None) -> dict[str, Any]:
+    if device is None:
+        device = jax.devices()[0]
     reduced: dict[str, Any] | None = None
     total = dataset.eval_inputs.shape[0]
     if total == 0:
@@ -65,7 +62,7 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
             future = eval_futures.pop(0)
             weight_int, batch = future.result()
             submit_eval_batch()
-            metrics = jax.device_get(small_metric_items(eval_step_fn(model, batch)))
+            metrics = jax.device_get(small_metric_items(eval_step_fn(model, batch), verbose=False))
             weight = float(weight_int)
             if reduced is None:
                 reduced = {

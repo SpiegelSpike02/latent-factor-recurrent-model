@@ -91,7 +91,7 @@ def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
             optimizer.update(model, model_grads)
         return metrics, new_carry
 
-    return nnx.jit(train_step)
+    return nnx.jit(train_step, donate_argnums=(2,))
 
 
 def build_trm_dense_unroll_train_step_runner(
@@ -138,4 +138,4 @@ def build_trm_eval_step_runner(halt_loss_weight: float = 0.5, *, collect_diagnos
         )
         return metrics
 
-    return nnx.jit(eval_step)
+    return nnx.jit(eval_step, donate_argnums=(1,))
