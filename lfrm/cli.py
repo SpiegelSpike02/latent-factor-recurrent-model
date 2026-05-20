@@ -773,15 +773,26 @@ def eval_device_batch(
     start: int,
     stop: int,
     device: jax.Device | NamedSharding,
+    target_batch_size: int,
 ) -> dict[str, jax.Array]:
     if dataset.spec.seq_len != config.model.seq_len:
         raise ValueError(f"Requested seq_len={config.model.seq_len}, but dataset seq_len={dataset.spec.seq_len}")
+    actual_batch_size = stop - start
     batch = {
         "inputs": np.asarray(dataset.eval_inputs[start:stop], dtype=np.int32),
         "labels": np.asarray(dataset.eval_labels[start:stop], dtype=np.int32),
         "given_mask": np.asarray(dataset.eval_given_mask[start:stop], dtype=bool),
         "puzzle_identifiers": np.asarray(dataset.eval_puzzle_identifiers[start:stop], dtype=np.int32),
     }
+    example_mask = np.ones((actual_batch_size,), dtype=np.float32)
+    if actual_batch_size < target_batch_size:
+        pad_width = target_batch_size - actual_batch_size
+        batch = {
+            key: np.pad(value, ((0, pad_width), *[(0, 0)] * (value.ndim - 1)), mode="edge")
+            for key, value in batch.items()
+        }
+        example_mask = np.pad(example_mask, (0, pad_width), constant_values=0.0)
+    batch["example_mask"] = example_mask
     return jax.device_put(batch, device=device)
 
 
@@ -790,7 +801,6 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
     sharded_device = batch_sharding(mesh)
     primary_device = jax.devices()[0]
     device = sharded_device or primary_device
-    data_parallel_size = 1 if mesh is None else int(mesh.shape["data"])
     reduced: dict[str, Any] | None = None
     total = dataset.eval_inputs.shape[0]
     if total == 0:
@@ -809,18 +819,13 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
     )
     for batch_index, start in enumerate(range(0, total, batch_size), start=1):
         stop = min(start + batch_size, total)
-        actual_batch_size = stop - start
-        batch_device = (
-            device
-            if actual_batch_size % data_parallel_size == 0
-            else primary_device
-        )
         batch = eval_device_batch(
             dataset,
             config=config,
             start=start,
             stop=stop,
-            device=batch_device,
+            device=device,
+            target_batch_size=batch_size,
         )
         metrics = jax.device_get(eval_step_fn(model, batch))
         weight = float(stop - start)

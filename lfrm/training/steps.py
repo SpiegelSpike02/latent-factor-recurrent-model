@@ -49,6 +49,18 @@ def _should_clamp_given(model: GridReasoningModel) -> bool:
     return bool(getattr(config, "clamp_given", False))
 
 
+def _example_mask(batch: dict[str, jax.Array], targets: jax.Array) -> jax.Array:
+    return batch.get("example_mask", jnp.ones((targets.shape[0],), dtype=jnp.float32)).astype(jnp.float32)
+
+
+def _apply_example_mask(loss_mask: jax.Array, example_mask: jax.Array) -> jax.Array:
+    return loss_mask.astype(jnp.float32) * example_mask[:, None]
+
+
+def _masked_example_mean(values: jax.Array, example_mask: jax.Array) -> jax.Array:
+    return jnp.sum(values.astype(jnp.float32) * example_mask) / jnp.maximum(jnp.sum(example_mask), 1.0)
+
+
 def _permute_sudoku_digits(
     inputs: jax.Array,
     targets: jax.Array,
@@ -418,7 +430,8 @@ def brc_loss_and_metrics(
         train=train,
     )
     given_mask = inputs != 1
-    loss_mask = supervised_loss_mask(model, given_mask, targets)
+    example_mask = _example_mask(batch, targets)
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, given_mask, targets), example_mask)
     brc = model.brc
     zero = jnp.asarray(0.0, dtype=jnp.float32)
 
@@ -545,15 +558,16 @@ def brc_loss_and_metrics(
         correct_per_example == supervised_cells_per_example,
         True,
     )
-    exact_accuracy = jnp.mean(exact_examples.astype(jnp.float32))
-    exact_count = jnp.sum(exact_examples.astype(jnp.float32))
+    exact_f32 = exact_examples.astype(jnp.float32)
+    exact_accuracy = _masked_example_mean(exact_f32, example_mask)
+    exact_count = jnp.sum(exact_f32 * example_mask)
     target_probability = token_target_probability(model, final_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask.astype(jnp.float32)) / normalizer
     if train:
         oracle_step = jnp.argmin(per_step_loss)
     else:
         per_step_example_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=-1) / per_example_normalizer[None, :]
-        oracle_step = jnp.mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32))
+        oracle_step = _masked_example_mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32), example_mask)
     given_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs, given_mask)
 
     metrics = {
@@ -617,7 +631,8 @@ def loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = supervised_loss_mask(model, given_mask, targets)
+    example_mask = _example_mask(batch, targets)
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, given_mask, targets), example_mask)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
 
@@ -713,7 +728,7 @@ def loss_and_metrics(
             selected_correct_per_example == supervised_cells_per_example,
             True,
         )
-        selected_exact_accuracy = jnp.mean(selected_exact_examples.astype(jnp.float32))
+        selected_exact_accuracy = _masked_example_mean(selected_exact_examples.astype(jnp.float32), example_mask)
     else:
         selected_ce_loss = per_step_loss[-1]
         selected_accuracy = cell_accuracy
@@ -732,8 +747,8 @@ def loss_and_metrics(
         "selected_lm_loss": selected_ce_loss,
         "selected_accuracy": selected_accuracy,
         "selected_exact_accuracy": selected_exact_accuracy,
-        "selected_step": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
-        "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
+        "selected_step": _masked_example_mean(selected_step.astype(jnp.float32) + 1.0, example_mask),
+        "oracle_step": _masked_example_mean(oracle_step.astype(jnp.float32) + 1.0, example_mask),
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_weights,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
@@ -749,7 +764,10 @@ def loss_and_metrics(
             }
         )
     if halt_logits is not None and halt_loss_weight != 0.0:
-        metrics["per_step_halt_probability"] = jax.nn.sigmoid(jnp.mean(halt_logits, axis=1))
+        metrics["per_step_halt_probability"] = (
+            jnp.sum(jax.nn.sigmoid(halt_logits) * example_mask[None, :], axis=1)
+            / jnp.maximum(jnp.sum(example_mask), 1.0)
+        )
     if "terminal_belief_delta" in diagnostics or terminal_residual_weight != 0.0:
         metrics["terminal_belief_delta"] = diagnostics.get("terminal_belief_delta", terminal_residual)
     if "terminal_belief_mse" in diagnostics or terminal_residual_weight != 0.0:
@@ -1060,8 +1078,15 @@ def trm_eval_loss_and_metrics(
         selected_step[None, :],
         axis=0,
     ).squeeze(0)
-    selected_exact_count = jnp.sum(selected_exact_targets)
-    halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(halt_logits, jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))))
+    selected_exact_count = jnp.sum(selected_exact_targets * example_mask)
+    halt_loss_per_example = optax.sigmoid_binary_cross_entropy(
+        halt_logits,
+        jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32)),
+    )
+    halt_loss = jnp.sum(halt_loss_per_example * example_mask[None, :]) / jnp.maximum(
+        jnp.sum(example_mask) * halt_logits.shape[0],
+        1.0,
+    )
     final_logits = step_logits[-1]
     final_token_loss = token_cross_entropy(model, final_logits, targets)
     final_lm_loss_value = jnp.sum(final_token_loss * loss_mask) / normalizer
@@ -1072,10 +1097,10 @@ def trm_eval_loss_and_metrics(
     target_probability = jnp.sum(target_probability * loss_mask) / metric_normalizer
     correct = (predictions == targets).astype(jnp.float32) * loss_mask
     cell_accuracy = jnp.sum(correct) / metric_normalizer
-    exact_accuracy = jnp.mean(selected_exact_targets)
+    exact_accuracy = _masked_example_mean(selected_exact_targets, example_mask)
     selected_q_halt_logits = jnp.take_along_axis(halt_logits, selected_step[None, :], axis=0).squeeze(0)
     selected_q_halt_correct = (selected_q_halt_logits >= 0.0) == selected_exact_targets.astype(bool)
-    q_halt_accuracy = jnp.mean(selected_q_halt_correct.astype(jnp.float32))
+    q_halt_accuracy = _masked_example_mean(selected_q_halt_correct.astype(jnp.float32), example_mask)
     final_predictions = jnp.argmax(final_logits, axis=-1)
     final_correct = (final_predictions == targets).astype(jnp.float32) * loss_mask
     final_cell_accuracy = jnp.sum(final_correct) / metric_normalizer
@@ -1085,34 +1110,39 @@ def trm_eval_loss_and_metrics(
         final_correct_per_example == supervised_cells_per_example,
         True,
     )
-    final_exact_count = jnp.sum(final_exact_examples.astype(jnp.float32))
+    final_exact_f32 = final_exact_examples.astype(jnp.float32)
+    final_exact_count = jnp.sum(final_exact_f32 * example_mask)
     oracle_step = jnp.argmin(per_step_example_loss, axis=0)
+    count = jnp.sum(example_mask)
     metrics = {
         "loss": loss,
         "lm_loss": final_lm_loss_value,
         "q_halt_loss": halt_loss,
-        "count": jnp.asarray(inputs.shape[0], dtype=jnp.float32),
+        "count": count,
         "accuracy": final_cell_accuracy,
-        "exact_accuracy": jnp.mean(final_exact_examples.astype(jnp.float32)),
+        "exact_accuracy": _masked_example_mean(final_exact_f32, example_mask),
         "q_halt_accuracy": q_halt_accuracy,
         "steps": jnp.asarray(step_logits.shape[0], dtype=jnp.float32),
         "halt_loss": halt_loss,
         "final_lm_loss": final_lm_loss_value,
         "final_accuracy": final_cell_accuracy,
-        "final_exact_accuracy": jnp.mean(final_exact_examples.astype(jnp.float32)),
+        "final_exact_accuracy": _masked_example_mean(final_exact_f32, example_mask),
         "halted_target_probability": target_probability,
         "exact_count": final_exact_count,
         "selected_lm_loss": selected_lm_loss_value,
         "selected_accuracy": cell_accuracy,
         "selected_exact_accuracy": exact_accuracy,
         "selected_exact_count": selected_exact_count,
-        "selected_step": jnp.mean(selected_step.astype(jnp.float32) + 1.0),
-        "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
+        "selected_step": _masked_example_mean(selected_step.astype(jnp.float32) + 1.0, example_mask),
+        "oracle_step": _masked_example_mean(oracle_step.astype(jnp.float32) + 1.0, example_mask),
         "final_exact_count": final_exact_count,
         "per_step_loss": per_step_loss,
         "per_step_accuracy": per_step_accuracy,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
-        "per_step_halt_probability": jax.nn.sigmoid(jnp.mean(halt_logits, axis=1)),
+        "per_step_halt_probability": (
+            jnp.sum(jax.nn.sigmoid(halt_logits) * example_mask[None, :], axis=1)
+            / jnp.maximum(count, 1.0)
+        ),
         "unroll_steps": jnp.asarray(step_logits.shape[0], dtype=jnp.int32),
     }
     selected_path_metrics = _maybe_path_metrics(model, predictions, targets, loss_mask)
