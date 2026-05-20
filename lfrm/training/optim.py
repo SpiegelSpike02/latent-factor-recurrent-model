@@ -205,9 +205,4 @@ def build_optimizer(config: ExperimentConfig, model: object | None = None) -> op
         optimizer = default_optimizer
     if config.optimizer.flatten_optimizer:
         optimizer = optax.flatten(optimizer)
-    if config.train.gradient_accumulation_steps > 1:
-        optimizer = optax.MultiSteps(
-            optimizer,
-            every_k_schedule=config.train.gradient_accumulation_steps,
-        )
     return optimizer

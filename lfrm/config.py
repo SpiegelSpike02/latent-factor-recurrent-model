@@ -140,8 +140,7 @@ class EMAConfig:
 
 @dataclass(frozen=True)
 class TrainConfig:
-    microbatch_size: int = 16
-    gradient_accumulation_steps: int = 1
+    batch_size: int = 16
     epochs: int = 500
     optimizer_updates: int = 0
     log_epochs: int = 10

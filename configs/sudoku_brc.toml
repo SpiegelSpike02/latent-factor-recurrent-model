@@ -59,7 +59,7 @@ grad_clip_norm = 1.0
 flatten_optimizer = true
 
 [train]
-microbatch_size = 768
+batch_size = 768
 epochs = 23040
 log_epochs = 10
 seed = 0

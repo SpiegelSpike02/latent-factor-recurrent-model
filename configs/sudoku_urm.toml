@@ -43,7 +43,7 @@ grad_clip_norm = 1.0
 flatten_optimizer = false
 
 [train]
-microbatch_size = 768
+batch_size = 768
 epochs = 50000
 log_epochs = 10
 trm_train_mode = "act"

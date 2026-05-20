@@ -66,8 +66,7 @@ ALLOWED_SECTION_KEYS = {
         "flatten_optimizer",
     },
     "train": {
-        "microbatch_size",
-        "gradient_accumulation_steps",
+        "batch_size",
         "epochs",
         "log_epochs",
         "trm_train_mode",
@@ -216,18 +215,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seq-len", type=int, default=81)
     parser.add_argument("--grid-height", type=int, default=9)
     parser.add_argument("--grid-width", type=int, default=9)
-    parser.add_argument("--microbatch-size", type=int, default=16)
-    parser.add_argument(
-        "--gradient-accumulation-steps",
-        type=int,
-        default=1,
-        help="Accumulate this many micro-batches before each optimizer update.",
-    )
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
         "--eval-batch-size",
         type=int,
         default=0,
-        help="Eval batch size. Uses --microbatch-size when set to 0.",
+        help="Eval batch size. Uses --batch-size when set to 0.",
     )
     parser.add_argument(
         "--epochs",
@@ -494,8 +487,7 @@ def build_config(
         flatten_optimizer=args.flatten_optimizer,
     )
     train = TrainConfig(
-        microbatch_size=args.microbatch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        batch_size=args.batch_size,
         epochs=args.epochs,
         log_epochs=args.log_epochs,
         trm_train_mode=args.trm_train_mode,

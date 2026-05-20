@@ -18,7 +18,6 @@ from lfrm.runtime.logging import (
 from lfrm.runtime.schedules import (
     apply_epoch_budget,
     config_to_dict,
-    effective_train_batch_size,
     eval_interval_updates,
     schedule_learning_rate,
     updates_from_epochs,
@@ -40,7 +39,6 @@ __all__ = [
     "checkpoint_step",
     "config_to_dict",
     "data_parallel_mesh",
-    "effective_train_batch_size",
     "eval_device_batch",
     "eval_interval_updates",
     "evaluate",

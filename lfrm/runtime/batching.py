@@ -21,12 +21,12 @@ def sample_device_batch(
     device: jax.Device | NamedSharding,
 ) -> dict[str, jax.Array]:
     if isinstance(rng, GridBatchSampler):
-        batch = rng.sample(batch_size=config.train.microbatch_size, seq_len=config.model.seq_len, split=split)
+        batch = rng.sample(batch_size=config.train.batch_size, seq_len=config.model.seq_len, split=split)
     else:
         batch = sample_batch(
             rng,
             dataset,
-            batch_size=config.train.microbatch_size,
+            batch_size=config.train.batch_size,
             seq_len=config.model.seq_len,
             split=split,
         )

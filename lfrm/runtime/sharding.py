@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import jax
+import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 

@@ -28,7 +28,7 @@ from lfrm.config import (
     WandbConfig,
 )
 from lfrm.runtime import (
-    effective_train_batch_size,
+    apply_epoch_budget,
     resolve_resume_checkpoint,
     schedule_learning_rate,
     small_metric_items,
@@ -100,16 +100,23 @@ class GridModelTests(unittest.TestCase):
         )
         self.assertEqual(updates_from_epochs(dataset, batch_size=768, epochs=5000), 6510)
 
-    def test_effective_batch_size_uses_microbatch_and_accumulation(self) -> None:
+    def test_epoch_budget_uses_batch_as_global_batch(self) -> None:
         config = ExperimentConfig(
             model=ModelConfig(vocab_size=11),
             optimizer=OptimizerConfig(),
-            train=TrainConfig(microbatch_size=1024, gradient_accumulation_steps=2),
+            train=TrainConfig(batch_size=1024, epochs=10, log_epochs=1),
+            eval=EvalConfig(epochs=2),
             data=DataConfig(dataset_path="unused"),
             runtime=RuntimeConfig(),
             wandb=WandbConfig(),
         )
-        self.assertEqual(effective_train_batch_size(config), 2048)
+        dataset = SimpleNamespace(
+            spec=SimpleNamespace(total_groups=2048, mean_puzzle_examples=1.0)
+        )
+        budgeted = apply_epoch_budget(config, dataset)
+        self.assertEqual(budgeted.train.optimizer_updates, 20)
+        self.assertEqual(budgeted.train.log_interval_updates, 2)
+        self.assertEqual(budgeted.eval.interval_updates, 4)
 
     def test_small_metric_items_drops_large_leaves(self) -> None:
         metrics = {
@@ -467,7 +474,7 @@ class GridModelTests(unittest.TestCase):
                 ),
             ),
             optimizer=OptimizerConfig(learning_rate=1e-4, lr_warmup_steps=1),
-            train=TrainConfig(microbatch_size=1, epochs=1, optimizer_updates=1),
+            train=TrainConfig(batch_size=1, epochs=1, optimizer_updates=1),
             data=DataConfig(),
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
@@ -645,7 +652,7 @@ class GridModelTests(unittest.TestCase):
                 puzzle_embed_weight_decay=1.0,
                 lr_warmup_steps=1,
             ),
-            train=TrainConfig(microbatch_size=2, epochs=2, optimizer_updates=2, halt_loss_weight=0.5),
+            train=TrainConfig(batch_size=2, epochs=2, optimizer_updates=2, halt_loss_weight=0.5),
             data=DataConfig(),
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
@@ -754,7 +761,7 @@ class GridModelTests(unittest.TestCase):
                 beta2=0.95,
                 lr_warmup_steps=1,
             ),
-            train=TrainConfig(microbatch_size=2, epochs=2, optimizer_updates=2, halt_loss_weight=0.5),
+            train=TrainConfig(batch_size=2, epochs=2, optimizer_updates=2, halt_loss_weight=0.5),
             data=DataConfig(),
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
@@ -849,7 +856,7 @@ class GridModelTests(unittest.TestCase):
             train_legacy_path = Path(tmpdir) / "legacy_train.toml"
             train_legacy_path.write_text(
                 "[train]\n"
-                "batch_size = 8\n",
+                "microbatch_size = 8\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "Unsupported \\[train\\] field"):

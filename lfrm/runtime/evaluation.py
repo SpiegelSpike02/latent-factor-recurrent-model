@@ -17,7 +17,7 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig, device=N
     total = dataset.eval_inputs.shape[0]
     if total == 0:
         raise ValueError("Eval split is empty")
-    batch_size = config.eval.batch_size or config.train.microbatch_size
+    batch_size = config.eval.batch_size or config.train.batch_size
     if batch_size <= 0:
         raise ValueError("eval batch_size must be at least 1 when set")
     total_weight = 0.0

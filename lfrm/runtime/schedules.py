@@ -26,10 +26,6 @@ def eval_interval_updates(config: ExperimentConfig) -> int:
     return max(1, config.eval.interval_updates)
 
 
-def effective_train_batch_size(config: ExperimentConfig) -> int:
-    return config.train.microbatch_size * config.train.gradient_accumulation_steps
-
-
 def updates_from_epochs(dataset, batch_size: int, epochs: int) -> int:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
@@ -47,15 +43,14 @@ def updates_from_epochs(dataset, batch_size: int, epochs: int) -> int:
 
 
 def apply_epoch_budget(config: ExperimentConfig, dataset) -> ExperimentConfig:
-    effective_batch_size = effective_train_batch_size(config)
     train = replace(
         config.train,
-        optimizer_updates=updates_from_epochs(dataset, effective_batch_size, config.train.epochs),
-        log_interval_updates=updates_from_epochs(dataset, effective_batch_size, config.train.log_epochs),
+        optimizer_updates=updates_from_epochs(dataset, config.train.batch_size, config.train.epochs),
+        log_interval_updates=updates_from_epochs(dataset, config.train.batch_size, config.train.log_epochs),
     )
     eval_config = replace(
         config.eval,
-        interval_updates=updates_from_epochs(dataset, effective_batch_size, config.eval.epochs),
+        interval_updates=updates_from_epochs(dataset, config.train.batch_size, config.eval.epochs),
     )
     return ExperimentConfig(
         task=config.task,

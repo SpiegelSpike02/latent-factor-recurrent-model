@@ -1,5 +1,4 @@
 from .brc_sudoku import BRCSudokuModel
-from .trm import TinyRecursiveModel
-from .urm import UnifiedReasoningModel
+from .recurrent import TinyRecursiveModel, UnifiedReasoningModel
 
 __all__ = ["BRCSudokuModel", "TinyRecursiveModel", "UnifiedReasoningModel"]

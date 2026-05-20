@@ -25,7 +25,7 @@ from lfrm.runtime.logging import (
     resolve_profile_dir,
     upload_wandb_profile,
 )
-from lfrm.runtime.schedules import effective_train_batch_size, eval_interval_updates, schedule_learning_rate
+from lfrm.runtime.schedules import eval_interval_updates, schedule_learning_rate
 from lfrm.runtime.sharding import (
     batch_sharding,
     data_parallel_mesh,
@@ -59,10 +59,8 @@ from lfrm.training.metrics import (
 
 
 def validate_runtime_config(config: ExperimentConfig) -> None:
-    if config.train.microbatch_size < 1:
-        raise ValueError("microbatch_size must be at least 1")
-    if config.train.gradient_accumulation_steps < 1:
-        raise ValueError("gradient_accumulation_steps must be at least 1")
+    if config.train.batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
     if config.eval.batch_size < 0:
         raise ValueError("eval batch_size must be non-negative")
     if config.train.epochs <= 0:
@@ -104,11 +102,11 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
 
 
 def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size: int) -> int:
-    if config.train.microbatch_size % data_parallel_size != 0:
+    if config.train.batch_size % data_parallel_size != 0:
         raise ValueError(
-            f"microbatch_size={config.train.microbatch_size} must be divisible by data_parallel_devices={data_parallel_size}"
+            f"batch_size={config.train.batch_size} must be divisible by data_parallel_devices={data_parallel_size}"
         )
-    eval_batch_size = config.eval.batch_size or config.train.microbatch_size
+    eval_batch_size = config.eval.batch_size or config.train.batch_size
     if eval_batch_size % data_parallel_size != 0:
         raise ValueError(
             f"eval_batch_size={eval_batch_size} must be divisible by data_parallel_devices={data_parallel_size}"
@@ -161,10 +159,8 @@ def print_run_overview(
         "num_puzzle_identifiers=", overview["num_puzzle_identifiers"],
         "train_examples=", overview["train_examples"],
         "eval_examples=", overview["eval_examples"],
-        "microbatch_size=", config.train.microbatch_size,
-        "gradient_accumulation_steps=", config.train.gradient_accumulation_steps,
-        "effective_batch_size=", effective_train_batch_size(config),
-        "eval_batch_size=", config.eval.batch_size or config.train.microbatch_size,
+        "batch_size=", config.train.batch_size,
+        "eval_batch_size=", config.eval.batch_size or config.train.batch_size,
         "epochs=", config.train.epochs,
         "optimizer_updates=", config.train.optimizer_updates,
         "log_epochs=", config.train.log_epochs,
@@ -387,17 +383,10 @@ def run_training(
         workers=config.runtime.prefetch_workers,
     )
 
-    current_batches = [
-        prefetcher.next()
-        for _ in range(config.train.gradient_accumulation_steps)
-    ]
+    current_batch = prefetcher.next()
     use_recurrent_act = config.model.model_type in ("trm", "urm") and config.train.trm_train_mode == "act"
     console_model_label = "brc" if config.model.model_type == "brc_sudoku" else config.model.model_type
-    train_carries = (
-        [place_tree(model.initial_carry(batch), data_sharding) for batch in current_batches]
-        if use_recurrent_act
-        else None
-    )
+    train_carry = place_tree(model.initial_carry(current_batch), data_sharding) if use_recurrent_act else None
     eval_interval = eval_interval_updates(config)
     profile_active = False
     profile_finished = False
@@ -419,34 +408,26 @@ def run_training(
                     jax.profiler.start_trace(str(profile_dir))
                     profile_active = True
                 is_eval_step = step % eval_interval == 0 or step == config.train.optimizer_updates
-                metrics = None
-                for microbatch_index in range(config.train.gradient_accumulation_steps):
-                    if use_recurrent_act:
-                        step_key = train_key
-                    else:
-                        train_key, step_key = jax.random.split(train_key)
-                    current_batch = current_batches[microbatch_index]
-                    if use_recurrent_act:
-                        assert train_carries is not None
-                        metrics, train_carry = train_step_fn(
-                            model,
-                            optimizer,
-                            train_carries[microbatch_index],
-                            current_batch,
-                            step_key,
-                            jnp.asarray(step - 1, dtype=jnp.int32),
-                        )
-                        train_carries[microbatch_index] = train_carry
-                    else:
-                        metrics = train_step_fn(
-                            model,
-                            optimizer,
-                            current_batch,
-                            step_key,
-                        )
-                    current_batches[microbatch_index] = prefetcher.next()
-                if metrics is None:
-                    raise RuntimeError("No training micro-batches were processed")
+                if use_recurrent_act:
+                    assert train_carry is not None
+                    step_key = train_key
+                    metrics, train_carry = train_step_fn(
+                        model,
+                        optimizer,
+                        train_carry,
+                        current_batch,
+                        step_key,
+                        jnp.asarray(step - 1, dtype=jnp.int32),
+                    )
+                else:
+                    train_key, step_key = jax.random.split(train_key)
+                    metrics = train_step_fn(
+                        model,
+                        optimizer,
+                        current_batch,
+                        step_key,
+                    )
+                current_batch = prefetcher.next()
 
                 if ema_model is not None and ema_update_fn is not None:
                     ema_update_fn(ema_model, model)
