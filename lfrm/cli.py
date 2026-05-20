@@ -1114,6 +1114,8 @@ def main() -> None:
                     print(summary)
 
             if is_eval_step:
+                save_checkpoint(str(checkpoint_dir), model, optimizer, step, ema_model=ema_model)
+
                 def run_eval_and_log(eval_model, prefix: str, label: str, *, commit: bool) -> dict[str, Any]:
                     eval_metrics = evaluate(
                         eval_step_fn,
@@ -1176,7 +1178,6 @@ def main() -> None:
                     run_eval_and_log(ema_model, "eval/ema", "eval/ema", commit=True)
                 else:
                     run_eval_and_log(model, "eval", "eval", commit=True)
-                save_checkpoint(str(checkpoint_dir), model, optimizer, step, ema_model=ema_model)
             if profile_active and step >= profile_stop_step:
                 jax.profiler.stop_trace()
                 profile_active = False

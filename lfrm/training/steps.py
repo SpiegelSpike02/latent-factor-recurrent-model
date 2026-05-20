@@ -683,7 +683,11 @@ def loss_and_metrics(
     selected_step = jnp.full((inputs.shape[0],), effective_step_logits.shape[0] - 1, dtype=jnp.int32)
     if halt_logits is not None and halt_loss_weight != 0.0:
         halt_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
-        halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(halt_logits, halt_targets))
+        halt_loss_per_example = optax.sigmoid_binary_cross_entropy(halt_logits, halt_targets)
+        halt_loss = jnp.sum(halt_loss_per_example * example_mask[None, :]) / jnp.maximum(
+            jnp.sum(example_mask) * halt_logits.shape[0],
+            1.0,
+        )
         selected_step = _trm_selected_step(halt_logits)
         gather_index = selected_step[None, :, None, None]
         selected_logits = jnp.take_along_axis(
@@ -812,7 +816,8 @@ def trm_act_loss_and_metrics(
     )
     targets = new_carry["current_labels"]
     given_mask = new_carry["current_given_mask"]
-    loss_mask = supervised_loss_mask(model, given_mask, targets)
+    example_mask = _example_mask(batch, targets)
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, given_mask, targets), example_mask)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
@@ -937,7 +942,8 @@ def trm_dense_unroll_loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = supervised_loss_mask(model, given_mask, targets)
+    example_mask = _example_mask(batch, targets)
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, given_mask, targets), example_mask)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
@@ -986,14 +992,19 @@ def trm_dense_unroll_loss_and_metrics(
         correct_per_example == supervised_cells_per_example,
         True,
     )
-    exact_accuracy = jnp.mean(exact_examples.astype(jnp.float32))
-    exact_count = jnp.sum(exact_examples.astype(jnp.float32))
+    exact_f32 = exact_examples.astype(jnp.float32)
+    exact_accuracy = _masked_example_mean(exact_f32, example_mask)
+    exact_count = jnp.sum(exact_f32 * example_mask)
 
     halt_logits = diagnostics.get("halt_logits")
     halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
     if halt_logits is not None and halt_loss_weight != 0.0:
         halt_targets = jax.lax.stop_gradient(per_step_example_solved.astype(jnp.float32))
-        halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(halt_logits, halt_targets))
+        halt_loss_per_example = optax.sigmoid_binary_cross_entropy(halt_logits, halt_targets)
+        halt_loss = jnp.sum(halt_loss_per_example * example_mask[None, :]) / jnp.maximum(
+            jnp.sum(example_mask) * halt_logits.shape[0],
+            1.0,
+        )
 
     loss = lm_loss_value + halt_loss_weight * halt_loss
     oracle_step = jnp.argmin(
@@ -1010,7 +1021,7 @@ def trm_dense_unroll_loss_and_metrics(
         "exact_accuracy": exact_accuracy,
         "exact_count": exact_count,
         "halt_loss": halt_loss,
-        "oracle_step": jnp.mean(oracle_step.astype(jnp.float32) + 1.0),
+        "oracle_step": _masked_example_mean(oracle_step.astype(jnp.float32) + 1.0, example_mask),
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_weights,
         "per_step_hidden_delta": diagnostics["hidden_delta_mean"],
@@ -1018,7 +1029,10 @@ def trm_dense_unroll_loss_and_metrics(
     }
     metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
     if halt_logits is not None and halt_loss_weight != 0.0:
-        metrics["per_step_halt_probability"] = jax.nn.sigmoid(jnp.mean(halt_logits, axis=1))
+        metrics["per_step_halt_probability"] = (
+            jnp.sum(jax.nn.sigmoid(halt_logits) * example_mask[None, :], axis=1)
+            / jnp.maximum(jnp.sum(example_mask), 1.0)
+        )
     return loss, metrics
 
 
@@ -1030,7 +1044,8 @@ def trm_eval_loss_and_metrics(
     inputs = batch["inputs"]
     targets = batch["labels"]
     given_mask = batch["given_mask"]
-    loss_mask = supervised_loss_mask(model, given_mask, targets)
+    example_mask = _example_mask(batch, targets)
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, given_mask, targets), example_mask)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
