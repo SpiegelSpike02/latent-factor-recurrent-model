@@ -23,8 +23,10 @@ def maybe_cast(x: Array, dtype: jnp.dtype) -> Array:
     return x if x.dtype == dtype else x.astype(dtype)
 
 
-def gather_embedding_rows(weights: Array, identifiers: Array) -> Array:
+def gather_embedding_rows(weights: Array, identifiers: Array, *, out_sharding=None) -> Array:
     identifiers = identifiers.astype(jnp.int32)
+    if out_sharding is not None:
+        return weights.at[identifiers].get(out_sharding=out_sharding)
     mesh = get_abstract_mesh()
     if "data" not in mesh.axis_names:
         return weights.at[identifiers].get()

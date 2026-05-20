@@ -41,7 +41,8 @@ def update_sparse_puzzle_embeddings(
     if not coalesce_updates:
         # This path is only safe for small embedding tables. Large ARC puzzle
         # tables can make SPMD scatter choose very large temporary buffers.
-        old_rows = gather_embedding_rows(weights, ids)
+        row_sharding = P(None, None) if is_data_sharded else None
+        old_rows = gather_embedding_rows(weights, ids, out_sharding=row_sharding)
         new_rows = old_rows.astype(jnp.float32) * (1.0 - lr * weight_decay)
         new_rows = new_rows - lr * jnp.sign(grads)
         model.puzzle_embed.weights[...] = weights.at[ids].add(new_rows.astype(weights.dtype) - old_rows)
@@ -60,9 +61,12 @@ def update_sparse_puzzle_embeddings(
     counts = jnp.zeros((ids.shape[0],), dtype=jnp.int32).at[inverse].add(1)
     valid = counts > 0
 
-    old_rows = gather_embedding_rows(weights, unique_ids)
+    row_sharding = P(None, None) if is_data_sharded else None
+    old_rows = gather_embedding_rows(weights, unique_ids, out_sharding=row_sharding)
     new_rows = old_rows.astype(jnp.float32) * (1.0 - lr * weight_decay)
     new_rows = new_rows - lr * jnp.sign(grad_sums)
     row_delta = jnp.where(valid[:, None], new_rows.astype(weights.dtype) - old_rows, jnp.zeros_like(old_rows))
+    if is_data_sharded:
+        row_delta = jax.sharding.reshard(row_delta, P(None, None))
     model.puzzle_embed.weights[...] = weights.at[unique_ids].add(row_delta)
     return jnp.sum(valid).astype(jnp.float32)
