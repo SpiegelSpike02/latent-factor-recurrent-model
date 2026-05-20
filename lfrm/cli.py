@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from lfrm.jax_defaults import apply_jax_defaults
+
+apply_jax_defaults()
+
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
