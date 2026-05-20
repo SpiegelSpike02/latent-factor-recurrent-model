@@ -369,7 +369,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Compute and log per-step eval diagnostics such as hidden delta and per-step curves.",
     )
-    parser.add_argument("--profile-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--profile-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Capture one JAX profiler trace. Disabled by default for stable long runs.",
+    )
     parser.add_argument(
         "--profile-start-step",
         type=int,

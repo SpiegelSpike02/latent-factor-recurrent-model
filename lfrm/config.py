@@ -161,7 +161,7 @@ class RuntimeConfig:
     prefetch_depth: int = 4
     prefetch_workers: int = 2
     eval_diagnostics: bool = False
-    profile_enabled: bool = True
+    profile_enabled: bool = False
     profile_start_step: int = 1000
     profile_steps: int = 20
     profile_dir: str = "profile"
