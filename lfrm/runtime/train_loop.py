@@ -84,6 +84,16 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
             "runtime.train_dispatch_chunk is reserved for a future scanned train runner; "
             "set it to 1 for the current optimized path"
         )
+    if (
+        config.runtime.data_parallel_devices != 1
+        and config.optimizer.puzzle_embed_coalesce_updates
+        and config.optimizer.puzzle_embed_learning_rate > 0.0
+    ):
+        print(
+            "[runtime] sparse puzzle embedding coalesce is disabled under data parallel sharding "
+            "because jnp.unique/sort cannot run over the sharded data axis.",
+            flush=True,
+        )
     if config.runtime.profile_enabled:
         if config.runtime.profile_start_step <= 0:
             raise ValueError("profile_start_step must be positive when profiling is enabled")
