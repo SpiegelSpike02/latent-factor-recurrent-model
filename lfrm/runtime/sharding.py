@@ -62,8 +62,6 @@ def device_put_batch_sharded(batch: dict[str, np.ndarray], sharding: NamedShardi
             raise ValueError(
                 f"Leading batch dimension {value.shape[0]} must be divisible by data devices={len(devices)}"
             )
-        if jax.process_count() == 1:
-            return jax.make_array_from_process_local_data(sharding, value)
         index_map = sharding.devices_indices_map(value.shape)
         local_arrays = [
             jax.device_put(value[index_map[device]], device)
