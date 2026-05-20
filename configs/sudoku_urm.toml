@@ -44,7 +44,7 @@ flatten_optimizer = false
 
 [train]
 batch_size = 768
-eval_batch_size = 4096
+eval_batch_size = 8192
 epochs = 50000
 log_epochs = 10
 eval_epochs = 2000
@@ -59,6 +59,11 @@ decay = 0.999
 
 [runtime]
 compute_dtype = "bfloat16"
+data_parallel_devices = 0
+prefetch_depth = 4
+prefetch_workers = 2
+eval_diagnostics = false
+profile_enabled = false
 
 [wandb]
 enabled = true

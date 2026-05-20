@@ -56,10 +56,10 @@ class GridModelTests(unittest.TestCase):
             clear=True,
         ):
             apply_jax_defaults()
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
-            self.assertNotIn("XLA_PYTHON_CLIENT_MEM_FRACTION", os.environ)
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "true")
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.95")
             self.assertNotIn("XLA_PYTHON_CLIENT_ALLOCATOR", os.environ)
-            self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "cuda_malloc_async")
+            self.assertNotIn("TF_GPU_ALLOCATOR", os.environ)
             self.assertEqual(os.environ["NCCL_PROTO"], "SIMPLE,LL,LL128")
             self.assertIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
@@ -238,6 +238,39 @@ class GridModelTests(unittest.TestCase):
             float(dense_metrics["lm_loss"]),
             places=5,
         )
+
+    def test_trm_mlp_t_keeps_channel_mlp(self) -> None:
+        model = TinyRecursiveModel(
+            ModelConfig(
+                vocab_size=11,
+                model_type="trm",
+                seq_len=9,
+                grid_height=3,
+                grid_width=3,
+                d_model=12,
+                rollout_steps=1,
+                trm=TRMConfig(
+                    deep_recursion=1,
+                    latent_recursion=1,
+                    block_layers=1,
+                    num_heads=3,
+                    mlp_ratio=2,
+                    mlp_t=True,
+                    position_encoding="none",
+                    puzzle_embed_len=0,
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(210),
+        )
+        self.assertTrue(hasattr(model.blocks[0], "token_mlp"))
+        self.assertTrue(hasattr(model.blocks[0], "channel_mlp"))
+        logits, _ = model.forward_all_steps_with_diagnostics(
+            jnp.ones((1, 9), dtype=jnp.int32),
+            train=False,
+            collect_diagnostics=False,
+        )
+        self.assertEqual(logits.shape, (1, 1, 9, 11))
 
     def test_brc_forward_and_verifier_are_finite(self) -> None:
         model = BRCSudokuModel(

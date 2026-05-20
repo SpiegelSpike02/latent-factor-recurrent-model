@@ -115,8 +115,7 @@ class TRMBlock(nnx.Module):
             )
         if trm.local_mixing:
             self.local_mixing = LocalConvSwiGLU(config, prefix_len, dtype, rngs=rngs)
-        if not trm.mlp_t:
-            self.channel_mlp = SwiGLU(config.d_model, trm.mlp_ratio, dtype, rngs=rngs)
+        self.channel_mlp = SwiGLU(config.d_model, trm.mlp_ratio, dtype, rngs=rngs)
 
     def __call__(
         self,
@@ -128,7 +127,7 @@ class TRMBlock(nnx.Module):
         if self.trm.mlp_t:
             mixed = jnp.swapaxes(hidden_states, 1, 2)
             mixed = _rms_norm(mixed + self.token_mlp(mixed), self.trm.rms_norm_eps)
-            return jnp.swapaxes(mixed, 1, 2)
+            hidden_states = jnp.swapaxes(mixed, 1, 2)
         else:
             attention_out = self.attention(
                 hidden_states,

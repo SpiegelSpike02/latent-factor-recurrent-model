@@ -44,8 +44,8 @@ grad_clip_norm = 1.0
 flatten_optimizer = false
 
 [train]
-batch_size = 128
-eval_batch_size = 512
+batch_size = 768
+eval_batch_size = 2048
 epochs = 50000
 log_epochs = 10
 eval_epochs = 5000
@@ -60,6 +60,11 @@ decay = 0.999
 
 [runtime]
 compute_dtype = "bfloat16"
+data_parallel_devices = 0
+prefetch_depth = 2
+prefetch_workers = 1
+eval_diagnostics = false
+profile_enabled = false
 
 [wandb]
 enabled = true
