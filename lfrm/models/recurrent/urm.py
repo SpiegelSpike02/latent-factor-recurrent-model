@@ -121,12 +121,11 @@ class UnifiedReasoningModel(nnx.Module):
         self.puzzle_embed_len = max(0, int(urm.puzzle_embed_len))
         self.total_seq_len = config.seq_len + self.puzzle_embed_len
 
-        self.token_embed = nnx.Embed(
+        self.token_embed = CastedEmbedding(
             config.vocab_size,
             config.d_model,
-            dtype=self.dtype,
-            param_dtype=jnp.float32,
-            embedding_init=trunc_normal_init(1.0 / self.embed_scale),
+            self.dtype,
+            init_std=1.0 / self.embed_scale,
             rngs=rngs,
         )
         self.has_puzzle_embed = self.puzzle_embed_len > 0

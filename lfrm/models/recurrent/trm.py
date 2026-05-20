@@ -229,12 +229,11 @@ class TinyRecursiveModel(nnx.Module):
         self.position_ids = jnp.arange(self.total_seq_len, dtype=jnp.int32)
 
         embed_init = trunc_normal_init(1.0 / self.embed_scale)
-        self.token_embed = nnx.Embed(
+        self.token_embed = CastedEmbedding(
             config.vocab_size,
             config.d_model,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            embedding_init=embed_init,
+            dtype,
+            init_std=1.0 / self.embed_scale,
             rngs=rngs,
         )
         if self.puzzle_embed_ndim > 0:
