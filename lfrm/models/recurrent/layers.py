@@ -56,11 +56,18 @@ def dot_product_attention(
     """
     attention_bias = None if bias is None else bias[None, :, :, :].astype(jnp.float32)
     requested = os.environ.get("LFRM_ATTENTION_IMPLEMENTATION", "cudnn").strip().lower()
+    cudnn_supported = (
+        attention_bias is None
+        and jax.default_backend() == "gpu"
+        and query.dtype in (jnp.float16, jnp.bfloat16)
+        and key.dtype == query.dtype
+        and value.dtype == query.dtype
+    )
     implementation: str | None
     if requested in ("", "auto", "none"):
-        implementation = "cudnn" if attention_bias is None and jax.default_backend() == "gpu" else None
+        implementation = "cudnn" if cudnn_supported else None
     elif requested in ("cudnn", "xla"):
-        implementation = requested
+        implementation = requested if requested == "xla" or cudnn_supported else None
     else:
         raise ValueError(
             "LFRM_ATTENTION_IMPLEMENTATION must be one of auto, cudnn, or xla; "

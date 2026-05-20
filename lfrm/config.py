@@ -158,7 +158,7 @@ class RuntimeConfig:
     compute_dtype: str = "bfloat16"
     data_parallel_devices: int = 1
     profile_enabled: bool = True
-    profile_start_step: int = 20
+    profile_start_step: int = 1000
     profile_steps: int = 20
     profile_dir: str = "profile"
 

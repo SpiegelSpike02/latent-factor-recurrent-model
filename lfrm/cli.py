@@ -701,6 +701,8 @@ def sample_device_batch(
     batch["inputs"] = np.asarray(batch["inputs"], dtype=np.int32)
     batch["labels"] = np.asarray(batch["labels"], dtype=np.int32)
     batch["puzzle_identifiers"] = np.asarray(batch["puzzle_identifiers"], dtype=np.int32)
+    if _is_batch_sharded_device(device):
+        return _device_put_batch_sharded(batch, device)
     return jax.device_put(batch, device=device)
 
 
@@ -742,6 +744,30 @@ def place_tree(tree, sharding: NamedSharding | None):
     if sharding is None:
         return tree
     return jax.device_put(tree, sharding)
+
+
+def _is_batch_sharded_device(device: jax.Device | NamedSharding) -> bool:
+    return isinstance(device, NamedSharding) and device.spec == P("data")
+
+
+def _device_put_batch_sharded(batch: dict[str, np.ndarray], sharding: NamedSharding) -> dict[str, jax.Array]:
+    devices = tuple(sharding.mesh.devices.flat)
+    if not devices:
+        raise ValueError("Cannot shard a batch over an empty mesh")
+
+    def put_leaf(value: np.ndarray) -> jax.Array:
+        if value.shape[0] % len(devices) != 0:
+            raise ValueError(
+                f"Leading batch dimension {value.shape[0]} must be divisible by data devices={len(devices)}"
+            )
+        index_map = sharding.devices_indices_map(value.shape)
+        local_arrays = [
+            jax.device_put(value[index_map[device]], device)
+            for device in devices
+        ]
+        return jax.make_array_from_single_device_arrays(value.shape, sharding, local_arrays)
+
+    return jax.tree.map(put_leaf, batch)
 
 
 class BatchPrefetcher:
@@ -793,6 +819,8 @@ def eval_device_batch(
         }
         example_mask = np.pad(example_mask, (0, pad_width), constant_values=0.0)
     batch["example_mask"] = example_mask
+    if _is_batch_sharded_device(device):
+        return _device_put_batch_sharded(batch, device)
     return jax.device_put(batch, device=device)
 
 
@@ -1048,7 +1076,10 @@ def main() -> None:
             is_eval_step = step % eval_interval == 0 or step == config.train.optimizer_updates
             metrics = None
             for microbatch_index in range(config.train.gradient_accumulation_steps):
-                train_key, step_key = jax.random.split(train_key)
+                if use_trm_act:
+                    step_key = train_key
+                else:
+                    train_key, step_key = jax.random.split(train_key)
                 current_batch = current_batches[microbatch_index]
                 if use_trm_act:
                     assert train_carries is not None

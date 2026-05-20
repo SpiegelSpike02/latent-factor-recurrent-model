@@ -906,7 +906,7 @@ def _update_sparse_puzzle_embeddings(
     *,
     learning_rate: jax.Array,
     weight_decay: float,
-) -> None:
+) -> jax.Array:
     ids = puzzle_ids.reshape(-1).astype(jnp.int32)
     grads = puzzle_embedding_grads.reshape((ids.shape[0], puzzle_embedding_grads.shape[-1])).astype(jnp.float32)
     unique_ids, inverse = jnp.unique(
@@ -929,6 +929,7 @@ def _update_sparse_puzzle_embeddings(
     new_rows = new_rows - lr * jnp.sign(grad_sums)
     row_delta = jnp.where(valid[:, None], new_rows.astype(weights.dtype) - old_rows, jnp.zeros_like(old_rows))
     model.puzzle_embed.weights[...] = weights.at[unique_ids].add(row_delta)
+    return jnp.sum(valid).astype(jnp.float32)
 
 
 def trm_dense_unroll_loss_and_metrics(
@@ -1226,6 +1227,7 @@ def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
         dropout_key: jax.Array,
         optimizer_step: jax.Array,
     ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+        dropout_key = jax.random.fold_in(dropout_key, optimizer_step)
         puzzle_ids = _act_sparse_puzzle_ids(carry, batch)
         puzzle_embeddings = (
             _sparse_puzzle_embeddings(model, puzzle_ids)
@@ -1267,7 +1269,7 @@ def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
             model_grads = grads
         if use_sparse_puzzle_embed:
             optimizer.update(model, model_grads)
-            _update_sparse_puzzle_embeddings(
+            touched_rows = _update_sparse_puzzle_embeddings(
                 model,
                 puzzle_ids,
                 puzzle_embedding_grads,
@@ -1275,10 +1277,7 @@ def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
                 weight_decay=config.optimizer.puzzle_embed_weight_decay,
             )
             metrics["puzzle_embed_learning_rate"] = puzzle_lr_schedule(optimizer_step)
-            metrics["puzzle_embed_touched_rows"] = jnp.sum(
-                jnp.unique(puzzle_ids.reshape(-1), size=puzzle_ids.size, fill_value=0)
-                != 0
-            ).astype(jnp.float32)
+            metrics["puzzle_embed_touched_rows"] = touched_rows
         else:
             optimizer.update(model, model_grads)
         return metrics, new_carry
