@@ -50,11 +50,9 @@ grad_clip_norm = 1.0
 flatten_optimizer = false
 
 [train]
-batch_size = 768
-eval_batch_size = 8192
+microbatch_size = 768
 epochs = 50000
 log_epochs = 10
-eval_epochs = 5000
 trm_train_mode = "act"
 halt_loss_weight = 0.5
 seed = 0
@@ -64,12 +62,17 @@ checkpoint_dir = "checkpoints"
 enabled = true
 decay = 0.999
 
+[eval]
+batch_size = 8192
+epochs = 5000
+diagnostics = false
+full_dataset = true
+
 [runtime]
 compute_dtype = "bfloat16"
 data_parallel_devices = 0
 prefetch_depth = 4
 prefetch_workers = 2
-eval_diagnostics = false
 profile_enabled = false
 
 [wandb]

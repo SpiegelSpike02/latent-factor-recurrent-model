@@ -46,11 +46,10 @@ grad_clip_norm = 1.0
 flatten_optimizer = false
 
 [train]
-batch_size = 1680
-eval_batch_size = 1680
+microbatch_size = 768
+gradient_accumulation_steps = 1
 epochs = 200000
 log_epochs = 10
-eval_epochs = 2000
 trm_train_mode = "act"
 halt_loss_weight = 0.5
 seed = 0
@@ -59,6 +58,12 @@ checkpoint_dir = "checkpoints"
 [train.ema]
 enabled = true
 decay = 0.999
+
+[eval]
+batch_size = 768
+epochs = 2000
+diagnostics = false
+full_dataset = true
 
 [runtime]
 compute_dtype = "bfloat16"
@@ -69,5 +74,5 @@ prefetch_workers = 1
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "arc1-urm-official-rope-act-stablemax-muon-b1680"
+name = "arc1-urm-official-rope-act-stablemax-muon-b768"
 mode = "online"

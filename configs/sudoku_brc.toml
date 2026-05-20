@@ -59,11 +59,9 @@ grad_clip_norm = 1.0
 flatten_optimizer = true
 
 [train]
-batch_size = 768
-eval_batch_size = 8192
+microbatch_size = 768
 epochs = 23040
 log_epochs = 10
-eval_epochs = 1920
 seed = 0
 checkpoint_dir = "checkpoints"
 
@@ -71,12 +69,17 @@ checkpoint_dir = "checkpoints"
 enabled = true
 decay = 0.995
 
+[eval]
+batch_size = 8192
+epochs = 1920
+diagnostics = false
+full_dataset = true
+
 [runtime]
 compute_dtype = "bfloat16"
 data_parallel_devices = 0
 prefetch_depth = 4
 prefetch_workers = 2
-eval_diagnostics = false
 profile_enabled = false
 
 [wandb]

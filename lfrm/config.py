@@ -1,7 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class TaskConfig:
+    type: str = "sudoku"
+    supervision: str = "unknown_only"
+    clamp_given: bool = False
 
 
 @dataclass(frozen=True)
@@ -50,8 +57,6 @@ class BRCSudokuConfig:
     verifier_margin: float = 1.0
 
 
-
-
 @dataclass(frozen=True)
 class URMConfig:
     recurrent_steps: int = 16
@@ -68,11 +73,10 @@ class URMConfig:
     halt_exploration_prob: float = 0.1
     step_loss_weights: tuple[float, ...] | None = None
 
+
 @dataclass(frozen=True)
 class ModelConfig:
     vocab_size: int
-    task_type: str = "sudoku"
-    supervision: str = "unknown_only"
     model_type: str = "brc_sudoku"
     num_puzzle_identifiers: int = 1
     seq_len: int = 81
@@ -82,10 +86,22 @@ class ModelConfig:
     rollout_steps: int = 6
     dropout_rate: float = 0.0
     loss_type: str = "softmax"
-    clamp_given: bool = False
+    task: TaskConfig | None = None
     trm: TRMConfig | None = None
     brc: BRCSudokuConfig | None = None
     urm: URMConfig | None = None
+
+    @property
+    def task_type(self) -> str:
+        return (self.task or TaskConfig()).type
+
+    @property
+    def supervision(self) -> str:
+        return (self.task or TaskConfig()).supervision
+
+    @property
+    def clamp_given(self) -> bool:
+        return (self.task or TaskConfig()).clamp_given
 
     @property
     def trm_config(self) -> TRMConfig:
@@ -124,15 +140,12 @@ class EMAConfig:
 
 @dataclass(frozen=True)
 class TrainConfig:
-    batch_size: int = 16
-    eval_batch_size: int = 0
+    microbatch_size: int = 16
     gradient_accumulation_steps: int = 1
     epochs: int = 500
     optimizer_updates: int = 0
     log_epochs: int = 10
     log_interval_updates: int = 0
-    eval_epochs: int = 100
-    eval_interval_updates: int = 0
     trm_train_mode: str = "act"
     halt_loss_weight: float = 0.0
     terminal_residual_weight: float = 0.0
@@ -150,6 +163,15 @@ class TrainConfig:
 
 
 @dataclass(frozen=True)
+class EvalConfig:
+    batch_size: int = 0
+    epochs: int = 100
+    interval_updates: int = 0
+    diagnostics: bool = False
+    full_dataset: bool = True
+
+
+@dataclass(frozen=True)
 class DataConfig:
     dataset_path: str | None = None
 
@@ -160,7 +182,6 @@ class RuntimeConfig:
     data_parallel_devices: int = 1
     prefetch_depth: int = 4
     prefetch_workers: int = 2
-    eval_diagnostics: bool = False
     profile_enabled: bool = False
     profile_start_step: int = 1000
     profile_steps: int = 20
@@ -184,6 +205,8 @@ class ExperimentConfig:
     data: DataConfig
     runtime: RuntimeConfig
     wandb: WandbConfig
+    task: TaskConfig = field(default_factory=TaskConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
 
     @property
     def checkpoint_path(self) -> Path:

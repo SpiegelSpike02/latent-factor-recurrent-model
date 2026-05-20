@@ -12,18 +12,27 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from lfrm.cli import load_toml_config, resolve_resume_checkpoint, schedule_learning_rate, updates_from_epochs
+from lfrm.cli import load_toml_config
 from lfrm.config import (
     DataConfig,
+    EvalConfig,
     ExperimentConfig,
     BRCSudokuConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
+    TaskConfig,
     TRMConfig,
     TrainConfig,
     URMConfig,
     WandbConfig,
+)
+from lfrm.runtime import (
+    effective_train_batch_size,
+    resolve_resume_checkpoint,
+    schedule_learning_rate,
+    small_metric_items,
+    updates_from_epochs,
 )
 from lfrm.models import BRCSudokuModel, TinyRecursiveModel
 from lfrm.jax_defaults import apply_jax_defaults
@@ -57,10 +66,10 @@ class GridModelTests(unittest.TestCase):
             clear=True,
         ):
             apply_jax_defaults()
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "true")
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.95")
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
+            self.assertNotIn("XLA_PYTHON_CLIENT_MEM_FRACTION", os.environ)
             self.assertNotIn("XLA_PYTHON_CLIENT_ALLOCATOR", os.environ)
-            self.assertNotIn("TF_GPU_ALLOCATOR", os.environ)
+            self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "cuda_malloc_async")
             self.assertEqual(os.environ["NCCL_PROTO"], "SIMPLE,LL,LL128")
             self.assertNotIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
             self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
@@ -79,15 +88,35 @@ class GridModelTests(unittest.TestCase):
             clear=True,
         ):
             apply_jax_defaults()
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "true")
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"], "0.95")
-            self.assertNotIn("TF_GPU_ALLOCATOR", os.environ)
+            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
+            self.assertNotIn("XLA_PYTHON_CLIENT_MEM_FRACTION", os.environ)
+            self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "cuda_malloc_async")
 
     def test_updates_from_epochs_matches_official_floor_conversion(self) -> None:
         dataset = SimpleNamespace(
             spec=SimpleNamespace(total_groups=1000, mean_puzzle_examples=1.0)
         )
         self.assertEqual(updates_from_epochs(dataset, batch_size=768, epochs=5000), 6510)
+
+    def test_effective_batch_size_uses_microbatch_and_accumulation(self) -> None:
+        config = ExperimentConfig(
+            model=ModelConfig(vocab_size=11),
+            optimizer=OptimizerConfig(),
+            train=TrainConfig(microbatch_size=1024, gradient_accumulation_steps=2),
+            data=DataConfig(dataset_path="unused"),
+            runtime=RuntimeConfig(),
+            wandb=WandbConfig(),
+        )
+        self.assertEqual(effective_train_batch_size(config), 2048)
+
+    def test_small_metric_items_drops_large_leaves(self) -> None:
+        metrics = {
+            "loss": jnp.asarray(1.0),
+            "per_step_loss": jnp.ones((16,), dtype=jnp.float32),
+            "logits": jnp.ones((2, 81, 11), dtype=jnp.float32),
+        }
+        filtered = small_metric_items(metrics, max_elements=32)
+        self.assertEqual(set(filtered), {"loss", "per_step_loss"})
 
     def test_lr_schedule_matches_official_zero_based_warmup(self) -> None:
         schedule = scheduled_lr(
@@ -436,7 +465,7 @@ class GridModelTests(unittest.TestCase):
                 ),
             ),
             optimizer=OptimizerConfig(learning_rate=1e-4, lr_warmup_steps=1),
-            train=TrainConfig(batch_size=1, epochs=1, optimizer_updates=1),
+            train=TrainConfig(microbatch_size=1, epochs=1, optimizer_updates=1),
             data=DataConfig(),
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
@@ -614,7 +643,7 @@ class GridModelTests(unittest.TestCase):
                 puzzle_embed_weight_decay=1.0,
                 lr_warmup_steps=1,
             ),
-            train=TrainConfig(batch_size=2, epochs=2, optimizer_updates=2, halt_loss_weight=0.5),
+            train=TrainConfig(microbatch_size=2, epochs=2, optimizer_updates=2, halt_loss_weight=0.5),
             data=DataConfig(),
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
@@ -694,10 +723,9 @@ class GridModelTests(unittest.TestCase):
 
     def test_urm_muon_train_step_finite(self) -> None:
         config = ExperimentConfig(
+            task=TaskConfig(type="arc", supervision="full_grid"),
             model=ModelConfig(
                 vocab_size=12,
-                task_type="arc",
-                supervision="full_grid",
                 model_type="urm",
                 num_puzzle_identifiers=1,
                 seq_len=16,
@@ -724,7 +752,7 @@ class GridModelTests(unittest.TestCase):
                 beta2=0.95,
                 lr_warmup_steps=1,
             ),
-            train=TrainConfig(batch_size=2, epochs=2, optimizer_updates=2, halt_loss_weight=0.5),
+            train=TrainConfig(microbatch_size=2, epochs=2, optimizer_updates=2, halt_loss_weight=0.5),
             data=DataConfig(),
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
@@ -816,6 +844,15 @@ class GridModelTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unsupported \\[model\\] field"):
                 load_toml_config(str(config_path))
 
+            train_legacy_path = Path(tmpdir) / "legacy_train.toml"
+            train_legacy_path.write_text(
+                "[train]\n"
+                "batch_size = 8\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Unsupported \\[train\\] field"):
+                load_toml_config(str(train_legacy_path))
+
     def test_config_loader_accepts_brc_and_trm_step_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "brc.toml"
@@ -857,6 +894,21 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_fit_energy_weight"], 0.75)
             self.assertEqual(loaded["brc_denoise_initial_prob"], 0.4)
             self.assertEqual(loaded["brc_denoise_mode_weights"], [0.35, 0.20, 0.30, 0.15])
+
+            eval_config_path = Path(tmpdir) / "eval.toml"
+            eval_config_path.write_text(
+                "[eval]\n"
+                "batch_size = 32\n"
+                "epochs = 10\n"
+                "diagnostics = true\n"
+                "full_dataset = true\n",
+                encoding="utf-8",
+            )
+            eval_loaded = load_toml_config(str(eval_config_path))
+            self.assertEqual(eval_loaded["eval_batch_size"], 32)
+            self.assertEqual(eval_loaded["eval_epochs"], 10)
+            self.assertTrue(eval_loaded["eval_diagnostics"])
+            self.assertTrue(eval_loaded["eval_full_dataset"])
 
             trm_config_path = Path(tmpdir) / "trm.toml"
             trm_config_path.write_text(

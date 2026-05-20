@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from flax import nnx
 
 from lfrm.config import ExperimentConfig
@@ -11,21 +13,22 @@ GridReasoningModel = BRCSudokuModel | TinyRecursiveModel | UnifiedReasoningModel
 
 
 def create_model(config: ExperimentConfig) -> GridReasoningModel:
-    if config.model.model_type == "trm":
+    model_config = replace(config.model, task=config.task)
+    if model_config.model_type == "trm":
         return TinyRecursiveModel(
-            config.model,
+            model_config,
             config.runtime,
             rngs=nnx.Rngs(config.train.seed),
         )
-    if config.model.model_type == "brc_sudoku":
+    if model_config.model_type == "brc_sudoku":
         return BRCSudokuModel(
-            config.model,
+            model_config,
             config.runtime,
             rngs=nnx.Rngs(config.train.seed),
         )
-    if config.model.model_type == "urm":
+    if model_config.model_type == "urm":
         return UnifiedReasoningModel(
-            config.model,
+            model_config,
             config.runtime,
             rngs=nnx.Rngs(config.train.seed),
         )
