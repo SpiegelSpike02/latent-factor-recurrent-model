@@ -205,31 +205,16 @@ class UnifiedReasoningModel(nnx.Module):
         return hidden
 
     def _inner_update(self, hidden: Array, input_embeddings: Array, *, train: bool, dropout_key: Array) -> Array:
-        def latent_scan(h: Array) -> Array:
-            def latent_step(carry: Array, _unused) -> tuple[Array, None]:
-                return self._run_layers(carry, input_embeddings), None
-
-            h, _ = jax.lax.scan(
-                latent_step,
-                h,
-                xs=None,
-                length=self.urm.latent_recursion,
-            )
+        def latent_update(h: Array) -> Array:
+            for _ in range(self.urm.latent_recursion):
+                h = self._run_layers(h, input_embeddings)
             return h
 
         h = hidden
-        if self.urm.deep_recursion > 1:
-            def deep_step(carry: Array, _unused) -> tuple[Array, None]:
-                return jax.lax.stop_gradient(latent_scan(carry)), None
+        for _ in range(self.urm.deep_recursion - 1):
+            h = jax.lax.stop_gradient(latent_update(h))
 
-            h, _ = jax.lax.scan(
-                deep_step,
-                h,
-                xs=None,
-                length=self.urm.deep_recursion - 1,
-            )
-
-        h = latent_scan(h)
+        h = latent_update(h)
         h = self.dropout(h, deterministic=not train, rngs=dropout_key)
         return h
 

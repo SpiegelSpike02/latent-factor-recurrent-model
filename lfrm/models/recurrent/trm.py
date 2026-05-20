@@ -463,32 +463,17 @@ class TinyRecursiveModel(nnx.Module):
         return hidden_states
 
     def _deep_step(self, y_state: Array, z_state: Array, input_embeddings: Array) -> tuple[Array, Array]:
-        def latent_step(z: Array, _unused) -> tuple[Array, None]:
-            return self._recurrent_level(z, y_state + input_embeddings), None
-
-        z_state, _ = jax.lax.scan(
-            latent_step,
-            z_state,
-            xs=None,
-            length=self.trm.latent_recursion,
-        )
+        for _ in range(self.trm.latent_recursion):
+            z_state = self._recurrent_level(z_state, y_state + input_embeddings)
         return self._recurrent_level(y_state, z_state), z_state
 
     def _act_step(self, state: State, input_embeddings: Array) -> State:
         y_state = state["y"]
         z_state = state["z"]
-        if self.trm.deep_recursion > 1:
-            def deep_step(carry: tuple[Array, Array], _unused) -> tuple[tuple[Array, Array], None]:
-                y, z = carry
-                y, z = self._deep_step(y, z, input_embeddings)
-                return (jax.lax.stop_gradient(y), jax.lax.stop_gradient(z)), None
-
-            (y_state, z_state), _ = jax.lax.scan(
-                deep_step,
-                (y_state, z_state),
-                xs=None,
-                length=self.trm.deep_recursion - 1,
-            )
+        for _ in range(self.trm.deep_recursion - 1):
+            y_state, z_state = self._deep_step(y_state, z_state, input_embeddings)
+            y_state = jax.lax.stop_gradient(y_state)
+            z_state = jax.lax.stop_gradient(z_state)
         y_state, z_state = self._deep_step(y_state, z_state, input_embeddings)
         return {"y": y_state, "z": z_state}
 
