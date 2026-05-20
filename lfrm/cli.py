@@ -864,6 +864,27 @@ def eval_device_batch(
     return jax.device_put(batch, device=device)
 
 
+def small_metric_items(metrics: dict[str, Any], *, max_elements: int = 4096) -> dict[str, Any]:
+    """Keep only scalar or short-vector metrics before host transfer.
+
+    JAX reports asynchronous device errors at synchronization points such as
+    device_get. Filtering here makes logging robust against accidentally adding
+    logits, hidden states, or other large tensors to a metrics dict.
+    """
+    small: dict[str, Any] = {}
+    skipped: list[str] = []
+    for key, value in metrics.items():
+        shape = getattr(value, "shape", ())
+        size = int(np.prod(shape)) if shape else 1
+        if size <= max_elements:
+            small[key] = value
+        else:
+            skipped.append(f"{key}{tuple(shape)}")
+    if skipped:
+        print("[metrics] skipped large metric leaves:", ", ".join(skipped), flush=True)
+    return small
+
+
 def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[str, Any]:
     mesh = data_parallel_mesh(config)
     sharded_device = batch_sharding(mesh)
@@ -918,7 +939,7 @@ def evaluate(eval_step_fn, model, dataset, *, config: ExperimentConfig) -> dict[
             future = eval_futures.pop(0)
             weight_int, batch = future.result()
             submit_eval_batch()
-            metrics = jax.device_get(eval_step_fn(model, batch))
+            metrics = jax.device_get(small_metric_items(eval_step_fn(model, batch)))
             weight = float(weight_int)
             if reduced is None:
                 reduced = {
@@ -1194,7 +1215,7 @@ def main() -> None:
                 ema_update_fn(ema_model, model)
 
             if step % config.train.log_interval_updates == 0 or step == 1:
-                host_metrics = jax.device_get(metrics)
+                host_metrics = jax.device_get(small_metric_items(metrics))
                 train_log = {
                     "train/loss": float(host_metrics["loss"]),
                     "train/learning_rate": schedule_learning_rate(config, step),
