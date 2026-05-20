@@ -15,11 +15,15 @@ dropout_rate = 0.05
 
 [model.brc]
 recurrent_steps = 24
+deep_recursion = 1
+latent_recursion = 1
 block_layers = 1
 latent_dim = 512
 num_heads = 8
 mlp_ratio = 4
-position_encoding = "rel2d"
+position_encoding = "rope"
+rms_norm_eps = 1e-5
+rope_theta = 10000.0
 # Relative CE weights for recurrent steps 1..24. The training code normalizes
 # this vector, so the values control schedule shape rather than total scale.
 step_loss_weights = [
@@ -85,5 +89,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-belief-rel2d-trmcap-b768"
+name = "sudoku-brc-belief-rope-dualrec-b768"
 mode = "online"

@@ -351,7 +351,8 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(diagnostics["draft"].shape, (1, 81))
         self.assertEqual(diagnostics["belief_logits"].shape, (1, 81, 9))
         self.assertEqual(final_only_diagnostics["belief_logits"].shape, (1, 81, 9))
-        self.assertEqual(model.relation_masks.shape, (4, 81, 81))
+        self.assertIn("brc_z_delta_norm", diagnostics)
+        self.assertTrue(bool(jnp.isfinite(diagnostics["brc_z_delta_norm"])))
         predictions = jnp.argmax(logits[-1], axis=-1)
         given_mask = tokens != 1
         self.assertTrue(bool(jnp.all(predictions[given_mask] == tokens[given_mask])))
@@ -446,6 +447,7 @@ class GridModelTests(unittest.TestCase):
             "belief_init_teacher_rate",
             "belief_init_corrupt_rate",
             "belief_init_soft_rate",
+            "brc_z_delta_norm",
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
@@ -530,7 +532,7 @@ class GridModelTests(unittest.TestCase):
         self.assertGreater(float(jnp.std(blank_digit_logits)), 1e-6)
         self.assertIn("halt_logits", diagnostics)
 
-    def test_trm_rel2d_position_bias_forward_is_finite(self) -> None:
+    def test_trm_rope_position_forward_is_finite(self) -> None:
         model = TinyRecursiveModel(
             ModelConfig(
                 vocab_size=11,
@@ -547,7 +549,7 @@ class GridModelTests(unittest.TestCase):
                     num_heads=3,
                     mlp_ratio=2,
                     puzzle_embed_len=0,
-                    position_encoding="rel2d",
+                    position_encoding="rope",
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -559,11 +561,9 @@ class GridModelTests(unittest.TestCase):
             puzzle_identifiers=jnp.asarray([0], dtype=jnp.int32),
             train=False,
         )
-        attention_bias = model._attention_bias()
         self.assertEqual(logits.shape, (2, 1, 9, 11))
-        self.assertEqual(model.rel2d_row_bias[...].shape, (3, 5))
-        self.assertEqual(model.rel2d_col_bias[...].shape, (3, 5))
-        self.assertEqual(attention_bias.shape, (3, 9, 9))
+        self.assertEqual(model.rope_cos.shape, (9, 4))
+        self.assertEqual(model.rope_sin.shape, (9, 4))
         self.assertTrue(bool(jnp.all(jnp.isfinite(logits))))
         self.assertIn("halt_logits", diagnostics)
 
@@ -584,7 +584,7 @@ class GridModelTests(unittest.TestCase):
                     num_heads=3,
                     mlp_ratio=2,
                     puzzle_embed_len=0,
-                    position_encoding="rel2d",
+                    position_encoding="rope",
                     local_mixing=True,
                     local_mixing_kernel=3,
                 ),

@@ -338,7 +338,7 @@ def _brc_compact_training_rollout(
     mid_index = jnp.asarray(model.recurrent_steps // 2, dtype=jnp.int32)
 
     def scan_step(carry, scan_inputs):
-        h_prev, belief_logits, early_candidate, mid_candidate = carry
+        h_prev, z_prev, belief_logits, early_candidate, mid_candidate = carry
         step_index, step_dropout_key, time_embedding = scan_inputs
         cell_input = model._cell_embeddings(
             inputs,
@@ -348,7 +348,7 @@ def _brc_compact_training_rollout(
             train=True,
             dropout_key=step_dropout_key,
         )
-        h_next, block_diagnostics = model._solver_update(h_prev, cell_input, z)
+        h_next, z_next, block_diagnostics = model.solver_latent_step(h_prev, cell_input, z_prev)
         raw_logits = model.lm_head(h_next.astype(model.dtype))
         next_belief = model._belief_update(inputs, belief_logits, raw_logits, step_index)
         logits = model._belief_to_token_logits(next_belief, inputs, step_index)
@@ -363,24 +363,25 @@ def _brc_compact_training_rollout(
         belief_probs = jax.nn.softmax(next_belief, axis=-1)
         confidence = jnp.max(belief_probs, axis=-1)
         filled_ratio = jnp.sum(confidence * unknown) / unknown_normalizer
-        return (h_next, next_belief, early_candidate, mid_candidate), (
+        return (h_next, z_next, next_belief, early_candidate, mid_candidate), (
             per_step_loss,
             hidden_delta,
             filled_ratio,
             block_diagnostics["brc_gate_mean"],
             block_diagnostics["brc_gate_std"],
+            block_diagnostics["brc_z_delta_norm"],
         )
 
     step_indices = jnp.arange(model.recurrent_steps, dtype=jnp.int32)
     step_dropout_keys = jax.random.split(dropout_key, model.recurrent_steps)
     time_embeddings = model.time_embed(step_indices)
-    initial_carry = (h, initial_belief.astype(jnp.float32), candidate_init, candidate_init)
-    (h_final, belief_final, early_candidate, mid_candidate), scan_outputs = jax.lax.scan(
+    initial_carry = (h, z, initial_belief.astype(jnp.float32), candidate_init, candidate_init)
+    (h_final, z_final, belief_final, early_candidate, mid_candidate), scan_outputs = jax.lax.scan(
         scan_step,
         initial_carry,
         (step_indices, step_dropout_keys, time_embeddings),
     )
-    per_step_loss, hidden_delta, filled_ratio, gate_mean, gate_std = scan_outputs
+    per_step_loss, hidden_delta, filled_ratio, gate_mean, gate_std, z_delta_norm = scan_outputs
     final_step = jnp.asarray(model.recurrent_steps - 1, dtype=jnp.int32)
     final_logits = model._belief_to_token_logits(belief_final, inputs, final_step)
     final_candidate = jnp.argmax(final_logits, axis=-1).astype(jnp.int32)
@@ -389,8 +390,9 @@ def _brc_compact_training_rollout(
         "diffusion_filled_ratio": filled_ratio,
         "brc_gate_mean": jnp.mean(gate_mean),
         "brc_gate_std": jnp.mean(gate_std),
+        "brc_z_delta_norm": jnp.mean(z_delta_norm),
         "unroll_steps": jnp.asarray(model.recurrent_steps, dtype=jnp.float32),
-        "z": z,
+        "z": z_final,
         "h": h_final,
         "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
         "belief_logits": belief_final,
@@ -603,6 +605,7 @@ def brc_loss_and_metrics(
         "diffusion_filled_ratio": diagnostics["diffusion_filled_ratio"],
         "brc_gate_mean": diagnostics["brc_gate_mean"],
         "brc_gate_std": diagnostics["brc_gate_std"],
+        "brc_z_delta_norm": diagnostics["brc_z_delta_norm"],
         "true_energy": true_energy,
         "fake_energy": fake_energy,
     }

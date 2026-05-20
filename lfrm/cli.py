@@ -117,11 +117,15 @@ ALLOWED_NESTED_KEYS = {
     },
     "brc": {
         "recurrent_steps",
+        "deep_recursion",
+        "latent_recursion",
         "block_layers",
         "latent_dim",
         "num_heads",
         "mlp_ratio",
         "position_encoding",
+        "rms_norm_eps",
+        "rope_theta",
         "step_loss_weights",
         "latent_fit_steps",
         "latent_lr",
@@ -266,7 +270,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-local-mixing-kernel", type=int, default=3)
     parser.add_argument("--trm-puzzle-embed-ndim", type=int, default=0)
     parser.add_argument("--trm-puzzle-embed-len", type=int, default=16)
-    parser.add_argument("--trm-position-encoding", choices=("none", "learned", "rope", "grid", "rel2d"), default="none")
+    parser.add_argument("--trm-position-encoding", choices=("none", "learned", "rope", "grid"), default="none")
     parser.add_argument("--trm-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--trm-rope-theta", type=float, default=10000.0)
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
@@ -274,10 +278,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-latent-dim", type=int, default=128)
     parser.add_argument("--brc-recurrent-steps", type=int, default=6)
+    parser.add_argument("--brc-deep-recursion", type=int, default=1)
+    parser.add_argument("--brc-latent-recursion", type=int, default=1)
     parser.add_argument("--brc-block-layers", type=int, default=1)
     parser.add_argument("--brc-num-heads", type=int, default=4)
     parser.add_argument("--brc-mlp-ratio", type=int, default=2)
-    parser.add_argument("--brc-position-encoding", choices=("learned", "rel2d", "none"), default="learned")
+    parser.add_argument("--brc-position-encoding", choices=("rope", "learned", "none"), default="rope")
+    parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
+    parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
     parser.add_argument("--brc-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-latent-fit-steps", type=int, default=4)
     parser.add_argument("--brc-latent-lr", type=float, default=0.1)
@@ -430,11 +438,15 @@ def build_config(
         ),
         brc=BRCSudokuConfig(
             recurrent_steps=args.brc_recurrent_steps,
+            deep_recursion=args.brc_deep_recursion,
+            latent_recursion=args.brc_latent_recursion,
             block_layers=args.brc_block_layers,
             latent_dim=args.brc_latent_dim,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,
             position_encoding=args.brc_position_encoding,
+            rms_norm_eps=args.brc_rms_norm_eps,
+            rope_theta=args.brc_rope_theta,
             step_loss_weights=tuple(args.brc_step_loss_weights) if args.brc_step_loss_weights is not None else None,
             latent_fit_steps=args.brc_latent_fit_steps,
             latent_lr=args.brc_latent_lr,

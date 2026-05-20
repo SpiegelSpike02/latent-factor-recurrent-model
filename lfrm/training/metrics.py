@@ -99,6 +99,7 @@ CORE_SCALAR_METRICS = (
     "diffusion_filled_ratio",
     "brc_gate_mean",
     "brc_gate_std",
+    "brc_z_delta_norm",
     "true_energy",
     "fake_energy",
     "belief_init_noise_rate",
@@ -210,6 +211,7 @@ BRC_CONSOLE_GROUPS = (
         (
             "diffusion_filled_ratio",
             "brc_gate_mean",
+            "brc_z_delta_norm",
             "belief_init_noise_rate",
             "belief_init_uniform_rate",
             "belief_init_teacher_rate",

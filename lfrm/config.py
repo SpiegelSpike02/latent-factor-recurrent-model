@@ -34,11 +34,15 @@ class TRMConfig:
 @dataclass(frozen=True)
 class BRCSudokuConfig:
     recurrent_steps: int = 6
+    deep_recursion: int = 1
+    latent_recursion: int = 1
     block_layers: int = 1
     latent_dim: int = 128
     num_heads: int = 4
     mlp_ratio: int = 2
-    position_encoding: str = "learned"
+    position_encoding: str = "rope"
+    rms_norm_eps: float = 1e-5
+    rope_theta: float = 10000.0
     step_loss_weights: tuple[float, ...] | None = None
     latent_fit_steps: int = 4
     latent_lr: float = 0.1

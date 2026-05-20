@@ -192,8 +192,8 @@ class TinyRecursiveModel(nnx.Module):
             raise ValueError("TRM puzzle_embed_len must be non-negative")
         if config.num_puzzle_identifiers < 1:
             raise ValueError("TRM num_puzzle_identifiers must be at least 1")
-        if trm.position_encoding not in ("none", "learned", "rope", "grid", "rel2d"):
-            raise ValueError("TRM position_encoding must be one of: none, learned, rope, grid, rel2d")
+        if trm.position_encoding not in ("none", "learned", "rope", "grid"):
+            raise ValueError("TRM position_encoding must be one of: none, learned, rope, grid")
         if trm.position_encoding == "rope" and config.d_model % trm.num_heads != 0:
             raise ValueError("TRM d_model must be divisible by trm.num_heads for RoPE")
         if trm.position_encoding == "rope" and (config.d_model // trm.num_heads) % 2 != 0:
@@ -285,24 +285,6 @@ class TinyRecursiveModel(nnx.Module):
                 embedding_init=embed_init,
                 rngs=rngs,
             )
-        if trm.position_encoding == "rel2d":
-            rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
-            cols = jnp.arange(config.seq_len, dtype=jnp.int32) % config.grid_width
-            rel_rows = rows[:, None] - rows[None, :] + config.grid_height - 1
-            rel_cols = cols[:, None] - cols[None, :] + config.grid_width - 1
-            self.rel2d_row_bias = nnx.Param(
-                jnp.zeros((trm.num_heads, 2 * config.grid_height - 1), dtype=jnp.float32)
-            )
-            self.rel2d_col_bias = nnx.Param(
-                jnp.zeros((trm.num_heads, 2 * config.grid_width - 1), dtype=jnp.float32)
-            )
-            if self.prefix_len > 0:
-                padded_rows = jnp.full((self.total_seq_len, self.total_seq_len), -1, dtype=jnp.int32)
-                padded_cols = jnp.full((self.total_seq_len, self.total_seq_len), -1, dtype=jnp.int32)
-                rel_rows = padded_rows.at[self.prefix_len :, self.prefix_len :].set(rel_rows)
-                rel_cols = padded_cols.at[self.prefix_len :, self.prefix_len :].set(rel_cols)
-            self.rel2d_row_indices = nnx.data(rel_rows)
-            self.rel2d_col_indices = nnx.data(rel_cols)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
         self.blocks = nnx.List(
             [
@@ -341,18 +323,6 @@ class TinyRecursiveModel(nnx.Module):
         else:
             self.rope_cos = None
             self.rope_sin = None
-
-    def _attention_bias(self) -> Array | None:
-        if self.trm.position_encoding != "rel2d":
-            return None
-        row_valid = self.rel2d_row_indices >= 0
-        col_valid = self.rel2d_col_indices >= 0
-        row_indices = jnp.maximum(self.rel2d_row_indices, 0)
-        col_indices = jnp.maximum(self.rel2d_col_indices, 0)
-        row_bias = jnp.take(self.rel2d_row_bias[...], row_indices, axis=1)
-        col_bias = jnp.take(self.rel2d_col_bias[...], col_indices, axis=1)
-        rel2d_bias = row_bias + col_bias
-        return jnp.where((row_valid & col_valid)[None, :, :], rel2d_bias, 0.0)
 
     @staticmethod
     def _box_shape(grid_height: int, grid_width: int) -> tuple[int, int]:
@@ -452,13 +422,12 @@ class TinyRecursiveModel(nnx.Module):
 
     def _recurrent_level(self, hidden_states: Array, input_injection: Array) -> Array:
         hidden_states = hidden_states + input_injection
-        attention_bias = self._attention_bias()
         for block in self.blocks:
             hidden_states = block(
                 maybe_cast(hidden_states, self.dtype),
                 self.rope_cos,
                 self.rope_sin,
-                attention_bias,
+                None,
             )
         return hidden_states
 

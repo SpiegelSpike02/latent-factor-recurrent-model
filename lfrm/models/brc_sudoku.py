@@ -8,123 +8,20 @@ from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
 from .common import Array, casted_linear_init, compute_dtype, maybe_cast, trunc_normal, trunc_normal_init
-from .recurrent.layers import rms_norm as _shared_rms_norm
+from .recurrent.layers import FullAttention, rms_norm as _shared_rms_norm
 
 
 def _rms_norm(x: Array, eps: float = 1e-5) -> Array:
     return _shared_rms_norm(x, eps)
 
 
-class RelationTypedAttention(nnx.Module):
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int,
-        num_relations: int,
-        grid_height: int,
-        grid_width: int,
-        position_encoding: str,
-        dtype: jnp.dtype,
-        *,
-        rngs: nnx.Rngs,
-    ) -> None:
-        if d_model % num_heads != 0:
-            raise ValueError("BRC-Sudoku d_model must be divisible by num_heads")
-        if position_encoding not in ("learned", "rel2d", "none"):
-            raise ValueError("BRC-Sudoku position_encoding must be 'learned', 'rel2d', or 'none'")
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.num_relations = num_relations
-        self.head_dim = d_model // num_heads
-        self.position_encoding = position_encoding
-        self.dtype = dtype
-        if position_encoding == "rel2d":
-            seq_len = grid_height * grid_width
-            rows = jnp.arange(seq_len, dtype=jnp.int32) // grid_width
-            cols = jnp.arange(seq_len, dtype=jnp.int32) % grid_width
-            rel_row = rows[None, :] - rows[:, None] + (grid_height - 1)
-            rel_col = cols[None, :] - cols[:, None] + (grid_width - 1)
-            rel2d_indices = rel_row * (2 * grid_width - 1) + rel_col
-            self.rel2d_indices = nnx.data(rel2d_indices.astype(jnp.int32))
-            self.rel2d_bias = nnx.Embed(
-                (2 * grid_height - 1) * (2 * grid_width - 1),
-                num_heads,
-                dtype=dtype,
-                param_dtype=jnp.float32,
-                embedding_init=nnx.initializers.zeros,
-                rngs=rngs,
-            )
-        self.qkv = nnx.Linear(
-            d_model,
-            3 * d_model,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.relation_embed = nnx.Embed(
-            num_relations,
-            d_model,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            embedding_init=trunc_normal_init(1.0 / math.sqrt(d_model)),
-            rngs=rngs,
-        )
-        self.relation_bias = nnx.Param(jnp.zeros((num_relations, num_heads), dtype=jnp.float32))
-        self.combine = nnx.Linear(
-            num_relations * d_model,
-            d_model,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.out = nnx.Linear(
-            d_model,
-            d_model,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-
-    def __call__(self, h: Array, relation_masks: Array) -> Array:
-        batch_size, seq_len, d_model = h.shape
-        qkv = self.qkv(maybe_cast(h, self.dtype))
-        q, k, v = jnp.split(qkv, 3, axis=-1)
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        q = jnp.swapaxes(q, 1, 2)
-        k = jnp.swapaxes(k, 1, 2)
-        v = jnp.swapaxes(v, 1, 2)
-        scores = jnp.einsum("bhnd,bhmd->bhnm", q, k, preferred_element_type=jnp.float32)
-        scores = scores / math.sqrt(self.head_dim)
-        if self.position_encoding == "rel2d":
-            rel2d_bias = self.rel2d_bias(self.rel2d_indices).astype(jnp.float32)
-            scores = scores + jnp.moveaxis(rel2d_bias, -1, 0)[None, :, :, :]
-        relation_scores = scores[:, None, :, :, :] + self.relation_bias[...][None, :, :, None, None]
-        relation_scores = jnp.where(relation_masks[None, :, None, :, :], relation_scores, -1.0e9)
-        weights = jax.nn.softmax(relation_scores.astype(jnp.float32), axis=-1).astype(h.dtype)
-        attended = jnp.einsum("brhnm,bhmd->brhnd", weights, v, preferred_element_type=jnp.float32)
-        attended = jnp.swapaxes(attended, 2, 3).reshape(batch_size, self.num_relations, seq_len, d_model)
-        relation_ids = jnp.arange(self.num_relations, dtype=jnp.int32)
-        attended = attended + self.relation_embed(relation_ids)[None, :, None, :]
-        attended = jnp.swapaxes(attended, 1, 2).reshape(batch_size, seq_len, self.num_relations * d_model)
-        return self.out(self.combine(attended))
-
-
-class RelationTypedSolverBlock(nnx.Module):
+class BRCSolverBlock(nnx.Module):
     def __init__(
         self,
         config: ModelConfig,
         num_heads: int,
         mlp_ratio: int,
         latent_dim: int,
-        num_relations: int,
         dtype: jnp.dtype,
         *,
         rngs: nnx.Rngs,
@@ -133,18 +30,15 @@ class RelationTypedSolverBlock(nnx.Module):
         self.dtype = dtype
         d_model = config.d_model
         hidden_dim = max(d_model, mlp_ratio * d_model)
-        self.relation_attention = RelationTypedAttention(
+        self.attention = FullAttention(
             d_model,
             num_heads,
-            num_relations,
-            config.grid_height,
-            config.grid_width,
-            config.brc_config.position_encoding,
             dtype,
+            name="BRC",
             rngs=rngs,
         )
         self.msg_in = nnx.Linear(
-            2 * d_model,
+            d_model,
             hidden_dim,
             dtype=dtype,
             param_dtype=jnp.float32,
@@ -169,30 +63,36 @@ class RelationTypedSolverBlock(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, h: Array, cell_input: Array, z: Array, relation_masks: Array) -> tuple[Array, dict[str, Array]]:
+    def __call__(
+        self,
+        h: Array,
+        cell_input: Array,
+        z: Array,
+        rope_cos: Array | None,
+        rope_sin: Array | None,
+    ) -> tuple[Array, dict[str, Array]]:
         h = h + cell_input
-        relation_msg = self.relation_attention(h, relation_masks)
-        msg = jnp.concatenate([h, relation_msg], axis=-1)
-        msg = self.msg_out(jax.nn.silu(self.msg_in(maybe_cast(msg, self.dtype)))).astype(jnp.float32)
+        attn = self.attention(h, rope_cos=rope_cos, rope_sin=rope_sin)
+        h = _rms_norm(h.astype(jnp.float32) + attn.astype(jnp.float32), self.config.brc_config.rms_norm_eps).astype(self.dtype)
+        msg = self.msg_out(jax.nn.silu(self.msg_in(maybe_cast(h, self.dtype)))).astype(jnp.float32)
         scale, shift, gate = jnp.split(self.film(maybe_cast(z, self.dtype)).astype(jnp.float32), 3, axis=-1)
         scale = 1.0 + 0.1 * jnp.tanh(scale)[:, None, :]
         shift = shift[:, None, :]
         gate = jax.nn.sigmoid(gate)[:, None, :]
         msg = scale * msg + shift
-        h_next = _rms_norm(h.astype(jnp.float32) + gate * msg).astype(self.dtype)
+        h_next = _rms_norm(h.astype(jnp.float32) + gate * msg, self.config.brc_config.rms_norm_eps).astype(self.dtype)
         return h_next, {
             "brc_gate_mean": jnp.mean(gate),
             "brc_gate_std": jnp.std(gate),
         }
 
 
-class RelationTypedVerifierBlock(nnx.Module):
+class BRCVerifierBlock(nnx.Module):
     def __init__(
         self,
         config: ModelConfig,
         num_heads: int,
         mlp_ratio: int,
-        num_relations: int,
         dtype: jnp.dtype,
         *,
         rngs: nnx.Rngs,
@@ -201,18 +101,15 @@ class RelationTypedVerifierBlock(nnx.Module):
         self.dtype = dtype
         d_model = config.d_model
         hidden_dim = max(d_model, mlp_ratio * d_model)
-        self.relation_attention = RelationTypedAttention(
+        self.attention = FullAttention(
             d_model,
             num_heads,
-            num_relations,
-            config.grid_height,
-            config.grid_width,
-            config.brc_config.position_encoding,
             dtype,
+            name="BRC verifier",
             rngs=rngs,
         )
         self.msg_in = nnx.Linear(
-            2 * d_model,
+            d_model,
             hidden_dim,
             dtype=dtype,
             param_dtype=jnp.float32,
@@ -228,11 +125,11 @@ class RelationTypedVerifierBlock(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, h: Array, relation_masks: Array) -> Array:
-        relation_msg = self.relation_attention(h, relation_masks)
-        msg = jnp.concatenate([h, relation_msg], axis=-1)
-        msg = self.msg_out(jax.nn.silu(self.msg_in(maybe_cast(msg, self.dtype)))).astype(jnp.float32)
-        return _rms_norm(h.astype(jnp.float32) + msg).astype(self.dtype)
+    def __call__(self, h: Array, rope_cos: Array | None, rope_sin: Array | None) -> Array:
+        attn = self.attention(h, rope_cos=rope_cos, rope_sin=rope_sin)
+        h = _rms_norm(h.astype(jnp.float32) + attn.astype(jnp.float32), self.config.brc_config.rms_norm_eps).astype(self.dtype)
+        msg = self.msg_out(jax.nn.silu(self.msg_in(maybe_cast(h, self.dtype)))).astype(jnp.float32)
+        return _rms_norm(h.astype(jnp.float32) + msg, self.config.brc_config.rms_norm_eps).astype(self.dtype)
 
 
 class BRCSudokuModel(nnx.Module):
@@ -259,6 +156,8 @@ class BRCSudokuModel(nnx.Module):
         brc = config.brc_config
         if brc.recurrent_steps < 1:
             raise ValueError("BRC recurrent_steps must be at least 1")
+        if min(brc.deep_recursion, brc.latent_recursion) < 1:
+            raise ValueError("BRC deep_recursion and latent_recursion must be at least 1")
         if brc.block_layers < 1:
             raise ValueError("BRC block_layers must be at least 1")
         if brc.latent_dim < 1:
@@ -269,8 +168,10 @@ class BRCSudokuModel(nnx.Module):
             raise ValueError("BRC d_model must be divisible by num_heads")
         if brc.mlp_ratio < 1:
             raise ValueError("BRC mlp_ratio must be at least 1")
-        if brc.position_encoding not in ("learned", "rel2d", "none"):
-            raise ValueError("BRC position_encoding must be 'learned', 'rel2d', or 'none'")
+        if brc.position_encoding not in ("rope", "learned", "none"):
+            raise ValueError("BRC position_encoding must be 'rope', 'learned', or 'none'")
+        if brc.position_encoding == "rope" and (config.d_model // brc.num_heads) % 2 != 0:
+            raise ValueError("BRC RoPE head dimension must be even")
         if brc.step_loss_weights is not None:
             if len(brc.step_loss_weights) != brc.recurrent_steps:
                 raise ValueError("BRC step_loss_weights length must equal recurrent_steps")
@@ -309,9 +210,6 @@ class BRCSudokuModel(nnx.Module):
         self.col_ids = nnx.data(cols)
         self.box_ids = nnx.data(boxes)
         self.box_indices = nnx.data(box_indices)
-        relation_masks = self._build_sudoku_relation_masks(rows, cols, boxes)
-        self.relation_masks = nnx.data(relation_masks)
-        self.num_relations = int(relation_masks.shape[0])
         self.num_boxes = int(box_indices.shape[0])
 
         embed_init = trunc_normal_init(1.0 / self.embed_scale)
@@ -331,6 +229,17 @@ class BRCSudokuModel(nnx.Module):
             self.box_embed = nnx.Embed(self.num_boxes, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.time_embed = nnx.Embed(self.recurrent_steps, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
+        if brc.position_encoding == "rope":
+            head_dim = config.d_model // brc.num_heads
+            inv_freq = 1.0 / (brc.rope_theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+            positions = jnp.arange(config.seq_len, dtype=jnp.float32)
+            freqs = positions[:, None] * inv_freq[None, :]
+            rope = jnp.concatenate((freqs, freqs), axis=-1)
+            self.rope_cos = nnx.data(jnp.cos(rope))
+            self.rope_sin = nnx.data(jnp.sin(rope))
+        else:
+            self.rope_cos = None
+            self.rope_sin = None
 
         self.latent_pool = nnx.Linear(
             config.d_model,
@@ -357,6 +266,23 @@ class BRCSudokuModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
+        self.latent_update_in = nnx.Linear(
+            config.d_model + brc.latent_dim,
+            config.d_model,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.latent_update_out = nnx.Linear(
+            config.d_model,
+            brc.latent_dim,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=nnx.initializers.zeros,
+            bias_init=nnx.initializers.zeros,
+            rngs=rngs,
+        )
         self.state_init_to_hidden = nnx.Linear(
             config.d_model,
             config.d_model,
@@ -368,12 +294,11 @@ class BRCSudokuModel(nnx.Module):
         self.h0 = nnx.Param(trunc_normal(rngs.params(), (config.d_model,), 1.0 / math.sqrt(config.d_model)))
         self.solver_blocks = nnx.List(
             [
-                RelationTypedSolverBlock(
+                BRCSolverBlock(
                     config,
                     brc.num_heads,
                     brc.mlp_ratio,
                     brc.latent_dim,
-                    self.num_relations,
                     self.dtype,
                     rngs=rngs,
                 )
@@ -408,11 +333,10 @@ class BRCSudokuModel(nnx.Module):
         self.verifier_given_embed = nnx.Embed(2, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.verifier_blocks = nnx.List(
             [
-                RelationTypedVerifierBlock(
+                BRCVerifierBlock(
                     config,
                     brc.num_heads,
                     brc.mlp_ratio,
-                    self.num_relations,
                     self.dtype,
                     rngs=rngs,
                 )
@@ -457,14 +381,6 @@ class BRCSudokuModel(nnx.Module):
                         cells.append(row * grid_width + col)
                 indices.append(cells)
         return jnp.asarray(indices, dtype=jnp.int32)
-
-    @staticmethod
-    def _build_sudoku_relation_masks(rows: Array, cols: Array, boxes: Array) -> Array:
-        eye = jnp.eye(rows.shape[0], dtype=bool)
-        same_row = (rows[:, None] == rows[None, :]) & ~eye
-        same_col = (cols[:, None] == cols[None, :]) & ~eye
-        same_box = (boxes[:, None] == boxes[None, :]) & ~eye
-        return jnp.stack([eye, same_row, same_col, same_box], axis=0)
 
     def condition_mask(self, tokens: Array) -> Array:
         return tokens != 1
@@ -573,7 +489,7 @@ class BRCSudokuModel(nnx.Module):
         gate_mean = jnp.asarray(0.0, dtype=jnp.float32)
         gate_std = jnp.asarray(0.0, dtype=jnp.float32)
         for block in self.solver_blocks:
-            h, block_diagnostics = block(h, cell_input, z, self.relation_masks)
+            h, block_diagnostics = block(h, cell_input, z, self.rope_cos, self.rope_sin)
             gate_mean = gate_mean + block_diagnostics["brc_gate_mean"]
             gate_std = gate_std + block_diagnostics["brc_gate_std"]
         normalizer = jnp.asarray(len(self.solver_blocks), dtype=jnp.float32)
@@ -581,6 +497,55 @@ class BRCSudokuModel(nnx.Module):
             "brc_gate_mean": gate_mean / normalizer,
             "brc_gate_std": gate_std / normalizer,
         }
+
+    def _dual_recurrent_solver_update(
+        self,
+        h: Array,
+        cell_input: Array,
+        z: Array,
+    ) -> tuple[Array, dict[str, Array]]:
+        def latent_update(hidden: Array) -> tuple[Array, dict[str, Array]]:
+            diagnostics = {
+                "brc_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
+                "brc_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
+            }
+            for _ in range(self.brc.latent_recursion):
+                hidden, diagnostics = self._solver_update(hidden, cell_input, z)
+            return hidden, diagnostics
+
+        diagnostics = {
+            "brc_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
+            "brc_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
+        }
+        for _ in range(self.brc.deep_recursion - 1):
+            h, diagnostics = latent_update(h)
+            h = jax.lax.stop_gradient(h)
+        return latent_update(h)
+
+    def update_latent(self, z: Array, h: Array) -> tuple[Array, dict[str, Array]]:
+        hidden_summary = jnp.mean(h.astype(jnp.float32), axis=1)
+        update_input = jnp.concatenate([hidden_summary, z.astype(jnp.float32)], axis=-1)
+        update_hidden = jax.nn.silu(self.latent_update_in(maybe_cast(update_input, self.dtype)))
+        delta = self.latent_update_out(update_hidden).astype(jnp.float32)
+        delta = 0.1 * jnp.tanh(delta)
+        z_next = z.astype(jnp.float32) + delta
+        return z_next, {
+            "brc_z_delta_norm": jnp.mean(jnp.linalg.norm(delta, axis=-1)),
+        }
+
+    def solver_latent_step(
+        self,
+        h: Array,
+        cell_input: Array,
+        z: Array,
+    ) -> tuple[Array, Array, dict[str, Array]]:
+        h_next, diagnostics = self._dual_recurrent_solver_update(h, cell_input, z)
+        z_next, latent_diagnostics = self.update_latent(z, h_next)
+        diagnostics = {
+            **diagnostics,
+            "brc_z_delta_norm": latent_diagnostics["brc_z_delta_norm"],
+        }
+        return h_next, z_next, diagnostics
 
     def initial_recurrent_state(
         self,
@@ -629,9 +594,9 @@ class BRCSudokuModel(nnx.Module):
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key, time_embedding = scan_inputs
             if return_raw_final_logits:
-                h_prev, belief_logits, _raw_final_logits = carry
+                h_prev, z_prev, belief_logits, _raw_final_logits = carry
             else:
-                h_prev, belief_logits = carry
+                h_prev, z_prev, belief_logits = carry
             cell_input = self._cell_embeddings(
                 tokens,
                 belief_logits,
@@ -640,12 +605,12 @@ class BRCSudokuModel(nnx.Module):
                 train=train,
                 dropout_key=step_dropout_key,
             )
-            h_next, block_diagnostics = self._solver_update(h_prev, cell_input, z)
+            h_next, z_next, block_diagnostics = self.solver_latent_step(h_prev, cell_input, z_prev)
             raw_logits = self.lm_head(maybe_cast(h_next, self.dtype))
             next_belief = self._belief_update(tokens, belief_logits, raw_logits, step_index)
-            next_carry = (h_next, next_belief)
+            next_carry = (h_next, z_next, next_belief)
             if return_raw_final_logits:
-                next_carry = (h_next, next_belief, raw_logits.astype(jnp.float32))
+                next_carry = (h_next, z_next, next_belief, raw_logits.astype(jnp.float32))
             if return_final_only:
                 return next_carry, None
             logits = self._belief_to_token_logits(next_belief, tokens, step_index)
@@ -660,6 +625,7 @@ class BRCSudokuModel(nnx.Module):
                 filled_ratio,
                 block_diagnostics["brc_gate_mean"],
                 block_diagnostics["brc_gate_std"],
+                block_diagnostics["brc_z_delta_norm"],
             )
 
         step_indices = jnp.arange(self.recurrent_steps, dtype=jnp.int32)
@@ -668,19 +634,19 @@ class BRCSudokuModel(nnx.Module):
         else:
             step_dropout_keys = jax.random.split(dropout_key, self.recurrent_steps)
         time_embeddings = self.time_embed(step_indices)
-        initial_carry = (h, initial_belief.astype(jnp.float32))
+        initial_carry = (h, z, initial_belief.astype(jnp.float32))
         if return_raw_final_logits:
             raw_final0 = jnp.zeros((*tokens.shape, self.config.vocab_size), dtype=jnp.float32)
-            initial_carry = (h, initial_belief.astype(jnp.float32), raw_final0)
+            initial_carry = (h, z, initial_belief.astype(jnp.float32), raw_final0)
         final_carry, scan_outputs = jax.lax.scan(
             scan_step,
             initial_carry,
             (step_indices, step_dropout_keys, time_embeddings),
         )
         if return_raw_final_logits:
-            h_final, belief_final, raw_final_logits = final_carry
+            h_final, z_final, belief_final, raw_final_logits = final_carry
         else:
-            h_final, belief_final = final_carry
+            h_final, z_final, belief_final = final_carry
         if return_final_only:
             final_step = jnp.asarray(self.recurrent_steps - 1, dtype=jnp.int32)
             logits = self._belief_to_token_logits(belief_final, tokens, final_step)
@@ -689,8 +655,9 @@ class BRCSudokuModel(nnx.Module):
                 "diffusion_filled_ratio": jnp.zeros((self.recurrent_steps,), dtype=jnp.float32),
                 "brc_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
                 "brc_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
+                "brc_z_delta_norm": jnp.asarray(0.0, dtype=jnp.float32),
                 "unroll_steps": jnp.asarray(self.recurrent_steps, dtype=jnp.float32),
-                "z": z,
+                "z": z_final,
                 "h": h_final,
                 "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
                 "belief_logits": belief_final,
@@ -698,14 +665,15 @@ class BRCSudokuModel(nnx.Module):
             if return_raw_final_logits:
                 diagnostics["raw_final_logits"] = raw_final_logits
             return logits, diagnostics
-        step_logits, hidden_delta, filled_ratio, gate_mean, gate_std = scan_outputs[:5]
+        step_logits, hidden_delta, filled_ratio, gate_mean, gate_std, z_delta_norm = scan_outputs[:6]
         diagnostics = {
             "hidden_delta_mean": hidden_delta,
             "diffusion_filled_ratio": filled_ratio,
             "brc_gate_mean": jnp.mean(gate_mean),
             "brc_gate_std": jnp.mean(gate_std),
+            "brc_z_delta_norm": jnp.mean(z_delta_norm),
             "unroll_steps": jnp.asarray(self.recurrent_steps, dtype=jnp.float32),
-            "z": z,
+            "z": z_final,
             "h": h_final,
             "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
             "belief_logits": belief_final,
@@ -785,7 +753,7 @@ class BRCSudokuModel(nnx.Module):
             + self._position_embeddings()[None, :, :]
         ) * 0.5
         for block in self.verifier_blocks:
-            h = block(h, self.relation_masks)
+            h = block(h, self.rope_cos, self.rope_sin)
         pooled = jnp.mean(h.astype(jnp.float32), axis=1)
         hidden = jax.nn.silu(self.verifier_hidden(maybe_cast(pooled, self.dtype)))
         return self.verifier_head(hidden).astype(jnp.float32).squeeze(-1)
