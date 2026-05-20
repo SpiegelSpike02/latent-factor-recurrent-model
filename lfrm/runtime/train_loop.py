@@ -90,8 +90,8 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         and config.optimizer.puzzle_embed_learning_rate > 0.0
     ):
         print(
-            "[runtime] sparse puzzle embedding coalesce is disabled under data parallel sharding "
-            "because jnp.unique/sort cannot run over the sharded data axis.",
+            "[runtime] sparse puzzle embedding updates are replicated before coalescing "
+            "because jnp.unique/sort cannot run over a sharded data axis.",
             flush=True,
         )
     if config.runtime.profile_enabled:
