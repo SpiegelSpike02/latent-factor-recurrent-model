@@ -4,21 +4,20 @@ import os
 
 
 DEFAULT_JAX_ENV = {
-    "XLA_PYTHON_CLIENT_PREALLOCATE": "true",
-    "XLA_PYTHON_CLIENT_MEM_FRACTION": "1.0",
-    "NCCL_LL128_BUFFSIZE": "-2",
-    "NCCL_LL_BUFFSIZE": "-2",
-    "NCCL_PROTO": "SIMPLE,LL,LL128",
+    "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    "TF_GPU_ALLOCATOR": "cuda_malloc_async",
 }
 
 DEFAULT_UNSET_ENV = (
     "XLA_PYTHON_CLIENT_ALLOCATOR",
-    "TF_GPU_ALLOCATOR",
+    "XLA_PYTHON_CLIENT_MEM_FRACTION",
+    "NCCL_LL128_BUFFSIZE",
+    "NCCL_LL_BUFFSIZE",
+    "NCCL_PROTO",
 )
 
 DEFAULT_XLA_FLAGS = (
     "--xla_gpu_triton_gemm_any=true",
-    "--xla_gpu_enable_latency_hiding_scheduler=true",
 )
 
 
