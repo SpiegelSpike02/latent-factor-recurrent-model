@@ -417,7 +417,7 @@ def run_training(
                 is_eval_step = step % eval_interval == 0 or step == config.train.optimizer_updates
                 if use_recurrent_act:
                     assert train_carry is not None
-                    step_key = train_key
+                    train_key, step_key = jax.random.split(train_key)
                     metrics, train_carry = train_step_fn(
                         model,
                         optimizer,

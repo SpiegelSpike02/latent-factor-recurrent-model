@@ -6,7 +6,7 @@ from flax import nnx
 
 from lfrm.config import ExperimentConfig
 from lfrm.models import BRCSudokuModel, TinyRecursiveModel, UnifiedReasoningModel
-from lfrm.training.optim import build_optimizer, trainable_param_filter
+from lfrm.training.optim import build_optimizer, trainable_param_filter, uses_sparse_puzzle_embedding
 
 
 GridReasoningModel = BRCSudokuModel | TinyRecursiveModel | UnifiedReasoningModel
@@ -47,10 +47,12 @@ def create_ema_model(model: GridReasoningModel, config: ExperimentConfig) -> Gri
 
 
 def ema_param_filter(config: ExperimentConfig):
-    del config
-    return nnx.All(nnx.Param, nnx.Not(nnx.PathContains("puzzle_embed")))
+    if uses_sparse_puzzle_embedding(config):
+        return nnx.All(nnx.Param, nnx.Not(nnx.PathContains("puzzle_embed")))
+    return nnx.Param
 
 
 def ema_sync_filter(config: ExperimentConfig):
-    del config
-    return nnx.All(nnx.Param, nnx.PathContains("puzzle_embed"))
+    if uses_sparse_puzzle_embedding(config):
+        return nnx.All(nnx.Param, nnx.PathContains("puzzle_embed"))
+    return nnx.Nothing
