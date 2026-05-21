@@ -93,9 +93,9 @@ ALLOWED_SECTION_KEYS = {
 ALLOWED_NESTED_KEYS = {
     "ema": {"enabled", "decay"},
     "trm": {
-        "deep_recursion",
-        "latent_recursion",
-        "block_layers",
+        "h_cycles",
+        "l_cycles",
+        "l_layers",
         "num_heads",
         "mlp_ratio",
         "mlp_t",
@@ -111,8 +111,11 @@ ALLOWED_NESTED_KEYS = {
         "step_loss_weights",
     },
     "brc": {
-        "recurrent_steps",
-        "block_layers",
+        "belief_steps",
+        "h_cycles",
+        "l_cycles",
+        "l_layers",
+        "hidden_state_dim",
         "num_heads",
         "mlp_ratio",
         "position_encoding",
@@ -129,9 +132,9 @@ ALLOWED_NESTED_KEYS = {
     },
     "urm": {
         "recurrent_steps",
-        "deep_recursion",
-        "latent_recursion",
-        "block_layers",
+        "h_cycles",
+        "l_cycles",
+        "l_layers",
         "num_heads",
         "mlp_ratio",
         "conv_kernel",
@@ -240,9 +243,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-steps", type=int, default=6)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
     parser.add_argument("--loss-type", choices=("softmax", "stablemax"), default="softmax")
-    parser.add_argument("--trm-deep-recursion", type=int, default=3)
-    parser.add_argument("--trm-latent-recursion", type=int, default=6)
-    parser.add_argument("--trm-block-layers", type=int, default=2)
+    parser.add_argument("--trm-h-cycles", type=int, default=3)
+    parser.add_argument("--trm-l-cycles", type=int, default=6)
+    parser.add_argument("--trm-l-layers", type=int, default=2)
     parser.add_argument("--trm-num-heads", type=int, default=8)
     parser.add_argument("--trm-mlp-ratio", type=int, default=4)
     parser.add_argument("--trm-mlp-t", action=argparse.BooleanOptionalAction, default=False)
@@ -256,8 +259,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--brc-recurrent-steps", type=int, default=6)
-    parser.add_argument("--brc-block-layers", type=int, default=1)
+    parser.add_argument("--brc-belief-steps", type=int, default=6)
+    parser.add_argument("--brc-h-cycles", type=int, default=1)
+    parser.add_argument("--brc-l-cycles", type=int, default=2)
+    parser.add_argument("--brc-l-layers", type=int, default=1)
+    parser.add_argument("--brc-hidden-state-dim", type=int, default=0)
     parser.add_argument("--brc-num-heads", type=int, default=4)
     parser.add_argument("--brc-mlp-ratio", type=int, default=2)
     parser.add_argument("--brc-position-encoding", choices=("rope", "learned", "none"), default="rope")
@@ -272,9 +278,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-fixed-point-loss-weight", type=float, default=0.0)
     parser.add_argument("--brc-context-weight-reg-weight", type=float, default=0.0)
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
-    parser.add_argument("--urm-deep-recursion", type=int, default=2)
-    parser.add_argument("--urm-latent-recursion", type=int, default=6)
-    parser.add_argument("--urm-block-layers", type=int, default=4)
+    parser.add_argument("--urm-h-cycles", type=int, default=2)
+    parser.add_argument("--urm-l-cycles", type=int, default=6)
+    parser.add_argument("--urm-l-layers", type=int, default=4)
     parser.add_argument("--urm-num-heads", type=int, default=8)
     parser.add_argument("--urm-mlp-ratio", type=int, default=4)
     parser.add_argument("--urm-conv-kernel", type=int, default=2)
@@ -385,9 +391,9 @@ def build_config(
         loss_type=args.loss_type,
         task=task,
         trm=TRMConfig(
-            deep_recursion=args.trm_deep_recursion,
-            latent_recursion=args.trm_latent_recursion,
-            block_layers=args.trm_block_layers,
+            h_cycles=args.trm_h_cycles,
+            l_cycles=args.trm_l_cycles,
+            l_layers=args.trm_l_layers,
             num_heads=args.trm_num_heads,
             mlp_ratio=args.trm_mlp_ratio,
             mlp_t=args.trm_mlp_t,
@@ -403,8 +409,11 @@ def build_config(
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
         brc=BRCConfig(
-            recurrent_steps=args.brc_recurrent_steps,
-            block_layers=args.brc_block_layers,
+            belief_steps=args.brc_belief_steps,
+            h_cycles=args.brc_h_cycles,
+            l_cycles=args.brc_l_cycles,
+            l_layers=args.brc_l_layers,
+            hidden_state_dim=args.brc_hidden_state_dim,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,
             position_encoding=args.brc_position_encoding,
@@ -425,9 +434,9 @@ def build_config(
         ),
         urm=URMConfig(
             recurrent_steps=args.urm_recurrent_steps,
-            deep_recursion=args.urm_deep_recursion,
-            latent_recursion=args.urm_latent_recursion,
-            block_layers=args.urm_block_layers,
+            h_cycles=args.urm_h_cycles,
+            l_cycles=args.urm_l_cycles,
+            l_layers=args.urm_l_layers,
             num_heads=args.urm_num_heads,
             mlp_ratio=args.urm_mlp_ratio,
             conv_kernel=args.urm_conv_kernel,

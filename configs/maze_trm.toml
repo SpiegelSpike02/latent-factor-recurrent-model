@@ -15,11 +15,11 @@ dropout_rate = 0.0
 loss_type = "stablemax"
 
 [model.trm]
-# Official TRM naming: deep_recursion = H_cycles, latent_recursion = L_cycles,
-# block_layers = L_layers. Official Maze attention config uses 3/4/2.
-deep_recursion = 3
-latent_recursion = 4
-block_layers = 2
+# Official TRM naming: h_cycles = H_cycles, l_cycles = L_cycles,
+# l_layers = L_layers. Official Maze attention config uses 3/4/2.
+h_cycles = 3
+l_cycles = 4
+l_layers = 2
 num_heads = 8
 mlp_ratio = 4
 mlp_t = false

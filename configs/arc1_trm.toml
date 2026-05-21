@@ -16,9 +16,9 @@ loss_type = "stablemax"
 
 [model.trm]
 # Official TRM ARC config: H_cycles=3, L_cycles=4, L_layers=2.
-deep_recursion = 3
-latent_recursion = 4
-block_layers = 2
+h_cycles = 3
+l_cycles = 4
+l_layers = 2
 num_heads = 8
 mlp_ratio = 4
 mlp_t = false

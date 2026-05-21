@@ -16,9 +16,9 @@ loss_type = "stablemax"
 [model.urm]
 # Official URM ARC script: loops=16, H_cycles=2, L_cycles=6, num_layers=4.
 recurrent_steps = 16
-deep_recursion = 2
-latent_recursion = 6
-block_layers = 4
+h_cycles = 2
+l_cycles = 6
+l_layers = 4
 num_heads = 8
 mlp_ratio = 4
 conv_kernel = 2

@@ -182,6 +182,7 @@ def _refine_belief_step(
     model: BRCModel,
     inputs: jax.Array,
     belief_logits: jax.Array,
+    hidden_state: jax.Array,
     base_embeddings: jax.Array,
     time_embedding: jax.Array,
     step_index: jax.Array,
@@ -189,18 +190,17 @@ def _refine_belief_step(
     train: bool,
     dropout_key: jax.Array | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, dict[str, jax.Array]]:
-    cell_input = model._cell_embeddings(
+    next_belief, next_hidden, _raw_delta, alpha, block_diagnostics = model._belief_step(
         inputs,
         belief_logits,
+        hidden_state,
         base_embeddings,
         time_embedding,
+        step_index,
         train=train,
         dropout_key=dropout_key,
     )
-    scratch, alpha, block_diagnostics = model._scratch_refine(cell_input)
-    raw_delta = model.lm_head(scratch.astype(model.dtype))
-    next_belief = model._belief_update(inputs, belief_logits, raw_delta, alpha, step_index)
-    return next_belief, scratch, alpha, block_diagnostics
+    return next_belief, next_hidden, alpha, block_diagnostics
 
 
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
@@ -225,10 +225,10 @@ def _brc_compact_training_rollout(
     loss_normalizer = jnp.maximum(jnp.sum(loss_mask_f32), 1.0)
     candidate_init = jnp.zeros_like(inputs)
     early_index = jnp.asarray(0, dtype=jnp.int32)
-    mid_index = jnp.asarray(model.recurrent_steps // 2, dtype=jnp.int32)
+    mid_index = jnp.asarray(model.belief_steps // 2, dtype=jnp.int32)
 
     def scan_step(carry, scan_inputs):
-        belief_logits, early_candidate, mid_candidate, trajectory_noise_count = carry
+        belief_logits, hidden_state, early_candidate, mid_candidate, trajectory_noise_count = carry
         step_index, step_dropout_key, noise_key, active_key, time_embedding = scan_inputs
         if trajectory_noise:
             noisy_belief, _noise_mode = _mix_training_belief(
@@ -247,10 +247,11 @@ def _brc_compact_training_rollout(
         else:
             refine_input_belief = belief_logits
             active = targets != 0
-        next_belief, scratch, _alpha, block_diagnostics = _refine_belief_step(
+        next_belief, next_hidden, _alpha, block_diagnostics = _refine_belief_step(
             model,
             inputs,
             refine_input_belief,
+            hidden_state,
             base_embeddings,
             time_embedding,
             step_index,
@@ -264,9 +265,6 @@ def _brc_compact_training_rollout(
         early_candidate = jnp.where(step_index == early_index, predictions, early_candidate)
         mid_candidate = jnp.where(step_index == mid_index, predictions, mid_candidate)
 
-        scratch_norm = jnp.sum(
-            jnp.linalg.norm(scratch.astype(jnp.float32), axis=-1) * query_mask
-        ) / query_normalizer
         belief_probs = jax.nn.softmax(next_belief, axis=-1)
         confidence = jnp.max(belief_probs, axis=-1)
         filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
@@ -283,9 +281,8 @@ def _brc_compact_training_rollout(
             next_belief,
             base_embeddings,
         )
-        return (next_belief, early_candidate, mid_candidate, trajectory_noise_count), (
+        return (jax.lax.stop_gradient(next_belief), next_hidden, early_candidate, mid_candidate, trajectory_noise_count), (
             per_step_loss,
-            scratch_norm,
             filled_ratio,
             block_diagnostics["step_gate_mean"],
             block_diagnostics["step_gate_std"],
@@ -298,21 +295,34 @@ def _brc_compact_training_rollout(
             context_weight_mean,
         )
 
-    step_indices = jnp.arange(model.recurrent_steps, dtype=jnp.int32)
+    step_indices = jnp.arange(model.belief_steps, dtype=jnp.int32)
     step_dropout_keys, step_noise_keys, step_active_keys = jax.random.split(dropout_key, 3)
-    step_dropout_keys = jax.random.split(step_dropout_keys, model.recurrent_steps)
-    step_noise_keys = jax.random.split(step_noise_keys, model.recurrent_steps)
-    step_active_keys = jax.random.split(step_active_keys, model.recurrent_steps)
+    step_dropout_keys = jax.random.split(step_dropout_keys, model.belief_steps)
+    step_noise_keys = jax.random.split(step_noise_keys, model.belief_steps)
+    step_active_keys = jax.random.split(step_active_keys, model.belief_steps)
     time_embeddings = model.time_embed(step_indices)
-    initial_carry = (initial_belief.astype(jnp.float32), candidate_init, candidate_init, jnp.asarray(0.0, dtype=jnp.float32))
-    (belief_final, early_candidate, mid_candidate, trajectory_noise_count), scan_outputs = jax.lax.scan(
+    initial_hidden = model.initial_hidden_state(
+        inputs,
+        initial_belief,
+        base_embeddings,
+        time_embeddings[0],
+        train=True,
+        dropout_key=step_dropout_keys[0],
+    )
+    initial_carry = (
+        initial_belief.astype(jnp.float32),
+        initial_hidden,
+        candidate_init,
+        candidate_init,
+        jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    (belief_final, _hidden_final, early_candidate, mid_candidate, trajectory_noise_count), scan_outputs = jax.lax.scan(
         scan_step,
         initial_carry,
         (step_indices, step_dropout_keys, step_noise_keys, step_active_keys, time_embeddings),
     )
     (
         per_step_loss,
-        scratch_norm,
         filled_ratio,
         gate_mean,
         gate_std,
@@ -324,11 +334,10 @@ def _brc_compact_training_rollout(
         context_weight_reg,
         context_weight_mean,
     ) = scan_outputs
-    final_step = jnp.asarray(model.recurrent_steps - 1, dtype=jnp.int32)
+    final_step = jnp.asarray(model.belief_steps - 1, dtype=jnp.int32)
     final_logits = model._belief_to_token_logits(belief_final, inputs, final_step)
     final_candidate = jnp.argmax(final_logits, axis=-1).astype(jnp.int32)
     diagnostics = {
-        "scratch_norm": scratch_norm,
         "diffusion_filled_ratio": filled_ratio,
         "step_gate_mean": jnp.mean(gate_mean),
         "step_gate_std": jnp.mean(gate_std),
@@ -339,10 +348,10 @@ def _brc_compact_training_rollout(
         "belief_update_norm": jnp.mean(update_norm),
         "context_weight_reg": jnp.mean(context_weight_reg),
         "context_weight_mean": jnp.mean(context_weight_mean),
-        "trajectory_noise_rate": trajectory_noise_count / jnp.asarray(model.recurrent_steps, dtype=jnp.float32),
+        "trajectory_noise_rate": trajectory_noise_count / jnp.asarray(model.belief_steps, dtype=jnp.float32),
         "per_step_denoise_energy": energy,
         "per_step_belief_entropy": entropy,
-        "unroll_steps": jnp.asarray(model.recurrent_steps, dtype=jnp.float32),
+        "unroll_steps": jnp.asarray(model.belief_steps, dtype=jnp.float32),
         "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
         "belief_logits": belief_final,
         "early_candidate": early_candidate,
@@ -491,7 +500,6 @@ def brc_loss_and_metrics(
         "trajectory_noise_rate": diagnostics.get("trajectory_noise_rate", zero),
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_loss_weights,
-        "scratch_norm": jnp.mean(diagnostics["scratch_norm"]),
         "diffusion_filled_ratio": diagnostics["diffusion_filled_ratio"],
         "step_gate_mean": diagnostics["step_gate_mean"],
         "step_gate_std": diagnostics["step_gate_std"],

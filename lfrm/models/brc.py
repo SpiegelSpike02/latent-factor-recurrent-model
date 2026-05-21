@@ -8,7 +8,7 @@ from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
 from .common import Array, casted_linear_init, compute_dtype, maybe_cast, trunc_normal_init
-from .recurrent.layers import FullAttention, rms_norm as _shared_rms_norm
+from .recurrent.layers import FullAttention, apply_rope, dot_product_attention, rms_norm as _shared_rms_norm
 
 
 def _rms_norm(x: Array, eps: float = 1e-5) -> Array:
@@ -19,6 +19,7 @@ class BRCSolverBlock(nnx.Module):
     def __init__(
         self,
         config: ModelConfig,
+        hidden_dim: int,
         num_heads: int,
         mlp_ratio: int,
         dtype: jnp.dtype,
@@ -27,26 +28,63 @@ class BRCSolverBlock(nnx.Module):
     ) -> None:
         self.config = config
         self.dtype = dtype
-        d_model = config.d_model
-        hidden_dim = max(d_model, mlp_ratio * d_model)
+        mlp_hidden_dim = max(hidden_dim, mlp_ratio * hidden_dim)
         self.attention = FullAttention(
-            d_model,
+            hidden_dim,
             num_heads,
             dtype,
             name="BRC",
             rngs=rngs,
         )
-        self.msg_in = nnx.Linear(
-            d_model,
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.cross_q = nnx.Linear(
             hidden_dim,
+            hidden_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.cross_kv = nnx.Linear(
+            hidden_dim,
+            2 * hidden_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.cross_out = nnx.Linear(
+            hidden_dim,
+            hidden_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.film = nnx.Linear(
+            hidden_dim,
+            2 * hidden_dim,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            bias_init=nnx.initializers.zeros,
+            rngs=rngs,
+        )
+        self.msg_in = nnx.Linear(
+            hidden_dim,
+            mlp_hidden_dim,
             dtype=dtype,
             param_dtype=jnp.float32,
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
         self.msg_out = nnx.Linear(
+            mlp_hidden_dim,
             hidden_dim,
-            d_model,
             dtype=dtype,
             param_dtype=jnp.float32,
             kernel_init=casted_linear_init,
@@ -55,11 +93,31 @@ class BRCSolverBlock(nnx.Module):
     def __call__(
         self,
         h: Array,
+        condition: Array,
         rope_cos: Array | None,
         rope_sin: Array | None,
     ) -> Array:
         attn = self.attention(h, rope_cos=rope_cos, rope_sin=rope_sin)
         h = _rms_norm(h.astype(jnp.float32) + attn.astype(jnp.float32), self.config.brc_config.rms_norm_eps).astype(self.dtype)
+        batch_size, seq_len, hidden_dim = h.shape
+        q = self.cross_q(maybe_cast(h, self.dtype))
+        k, v = jnp.split(self.cross_kv(maybe_cast(condition, self.dtype)), 2, axis=-1)
+        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        if rope_cos is not None and rope_sin is not None:
+            q, k = apply_rope(q, k, rope_cos, rope_sin)
+        cross = dot_product_attention(q, k, v).reshape(batch_size, seq_len, hidden_dim)
+        h = _rms_norm(h.astype(jnp.float32) + self.cross_out(cross).astype(jnp.float32), self.config.brc_config.rms_norm_eps).astype(self.dtype)
+        pooled_condition = jnp.mean(condition.astype(jnp.float32), axis=1)
+        scale, shift = jnp.split(self.film(maybe_cast(pooled_condition, self.dtype)).astype(jnp.float32), 2, axis=-1)
+        h_norm = _rms_norm(h.astype(jnp.float32), self.config.brc_config.rms_norm_eps).astype(jnp.float32)
+        h = _rms_norm(
+            h.astype(jnp.float32)
+            + h_norm * jnp.tanh(scale)[:, None, :]
+            + shift[:, None, :],
+            self.config.brc_config.rms_norm_eps,
+        ).astype(self.dtype)
         msg = self.msg_out(jax.nn.silu(self.msg_in(maybe_cast(h, self.dtype)))).astype(jnp.float32)
         return _rms_norm(h.astype(jnp.float32) + msg, self.config.brc_config.rms_norm_eps).astype(self.dtype)
 
@@ -81,23 +139,26 @@ class BRCModel(nnx.Module):
         if config.task_type == "sudoku" and config.vocab_size < 11:
             raise ValueError("BRC Sudoku expects vocab_size >= 11")
         brc = config.brc_config
-        if brc.recurrent_steps < 1:
-            raise ValueError("BRC recurrent_steps must be at least 1")
-        if brc.block_layers < 1:
-            raise ValueError("BRC block_layers must be at least 1")
+        if brc.belief_steps < 1:
+            raise ValueError("BRC belief_steps must be at least 1")
+        if min(brc.h_cycles, brc.l_cycles, brc.l_layers) < 1:
+            raise ValueError("BRC h_cycles, l_cycles, and l_layers must be at least 1")
+        hidden_dim = int(brc.hidden_state_dim) if brc.hidden_state_dim > 0 else config.d_model
+        if hidden_dim < 1:
+            raise ValueError("BRC hidden_state_dim must be positive or 0 for d_model")
         if brc.num_heads < 1:
             raise ValueError("BRC num_heads must be at least 1")
-        if config.d_model % brc.num_heads != 0:
-            raise ValueError("BRC d_model must be divisible by num_heads")
+        if hidden_dim % brc.num_heads != 0:
+            raise ValueError("BRC hidden state dimension must be divisible by num_heads")
         if brc.mlp_ratio < 1:
             raise ValueError("BRC mlp_ratio must be at least 1")
         if brc.position_encoding not in ("rope", "learned", "none"):
             raise ValueError("BRC position_encoding must be 'rope', 'learned', or 'none'")
-        if brc.position_encoding == "rope" and (config.d_model // brc.num_heads) % 2 != 0:
+        if brc.position_encoding == "rope" and (hidden_dim // brc.num_heads) % 2 != 0:
             raise ValueError("BRC RoPE head dimension must be even")
         if brc.step_loss_weights is not None:
-            if len(brc.step_loss_weights) != brc.recurrent_steps:
-                raise ValueError("BRC step_loss_weights length must equal recurrent_steps")
+            if len(brc.step_loss_weights) != brc.belief_steps:
+                raise ValueError("BRC step_loss_weights length must equal belief_steps")
             if any(weight < 0.0 for weight in brc.step_loss_weights):
                 raise ValueError("BRC step_loss_weights must be non-negative")
             if sum(brc.step_loss_weights) <= 0.0:
@@ -122,7 +183,10 @@ class BRCModel(nnx.Module):
         self.config = config
         self.runtime = runtime
         self.brc = brc
-        self.recurrent_steps = int(brc.recurrent_steps)
+        self.belief_steps = int(brc.belief_steps)
+        self.h_cycles = int(brc.h_cycles)
+        self.l_cycles = int(brc.l_cycles)
+        self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
         self.belief_vocab_size = config.vocab_size
@@ -160,10 +224,10 @@ class BRCModel(nnx.Module):
             self.row_embed = nnx.Embed(config.grid_height, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
             self.col_embed = nnx.Embed(config.grid_width, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
             self.box_embed = nnx.Embed(self.num_boxes, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.time_embed = nnx.Embed(self.recurrent_steps, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
+        self.time_embed = nnx.Embed(self.belief_steps, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
         if brc.position_encoding == "rope":
-            head_dim = config.d_model // brc.num_heads
+            head_dim = self.hidden_dim // brc.num_heads
             inv_freq = 1.0 / (brc.rope_theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
             positions = jnp.arange(config.seq_len, dtype=jnp.float32)
             freqs = positions[:, None] * inv_freq[None, :]
@@ -174,9 +238,43 @@ class BRCModel(nnx.Module):
             self.rope_cos = None
             self.rope_sin = None
 
-        self.input_to_scratch = nnx.Linear(
+        self.input_to_hidden = nnx.Linear(
             config.d_model,
+            self.hidden_dim,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.readout_condition = nnx.Linear(
             config.d_model,
+            self.hidden_dim,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.readout_gate = nnx.Linear(
+            self.hidden_dim * 4,
+            self.hidden_dim,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            bias_init=nnx.initializers.constant(-1.0),
+            rngs=rngs,
+        )
+        readout_mlp_dim = max(self.hidden_dim, brc.mlp_ratio * self.hidden_dim)
+        self.readout_fuse_in = nnx.Linear(
+            self.hidden_dim * 4,
+            readout_mlp_dim,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.readout_fuse_out = nnx.Linear(
+            readout_mlp_dim,
+            self.hidden_dim,
             dtype=self.dtype,
             param_dtype=jnp.float32,
             kernel_init=casted_linear_init,
@@ -186,16 +284,17 @@ class BRCModel(nnx.Module):
             [
                 BRCSolverBlock(
                     config,
+                    self.hidden_dim,
                     brc.num_heads,
                     brc.mlp_ratio,
                     self.dtype,
                     rngs=rngs,
                 )
-                for _ in range(brc.block_layers)
+                for _ in range(brc.l_layers)
             ]
         )
         self.lm_head = nnx.Linear(
-            config.d_model,
+            self.hidden_dim,
             config.vocab_size,
             dtype=self.dtype,
             param_dtype=jnp.float32,
@@ -203,7 +302,7 @@ class BRCModel(nnx.Module):
             rngs=rngs,
         )
         self.step_gate = nnx.Linear(
-            config.d_model,
+            self.hidden_dim,
             1,
             dtype=self.dtype,
             param_dtype=jnp.float32,
@@ -312,9 +411,9 @@ class BRCModel(nnx.Module):
         return self.dropout(x, deterministic=not train, rngs=dropout_key).astype(self.dtype)
 
     def _belief_to_token_logits(self, belief_logits: Array, tokens: Array, step_index: Array) -> Array:
-        total_steps = jnp.maximum(jnp.asarray(self.recurrent_steps - 1, dtype=jnp.float32), 1.0)
+        total_steps = jnp.maximum(jnp.asarray(self.belief_steps - 1, dtype=jnp.float32), 1.0)
         progress = step_index.astype(jnp.float32) / total_steps
-        sharpen = jnp.where(step_index >= jnp.maximum(self.recurrent_steps - 4, 0), 1.0 + 2.0 * progress, 1.0)
+        sharpen = jnp.where(step_index >= jnp.maximum(self.belief_steps - 4, 0), 1.0 + 2.0 * progress, 1.0)
         belief_logits = self._normalize_belief_logits(belief_logits, tokens) * sharpen
         return belief_logits
 
@@ -350,16 +449,134 @@ class BRCModel(nnx.Module):
         context_weight_mean = jnp.mean(context_weight)
         return energy, kl_delta, entropy, confidence, update_norm, context_weight_reg, context_weight_mean
 
-    def _scratch_refine(self, cell_input: Array) -> tuple[Array, Array, dict[str, Array]]:
-        scratch = self.input_to_scratch(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
-        for block in self.solver_blocks:
-            scratch = block(scratch, self.rope_cos, self.rope_sin)
-        alpha = jax.nn.sigmoid(self.step_gate(maybe_cast(scratch, self.dtype)).astype(jnp.float32))
-        return scratch, alpha, {
+    def _hidden_l_cycle(self, hidden_state: Array, cell_input: Array) -> Array:
+        hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
+        hidden = hidden_state.astype(self.dtype)
+        for _ in range(self.l_cycles):
+            hidden = _rms_norm(
+                hidden.astype(jnp.float32) + hidden_input.astype(jnp.float32),
+                self.brc.rms_norm_eps,
+            ).astype(self.dtype)
+            for block in self.solver_blocks:
+                hidden = block(hidden, hidden_input, self.rope_cos, self.rope_sin)
+        return hidden
+
+    def _readout_fuse(self, hidden_state: Array, cell_input: Array) -> Array:
+        hidden = _rms_norm(hidden_state.astype(jnp.float32), self.brc.rms_norm_eps).astype(self.dtype)
+        condition = self.readout_condition(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
+        condition = _rms_norm(condition.astype(jnp.float32), self.brc.rms_norm_eps).astype(self.dtype)
+        gate_input = jnp.concatenate(
+            (
+                hidden,
+                condition,
+                (hidden.astype(jnp.float32) * condition.astype(jnp.float32)).astype(self.dtype),
+                (hidden.astype(jnp.float32) - condition.astype(jnp.float32)).astype(self.dtype),
+            ),
+            axis=-1,
+        )
+        gate = jax.nn.sigmoid(self.readout_gate(maybe_cast(gate_input, self.dtype)).astype(jnp.float32))
+        update = self.readout_fuse_out(
+            jax.nn.silu(self.readout_fuse_in(maybe_cast(gate_input, self.dtype)))
+        ).astype(jnp.float32)
+        fused = hidden.astype(jnp.float32) + gate * (condition.astype(jnp.float32) + update)
+        return _rms_norm(fused, self.brc.rms_norm_eps).astype(self.dtype)
+
+    def _h_cycle_step(
+        self,
+        tokens: Array,
+        belief_logits: Array,
+        hidden_state: Array,
+        base_embeddings: Array,
+        time_embedding: Array,
+        step_index: Array,
+        *,
+        train: bool,
+        dropout_key: Array | None,
+    ) -> tuple[Array, Array, Array, Array, dict[str, Array]]:
+        cell_input = self._cell_embeddings(
+            tokens,
+            belief_logits,
+            base_embeddings,
+            time_embedding,
+            train=train,
+            dropout_key=dropout_key,
+        )
+        hidden = self._hidden_l_cycle(hidden_state, cell_input)
+        read_state = self._readout_fuse(hidden, cell_input)
+        alpha = jax.nn.sigmoid(self.step_gate(maybe_cast(read_state, self.dtype)).astype(jnp.float32))
+        raw_delta = self.lm_head(maybe_cast(read_state, self.dtype))
+        next_belief = self._belief_update(tokens, belief_logits, raw_delta, alpha, step_index)
+        return next_belief, hidden, raw_delta.astype(jnp.float32), alpha, {
             "step_gate_mean": jnp.mean(alpha),
             "step_gate_std": jnp.std(alpha),
-            "scratch_norm": jnp.mean(jnp.linalg.norm(scratch.astype(jnp.float32), axis=-1)),
         }
+
+    def _belief_step(
+        self,
+        tokens: Array,
+        belief_logits: Array,
+        hidden_state: Array,
+        base_embeddings: Array,
+        time_embedding: Array,
+        step_index: Array,
+        *,
+        train: bool,
+        dropout_key: Array | None,
+    ) -> tuple[Array, Array, Array, Array, dict[str, Array]]:
+        raw_delta = jnp.zeros((*tokens.shape, self.config.vocab_size), dtype=jnp.float32)
+        alpha = jnp.zeros((*tokens.shape, 1), dtype=jnp.float32)
+        diagnostics = {
+            "step_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
+            "step_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
+        }
+        if dropout_key is None:
+            h_dropout_keys = jax.random.split(jax.random.key(0), self.h_cycles)
+        else:
+            h_dropout_keys = jax.random.split(dropout_key, self.h_cycles)
+        for h_index in range(self.h_cycles - 1):
+            belief_logits, hidden_state, raw_delta, alpha, diagnostics = self._h_cycle_step(
+                tokens,
+                belief_logits,
+                hidden_state,
+                base_embeddings,
+                time_embedding,
+                step_index,
+                train=train,
+                dropout_key=h_dropout_keys[h_index],
+            )
+            belief_logits = jax.lax.stop_gradient(belief_logits)
+            hidden_state = jax.lax.stop_gradient(hidden_state)
+        belief_logits, hidden_state, raw_delta, alpha, diagnostics = self._h_cycle_step(
+            tokens,
+            belief_logits,
+            hidden_state,
+            base_embeddings,
+            time_embedding,
+            step_index,
+            train=train,
+            dropout_key=h_dropout_keys[self.h_cycles - 1],
+        )
+        return belief_logits, jax.lax.stop_gradient(hidden_state), raw_delta, alpha, diagnostics
+
+    def initial_hidden_state(
+        self,
+        tokens: Array,
+        belief_logits: Array,
+        base_embeddings: Array,
+        time_embedding: Array,
+        *,
+        train: bool,
+        dropout_key: Array | None,
+    ) -> Array:
+        cell_input = self._cell_embeddings(
+            tokens,
+            belief_logits,
+            base_embeddings,
+            time_embedding,
+            train=train,
+            dropout_key=dropout_key,
+        )
+        return self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
 
     def context_memory(
         self,
@@ -397,29 +614,25 @@ class BRCModel(nnx.Module):
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key, time_embedding = scan_inputs
             if return_raw_final_logits:
-                belief_logits, _raw_final_logits = carry
+                belief_logits, hidden_state, _raw_final_logits = carry
             else:
-                belief_logits = carry
-            cell_input = self._cell_embeddings(
+                belief_logits, hidden_state = carry
+            next_belief, next_hidden, raw_delta, _alpha, block_diagnostics = self._belief_step(
                 tokens,
                 belief_logits,
+                hidden_state,
                 base_embeddings,
                 time_embedding,
+                step_index,
                 train=train,
                 dropout_key=step_dropout_key,
             )
-            scratch, alpha, block_diagnostics = self._scratch_refine(cell_input)
-            raw_delta = self.lm_head(maybe_cast(scratch, self.dtype))
-            next_belief = self._belief_update(tokens, belief_logits, raw_delta, alpha, step_index)
-            next_carry = next_belief
+            next_carry = (jax.lax.stop_gradient(next_belief), next_hidden)
             if return_raw_final_logits:
-                next_carry = (next_belief, raw_delta.astype(jnp.float32))
+                next_carry = (jax.lax.stop_gradient(next_belief), next_hidden, raw_delta.astype(jnp.float32))
             if return_final_only:
                 return next_carry, None
             logits = self._belief_to_token_logits(next_belief, tokens, step_index)
-            scratch_norm = jnp.sum(
-                jnp.linalg.norm(scratch.astype(jnp.float32), axis=-1) * query_mask
-            ) / query_normalizer
             belief_probs = jax.nn.softmax(next_belief, axis=-1)
             confidence = jnp.max(belief_probs, axis=-1)
             filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
@@ -438,7 +651,6 @@ class BRCModel(nnx.Module):
             )
             return next_carry, (
                 logits,
-                scratch_norm,
                 filled_ratio,
                 block_diagnostics["step_gate_mean"],
                 block_diagnostics["step_gate_std"],
@@ -451,25 +663,33 @@ class BRCModel(nnx.Module):
                 context_weight_mean,
             )
 
-        step_indices = jnp.arange(self.recurrent_steps, dtype=jnp.int32)
+        step_indices = jnp.arange(self.belief_steps, dtype=jnp.int32)
         if dropout_key is None:
-            step_dropout_keys = jax.random.split(jax.random.key(0), self.recurrent_steps)
+            step_dropout_keys = jax.random.split(jax.random.key(0), self.belief_steps)
         else:
-            step_dropout_keys = jax.random.split(dropout_key, self.recurrent_steps)
+            step_dropout_keys = jax.random.split(dropout_key, self.belief_steps)
         time_embeddings = self.time_embed(step_indices)
-        initial_carry = initial_belief.astype(jnp.float32)
+        initial_hidden = self.initial_hidden_state(
+            tokens,
+            initial_belief,
+            base_embeddings,
+            time_embeddings[0],
+            train=train,
+            dropout_key=step_dropout_keys[0],
+        )
+        initial_carry = (initial_belief.astype(jnp.float32), initial_hidden)
         if return_raw_final_logits:
             raw_final0 = jnp.zeros((*tokens.shape, self.config.vocab_size), dtype=jnp.float32)
-            initial_carry = (initial_belief.astype(jnp.float32), raw_final0)
+            initial_carry = (initial_belief.astype(jnp.float32), initial_hidden, raw_final0)
         final_carry, scan_outputs = jax.lax.scan(
             scan_step,
             initial_carry,
             (step_indices, step_dropout_keys, time_embeddings),
         )
         if return_raw_final_logits:
-            belief_final, raw_final_logits = final_carry
+            belief_final, _hidden_final, raw_final_logits = final_carry
         else:
-            belief_final = final_carry
+            belief_final, _hidden_final = final_carry
         (
             final_energy,
             final_kl_delta,
@@ -484,11 +704,10 @@ class BRCModel(nnx.Module):
             base_embeddings,
         )
         if return_final_only:
-            final_step = jnp.asarray(self.recurrent_steps - 1, dtype=jnp.int32)
+            final_step = jnp.asarray(self.belief_steps - 1, dtype=jnp.int32)
             logits = self._belief_to_token_logits(belief_final, tokens, final_step)
             diagnostics = {
-                "scratch_norm": jnp.zeros((self.recurrent_steps,), dtype=jnp.float32),
-                "diffusion_filled_ratio": jnp.zeros((self.recurrent_steps,), dtype=jnp.float32),
+                "diffusion_filled_ratio": jnp.zeros((self.belief_steps,), dtype=jnp.float32),
                 "step_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
                 "step_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
                 "denoise_energy": final_energy,
@@ -498,7 +717,7 @@ class BRCModel(nnx.Module):
                 "belief_update_norm": final_update_norm,
                 "context_weight_reg": final_context_weight_reg,
                 "context_weight_mean": final_context_weight_mean,
-                "unroll_steps": jnp.asarray(self.recurrent_steps, dtype=jnp.float32),
+                "unroll_steps": jnp.asarray(self.belief_steps, dtype=jnp.float32),
                 "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
                 "belief_logits": belief_final,
             }
@@ -507,7 +726,6 @@ class BRCModel(nnx.Module):
             return logits, diagnostics
         (
             step_logits,
-            scratch_norm,
             filled_ratio,
             gate_mean,
             gate_std,
@@ -520,7 +738,6 @@ class BRCModel(nnx.Module):
             context_weight_mean,
         ) = scan_outputs
         diagnostics = {
-            "scratch_norm": scratch_norm,
             "diffusion_filled_ratio": filled_ratio,
             "step_gate_mean": jnp.mean(gate_mean),
             "step_gate_std": jnp.mean(gate_std),
@@ -533,7 +750,7 @@ class BRCModel(nnx.Module):
             "context_weight_mean": jnp.mean(context_weight_mean),
             "per_step_denoise_energy": energy,
             "per_step_belief_entropy": entropy,
-            "unroll_steps": jnp.asarray(self.recurrent_steps, dtype=jnp.float32),
+            "unroll_steps": jnp.asarray(self.belief_steps, dtype=jnp.float32),
             "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
             "belief_logits": belief_final,
         }

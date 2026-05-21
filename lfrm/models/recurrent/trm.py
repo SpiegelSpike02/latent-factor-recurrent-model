@@ -154,10 +154,10 @@ class TRMBlock(nnx.Module):
 class TinyRecursiveModel(nnx.Module):
     """Official-style Tiny Recursive Model baseline.
 
-    The model keeps two recurrent token states, y and z. Each rollout step runs
-    paper-style deep recursion: z is refined several times conditioned on y and
-    the input, then y is updated from z. The same tiny block stack is shared
-    across both states.
+    The model keeps two recurrent token states, y and z. In official TRM terms
+    these are z_H and z_L: every ACT step runs H_cycles, each H cycle updates
+    z_L for L_cycles and then updates z_H once. The same L_layers block stack is
+    shared across both states.
     """
 
     def __init__(
@@ -174,12 +174,12 @@ class TinyRecursiveModel(nnx.Module):
         if config.rollout_steps < 1:
             raise ValueError("TRM rollout_steps must be at least 1")
         trm = config.trm_config
-        if trm.deep_recursion < 1:
-            raise ValueError("TRM deep_recursion must be at least 1")
-        if trm.latent_recursion < 1:
-            raise ValueError("TRM latent_recursion must be at least 1")
-        if trm.block_layers < 1:
-            raise ValueError("TRM block_layers must be at least 1")
+        if trm.h_cycles < 1:
+            raise ValueError("TRM h_cycles must be at least 1")
+        if trm.l_cycles < 1:
+            raise ValueError("TRM l_cycles must be at least 1")
+        if trm.l_layers < 1:
+            raise ValueError("TRM l_layers must be at least 1")
         if not trm.no_act_continue:
             raise ValueError("TRM no_act_continue=False is not implemented; current halt head matches official no_ACT_continue=True")
         if trm.mlp_ratio < 1:
@@ -289,7 +289,7 @@ class TinyRecursiveModel(nnx.Module):
         self.blocks = nnx.List(
             [
                 TRMBlock(config, self.total_seq_len, self.prefix_len, dtype, rngs=rngs)
-                for _ in range(trm.block_layers)
+                for _ in range(trm.l_layers)
             ]
         )
         self.lm_head = nnx.Linear(
@@ -431,19 +431,19 @@ class TinyRecursiveModel(nnx.Module):
             )
         return hidden_states
 
-    def _deep_step(self, y_state: Array, z_state: Array, input_embeddings: Array) -> tuple[Array, Array]:
-        for _ in range(self.trm.latent_recursion):
+    def _h_cycle_step(self, y_state: Array, z_state: Array, input_embeddings: Array) -> tuple[Array, Array]:
+        for _ in range(self.trm.l_cycles):
             z_state = self._recurrent_level(z_state, y_state + input_embeddings)
         return self._recurrent_level(y_state, z_state), z_state
 
     def _act_step(self, state: State, input_embeddings: Array) -> State:
         y_state = state["y"]
         z_state = state["z"]
-        for _ in range(self.trm.deep_recursion - 1):
-            y_state, z_state = self._deep_step(y_state, z_state, input_embeddings)
+        for _ in range(self.trm.h_cycles - 1):
+            y_state, z_state = self._h_cycle_step(y_state, z_state, input_embeddings)
             y_state = jax.lax.stop_gradient(y_state)
             z_state = jax.lax.stop_gradient(z_state)
-        y_state, z_state = self._deep_step(y_state, z_state, input_embeddings)
+        y_state, z_state = self._h_cycle_step(y_state, z_state, input_embeddings)
         return {"y": y_state, "z": z_state}
 
     def _blank_mean(self, values: Array, condition_mask: Array) -> Array:

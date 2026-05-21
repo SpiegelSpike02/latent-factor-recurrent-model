@@ -15,8 +15,11 @@ dropout_rate = 0.0
 loss_type = "stablemax"
 
 [model.brc]
-recurrent_steps = 16
-block_layers = 1
+belief_steps = 8
+h_cycles = 4
+l_cycles = 2
+hidden_state_dim = 256
+l_layers = 1
 num_heads = 8
 mlp_ratio = 4
 position_encoding = "rope"
@@ -64,5 +67,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "arc1-brc-canvas-belief-rope-b768"
+name = "arc1-brc-belief-dualtime-b768"
 mode = "online"

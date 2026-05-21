@@ -102,8 +102,8 @@ class UnifiedReasoningModel(nnx.Module):
         if config.grid_height * config.grid_width != config.seq_len:
             raise ValueError("grid_height * grid_width must equal seq_len")
         urm = config.urm_config
-        if min(urm.recurrent_steps, urm.deep_recursion, urm.latent_recursion, urm.block_layers) < 1:
-            raise ValueError("URM recurrent/deep/latent/block counts must be positive")
+        if min(urm.recurrent_steps, urm.h_cycles, urm.l_cycles, urm.l_layers) < 1:
+            raise ValueError("URM recurrent_steps, h_cycles, l_cycles, and l_layers must be positive")
         if urm.num_heads < 1 or config.d_model % urm.num_heads != 0:
             raise ValueError("URM d_model must be divisible by num_heads")
         if urm.mlp_ratio < 1:
@@ -142,7 +142,7 @@ class UnifiedReasoningModel(nnx.Module):
                 rngs=rngs,
             )
 
-        self.blocks = nnx.List([URMBlock(config, self.dtype, rngs=rngs) for _ in range(urm.block_layers)])
+        self.blocks = nnx.List([URMBlock(config, self.dtype, rngs=rngs) for _ in range(urm.l_layers)])
         self.output_head = nnx.Linear(
             config.d_model,
             config.vocab_size,
@@ -206,12 +206,12 @@ class UnifiedReasoningModel(nnx.Module):
 
     def _inner_update(self, hidden: Array, input_embeddings: Array, *, train: bool, dropout_key: Array) -> Array:
         def latent_update(h: Array) -> Array:
-            for _ in range(self.urm.latent_recursion):
+            for _ in range(self.urm.l_cycles):
                 h = self._run_layers(h, input_embeddings)
             return h
 
         h = hidden
-        for _ in range(self.urm.deep_recursion - 1):
+        for _ in range(self.urm.h_cycles - 1):
             h = jax.lax.stop_gradient(latent_update(h))
 
         h = latent_update(h)

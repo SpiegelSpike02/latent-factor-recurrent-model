@@ -11,9 +11,9 @@ class TaskConfig:
 
 @dataclass(frozen=True)
 class TRMConfig:
-    deep_recursion: int = 3
-    latent_recursion: int = 6
-    block_layers: int = 2
+    h_cycles: int = 3
+    l_cycles: int = 6
+    l_layers: int = 2
     num_heads: int = 8
     mlp_ratio: int = 4
     mlp_t: bool = False
@@ -31,8 +31,11 @@ class TRMConfig:
 
 @dataclass(frozen=True)
 class BRCConfig:
-    recurrent_steps: int = 6
-    block_layers: int = 1
+    belief_steps: int = 6
+    h_cycles: int = 1
+    l_cycles: int = 2
+    l_layers: int = 1
+    hidden_state_dim: int = 0
     num_heads: int = 4
     mlp_ratio: int = 2
     position_encoding: str = "rope"
@@ -51,9 +54,9 @@ class BRCConfig:
 @dataclass(frozen=True)
 class URMConfig:
     recurrent_steps: int = 16
-    deep_recursion: int = 2
-    latent_recursion: int = 6
-    block_layers: int = 4
+    h_cycles: int = 2
+    l_cycles: int = 6
+    l_layers: int = 4
     num_heads: int = 8
     mlp_ratio: int = 4
     conv_kernel: int = 2
