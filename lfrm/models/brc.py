@@ -244,6 +244,8 @@ class BRCModel(nnx.Module):
         return jnp.asarray(indices, dtype=jnp.int32)
 
     def context_mask(self, tokens: Array) -> Array:
+        if self.config.task_type == "sudoku":
+            return tokens > 1
         return tokens != 0
 
     def draft_from_tokens(self, tokens: Array) -> Array:
