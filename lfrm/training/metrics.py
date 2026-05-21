@@ -211,6 +211,10 @@ BRC_CONSOLE_GROUPS = (
         "dynamics",
         (
             "diffusion_filled_ratio",
+            "halt_loss",
+            "selected_step",
+            "selected_accuracy",
+            "selected_exact_accuracy",
         ),
     ),
     (

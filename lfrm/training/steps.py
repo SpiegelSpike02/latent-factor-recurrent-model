@@ -211,8 +211,8 @@ def _refine_belief_step(
     *,
     train: bool,
     dropout_key: jax.Array | None,
-) -> tuple[jax.Array, jax.Array]:
-    next_belief, next_hidden = model._belief_step(
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    next_belief, next_hidden, halt_logits = model._belief_step(
         inputs,
         belief_logits,
         hidden_state,
@@ -222,7 +222,7 @@ def _refine_belief_step(
         train=train,
         dropout_key=dropout_key,
     )
-    return next_belief, next_hidden
+    return next_belief, next_hidden, halt_logits
 
 
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
@@ -249,12 +249,23 @@ def _brc_compact_training_rollout(
     query_normalizer = jnp.maximum(jnp.sum(query_mask), 1.0)
     loss_mask_f32 = loss_mask.astype(jnp.float32)
     loss_normalizer = jnp.maximum(jnp.sum(loss_mask_f32), 1.0)
+    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask_f32, axis=-1), 1.0)
+    supervised_cells_per_example = jnp.sum(loss_mask_f32, axis=-1)
     candidate_init = jnp.zeros_like(inputs)
     early_index = jnp.asarray(0, dtype=jnp.int32)
     mid_index = jnp.asarray(model.belief_steps // 2, dtype=jnp.int32)
 
     def scan_step(carry, scan_inputs):
-        belief_logits, hidden_state, early_candidate, mid_candidate, trajectory_noise_count = carry
+        (
+            belief_logits,
+            hidden_state,
+            early_candidate,
+            mid_candidate,
+            selected_candidate,
+            selected_step,
+            has_selected,
+            trajectory_noise_count,
+        ) = carry
         step_index, step_dropout_key, noise_key, active_key, time_embedding = scan_inputs
         if trajectory_noise:
             noisy_belief, _noise_mode = _mix_training_belief(
@@ -271,7 +282,7 @@ def _brc_compact_training_rollout(
             trajectory_noise_count = trajectory_noise_count + jnp.mean(noise_active.astype(jnp.float32))
         else:
             refine_input_belief = belief_logits
-        next_belief, next_hidden = _refine_belief_step(
+        next_belief, next_hidden, halt_logits = _refine_belief_step(
             model,
             inputs,
             refine_input_belief,
@@ -288,6 +299,18 @@ def _brc_compact_training_rollout(
         predictions = jnp.argmax(logits, axis=-1).astype(jnp.int32)
         early_candidate = jnp.where(step_index == early_index, predictions, early_candidate)
         mid_candidate = jnp.where(step_index == mid_index, predictions, mid_candidate)
+        step_correct = (predictions == targets).astype(jnp.float32) * loss_mask_f32
+        step_exact = jnp.where(
+            supervised_cells_per_example > 0,
+            jnp.sum(step_correct, axis=-1) == supervised_cells_per_example,
+            True,
+        )
+        step_halted = halt_logits > 0.0
+        step_halted = jnp.where(step_index == model.belief_steps - 1, True, step_halted)
+        take_selected = step_halted & (~has_selected)
+        selected_candidate = jnp.where(take_selected[:, None], predictions, selected_candidate)
+        selected_step = jnp.where(take_selected, step_index, selected_step)
+        has_selected = has_selected | take_selected
 
         belief_probs = jax.nn.softmax(next_belief, axis=-1)
         confidence = jnp.max(belief_probs, axis=-1)
@@ -297,18 +320,40 @@ def _brc_compact_training_rollout(
                 refine_input_belief,
                 next_belief,
             )
-            return (jax.lax.stop_gradient(next_belief), next_hidden, early_candidate, mid_candidate, trajectory_noise_count), (
+            return (
+                jax.lax.stop_gradient(next_belief),
+                next_hidden,
+                early_candidate,
+                mid_candidate,
+                selected_candidate,
+                selected_step,
+                has_selected,
+                trajectory_noise_count,
+            ), (
                 per_step_loss,
                 filled_ratio,
+                halt_logits,
+                step_exact.astype(jnp.float32),
                 energy,
                 kl_delta,
                 entropy,
                 mean_confidence,
                 update_norm,
             )
-        return (jax.lax.stop_gradient(next_belief), next_hidden, early_candidate, mid_candidate, trajectory_noise_count), (
+        return (
+            jax.lax.stop_gradient(next_belief),
+            next_hidden,
+            early_candidate,
+            mid_candidate,
+            selected_candidate,
+            selected_step,
+            has_selected,
+            trajectory_noise_count,
+        ), (
             per_step_loss,
             filled_ratio,
+            halt_logits,
+            step_exact.astype(jnp.float32),
         )
 
     step_indices = jnp.arange(model.belief_steps, dtype=jnp.int32)
@@ -330,9 +375,21 @@ def _brc_compact_training_rollout(
         initial_hidden,
         candidate_init,
         candidate_init,
+        candidate_init,
+        jnp.full((inputs.shape[0],), model.belief_steps - 1, dtype=jnp.int32),
+        jnp.zeros((inputs.shape[0],), dtype=bool),
         jnp.asarray(0.0, dtype=jnp.float32),
     )
-    (belief_final, _hidden_final, early_candidate, mid_candidate, trajectory_noise_count), scan_outputs = jax.lax.scan(
+    (
+        belief_final,
+        _hidden_final,
+        early_candidate,
+        mid_candidate,
+        selected_candidate,
+        selected_step,
+        _has_selected,
+        trajectory_noise_count,
+    ), scan_outputs = jax.lax.scan(
         scan_step,
         initial_carry,
         (step_indices, step_dropout_keys, step_noise_keys, step_active_keys, time_embeddings),
@@ -341,6 +398,8 @@ def _brc_compact_training_rollout(
         (
             per_step_loss,
             filled_ratio,
+            halt_logits,
+            per_step_exact,
             energy,
             kl_delta,
             entropy,
@@ -348,7 +407,7 @@ def _brc_compact_training_rollout(
             update_norm,
         ) = scan_outputs
     else:
-        per_step_loss, filled_ratio = scan_outputs
+        per_step_loss, filled_ratio, halt_logits, per_step_exact = scan_outputs
     final_step = jnp.asarray(model.belief_steps - 1, dtype=jnp.int32)
     final_logits = model._belief_to_token_logits(belief_final, inputs, final_step)
     final_candidate = jnp.argmax(final_logits, axis=-1).astype(jnp.int32)
@@ -361,6 +420,10 @@ def _brc_compact_training_rollout(
         "early_candidate": early_candidate,
         "mid_candidate": mid_candidate,
         "final_candidate": final_candidate,
+        "halt_logits": halt_logits,
+        "per_step_exact": per_step_exact,
+        "selected_candidate": selected_candidate,
+        "selected_step": selected_step,
     }
     if model._compute_fixed_point_metrics():
         diagnostics.update(
@@ -393,6 +456,7 @@ def brc_loss_and_metrics(
     batch: dict[str, jax.Array],
     train: bool,
     dropout_key: jax.Array | None,
+    halt_loss_weight: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     if dropout_key is None:
         dropout_key = jax.random.key(0)
@@ -467,6 +531,23 @@ def brc_loss_and_metrics(
         token_loss = token_cross_entropy(model, step_logits, step_targets)
         per_step_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=(1, 2)) / normalizer
         final_logits = step_logits[-1]
+        step_predictions = jnp.argmax(step_logits, axis=-1)
+        step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask.astype(jnp.float32)
+        supervised_cells_per_example_for_steps = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
+        diagnostics["per_step_exact"] = jnp.where(
+            supervised_cells_per_example_for_steps[None, :] > 0,
+            jnp.sum(step_correct, axis=-1) == supervised_cells_per_example_for_steps[None, :],
+            True,
+        ).astype(jnp.float32)
+        selected_step = _trm_selected_step(diagnostics["halt_logits"])
+        gather_index = selected_step[None, :, None, None]
+        selected_logits = jnp.take_along_axis(
+            step_logits,
+            jnp.broadcast_to(gather_index, (1, inputs.shape[0], step_logits.shape[2], step_logits.shape[3])),
+            axis=0,
+        ).squeeze(0)
+        diagnostics["selected_candidate"] = jnp.argmax(selected_logits, axis=-1).astype(jnp.int32)
+        diagnostics["selected_step"] = selected_step
     step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
     step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
     solution_loss = per_step_loss[-1]
@@ -475,7 +556,15 @@ def brc_loss_and_metrics(
         if model._compute_fixed_point_metrics()
         else zero
     )
-    loss = step_ce_loss + fixed_point_loss
+    halt_loss = zero
+    if halt_loss_weight != 0.0:
+        halt_targets = jax.lax.stop_gradient(diagnostics["per_step_exact"])
+        halt_loss_per_example = optax.sigmoid_binary_cross_entropy(diagnostics["halt_logits"], halt_targets)
+        halt_loss = jnp.sum(halt_loss_per_example * example_mask[None, :]) / jnp.maximum(
+            jnp.sum(example_mask) * diagnostics["halt_logits"].shape[0],
+            1.0,
+        )
+    loss = step_ce_loss + fixed_point_loss + halt_loss_weight * halt_loss
 
     predictions = jnp.argmax(final_logits, axis=-1)
     metric_correct = (predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
@@ -503,6 +592,16 @@ def brc_loss_and_metrics(
         per_step_example_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=-1) / per_example_normalizer[None, :]
         oracle_step = _masked_example_mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32), example_mask)
     context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
+    selected_predictions = diagnostics.get("selected_candidate", predictions)
+    selected_correct = (selected_predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
+    selected_accuracy = jnp.sum(selected_correct) / metric_normalizer
+    selected_correct_per_example = jnp.sum(selected_correct, axis=-1)
+    selected_exact_examples = jnp.where(
+        supervised_cells_per_example > 0,
+        selected_correct_per_example == supervised_cells_per_example,
+        True,
+    )
+    selected_exact_accuracy = _masked_example_mean(selected_exact_examples.astype(jnp.float32), example_mask)
 
     metrics = {
         "loss": loss,
@@ -536,6 +635,22 @@ def brc_loss_and_metrics(
         )
     if train and brc.denoise_trajectory_prob > 0.0:
         metrics["trajectory_noise_rate"] = diagnostics["trajectory_noise_rate"]
+    if halt_loss_weight != 0.0:
+        metrics.update(
+            {
+                "halt_loss": halt_loss,
+                "selected_accuracy": selected_accuracy,
+                "selected_exact_accuracy": selected_exact_accuracy,
+                "selected_step": _masked_example_mean(
+                    diagnostics["selected_step"].astype(jnp.float32) + 1.0,
+                    example_mask,
+                ),
+                "per_step_halt_probability": (
+                    jnp.sum(jax.nn.sigmoid(diagnostics["halt_logits"]) * example_mask[None, :], axis=1)
+                    / jnp.maximum(jnp.sum(example_mask), 1.0)
+                ),
+            }
+        )
     if model._compute_fixed_point_metrics():
         metrics.update(
             {
@@ -561,12 +676,13 @@ def loss_and_metrics(
     terminal_residual_weight: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     if isinstance(model, BRCModel):
-        del halt_loss_weight, terminal_residual_weight
+        del terminal_residual_weight
         return brc_loss_and_metrics(
             model,
             batch,
             train,
             dropout_key,
+            halt_loss_weight,
         )
 
     inputs = batch["inputs"]
