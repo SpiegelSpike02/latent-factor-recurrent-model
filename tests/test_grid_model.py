@@ -288,6 +288,7 @@ class GridModelTests(unittest.TestCase):
         solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
         tokens = jnp.asarray([[int(ch) + 1 for ch in puzzle]], dtype=jnp.int32)
         labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
+        self.assertTrue(bool(jnp.all(model.context_mask(tokens) == (tokens > 1))))
         logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
         final_only_logits, final_only_diagnostics = model.run_diffusion(
             tokens,

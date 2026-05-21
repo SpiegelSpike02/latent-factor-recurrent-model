@@ -338,6 +338,8 @@ class BRCModel(nnx.Module):
         return jnp.asarray(indices, dtype=jnp.int32)
 
     def context_mask(self, tokens: Array) -> Array:
+        if self.config.task_type == "sudoku":
+            return tokens > 1
         return tokens != 0
 
     def _normalize_belief_logits(self, belief_logits: Array, tokens: Array) -> Array:

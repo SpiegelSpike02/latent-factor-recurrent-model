@@ -136,7 +136,7 @@ def _sudoku_board_metrics(
     predictions: jax.Array,
     inputs: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    context_mask = inputs != 0
+    context_mask = inputs > 1 if model.config.task_type == "sudoku" else inputs != 0
     context_f32 = context_mask.astype(jnp.float32)
     context_consistency = (
         jnp.sum(((predictions == inputs) & context_mask).astype(jnp.float32))
