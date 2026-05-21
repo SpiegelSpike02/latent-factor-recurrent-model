@@ -22,6 +22,7 @@ mlp_ratio = 4
 position_encoding = "rope"
 rms_norm_eps = 1e-5
 rope_theta = 10000.0
+step_loss_schedule = "uniform"
 denoise_initial_prob = 0.4
 denoise_trajectory_prob = 0.0
 denoise_teacher_reveal_prob = 0.25
@@ -36,7 +37,6 @@ beta2 = 0.95
 weight_decay = 0.1
 lr_warmup_steps = 2000
 grad_clip_norm = 1.0
-flatten_optimizer = true
 
 [train]
 batch_size = 768

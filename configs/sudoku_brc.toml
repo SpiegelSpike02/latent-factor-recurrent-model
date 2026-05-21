@@ -20,14 +20,7 @@ mlp_ratio = 4
 position_encoding = "rope"
 rms_norm_eps = 1e-5
 rope_theta = 10000.0
-# Relative CE weights for recurrent steps 1..24. The training code normalizes
-# this vector, so the values control schedule shape rather than total scale.
-step_loss_weights = [
-  1, 2, 3, 4, 5, 6,
-  7, 8, 9, 10, 11, 12,
-  13, 14, 15, 16, 17, 18,
-  19, 20, 21, 22, 23, 24,
-]
+step_loss_schedule = "uniform"
 denoise_initial_prob = 0.0
 denoise_trajectory_prob = 0.0
 denoise_teacher_reveal_prob = 0.25
@@ -44,7 +37,6 @@ beta2 = 0.95
 weight_decay = 0.1
 lr_warmup_steps = 3000
 grad_clip_norm = 1.0
-flatten_optimizer = true
 
 [train]
 batch_size = 768

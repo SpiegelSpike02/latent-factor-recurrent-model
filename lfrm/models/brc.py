@@ -95,13 +95,8 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC position_encoding must be 'rope', 'learned', or 'none'")
         if brc.position_encoding == "rope" and (config.d_model // brc.num_heads) % 2 != 0:
             raise ValueError("BRC RoPE head dimension must be even")
-        if brc.step_loss_weights is not None:
-            if len(brc.step_loss_weights) != brc.recurrent_steps:
-                raise ValueError("BRC step_loss_weights length must equal recurrent_steps")
-            if any(weight < 0.0 for weight in brc.step_loss_weights):
-                raise ValueError("BRC step_loss_weights must be non-negative")
-            if sum(brc.step_loss_weights) <= 0.0:
-                raise ValueError("BRC step_loss_weights must contain a positive weight")
+        if brc.step_loss_schedule not in ("uniform", "linear"):
+            raise ValueError("BRC step_loss_schedule must be 'uniform' or 'linear'")
         if not 0.0 <= brc.denoise_initial_prob <= 1.0:
             raise ValueError("BRC denoise_initial_prob must be in [0, 1]")
         if not 0.0 <= brc.denoise_trajectory_prob <= 1.0:
@@ -360,7 +355,6 @@ class BRCModel(nnx.Module):
         return scratch, alpha, {
             "step_gate_mean": jnp.mean(alpha),
             "step_gate_std": jnp.std(alpha),
-            "scratch_norm": jnp.mean(jnp.linalg.norm(scratch.astype(jnp.float32), axis=-1)),
         }
 
     def context_memory(
@@ -419,9 +413,6 @@ class BRCModel(nnx.Module):
             if return_final_only:
                 return next_carry, None
             logits = self._belief_to_token_logits(next_belief, tokens, step_index)
-            scratch_norm = jnp.sum(
-                jnp.linalg.norm(scratch.astype(jnp.float32), axis=-1) * query_mask
-            ) / query_normalizer
             belief_probs = jax.nn.softmax(next_belief, axis=-1)
             confidence = jnp.max(belief_probs, axis=-1)
             filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
@@ -440,7 +431,6 @@ class BRCModel(nnx.Module):
             )
             return next_carry, (
                 logits,
-                scratch_norm,
                 filled_ratio,
                 block_diagnostics["step_gate_mean"],
                 block_diagnostics["step_gate_std"],
@@ -489,7 +479,6 @@ class BRCModel(nnx.Module):
             final_step = jnp.asarray(self.recurrent_steps - 1, dtype=jnp.int32)
             logits = self._belief_to_token_logits(belief_final, tokens, final_step)
             diagnostics = {
-                "scratch_norm": jnp.zeros((self.recurrent_steps,), dtype=jnp.float32),
                 "diffusion_filled_ratio": jnp.zeros((self.recurrent_steps,), dtype=jnp.float32),
                 "step_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
                 "step_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
@@ -509,7 +498,6 @@ class BRCModel(nnx.Module):
             return logits, diagnostics
         (
             step_logits,
-            scratch_norm,
             filled_ratio,
             gate_mean,
             gate_std,
@@ -522,7 +510,6 @@ class BRCModel(nnx.Module):
             context_weight_mean,
         ) = scan_outputs
         diagnostics = {
-            "scratch_norm": scratch_norm,
             "diffusion_filled_ratio": filled_ratio,
             "step_gate_mean": jnp.mean(gate_mean),
             "step_gate_std": jnp.mean(gate_std),

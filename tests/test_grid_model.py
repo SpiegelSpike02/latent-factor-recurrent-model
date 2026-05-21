@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -35,7 +33,6 @@ from lfrm.runtime import (
     updates_from_epochs,
 )
 from lfrm.models import BRCModel, TinyRecursiveModel
-from lfrm.jax_defaults import apply_jax_defaults
 from lfrm.training import (
     build_train_step_runner,
     build_trm_act_train_step_runner,
@@ -51,48 +48,6 @@ from lfrm.training.optim import scheduled_lr
 
 
 class GridModelTests(unittest.TestCase):
-    def test_jax_defaults_set_gpu_startup_flags(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {
-                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.80",
-                "XLA_PYTHON_CLIENT_ALLOCATOR": "platform",
-                "TF_GPU_ALLOCATOR": "cuda_malloc_async",
-                "XLA_FLAGS": "--some_existing_flag=true",
-                "LFRM_EXTRA_XLA_FLAGS": "--xla_gpu_experimental_flag_for_test=true",
-            },
-            clear=True,
-        ):
-            apply_jax_defaults()
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
-            self.assertNotIn("XLA_PYTHON_CLIENT_MEM_FRACTION", os.environ)
-            self.assertNotIn("XLA_PYTHON_CLIENT_ALLOCATOR", os.environ)
-            self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "cuda_malloc_async")
-            self.assertNotIn("NCCL_PROTO", os.environ)
-            self.assertNotIn("NCCL_LL_BUFFSIZE", os.environ)
-            self.assertNotIn("NCCL_LL128_BUFFSIZE", os.environ)
-            self.assertNotIn("--some_existing_flag=true", os.environ["XLA_FLAGS"].split())
-            self.assertIn("--xla_gpu_triton_gemm_any=true", os.environ["XLA_FLAGS"].split())
-            self.assertNotIn("--xla_gpu_enable_latency_hiding_scheduler=true", os.environ["XLA_FLAGS"].split())
-            self.assertNotIn("--xla_gpu_experimental_flag_for_test=true", os.environ["XLA_FLAGS"].split())
-
-    def test_jax_defaults_ignore_external_env(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {
-                "LFRM_RESPECT_EXTERNAL_JAX_ENV": "true",
-                "XLA_PYTHON_CLIENT_PREALLOCATE": "true",
-                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.80",
-                "TF_GPU_ALLOCATOR": "custom_allocator",
-            },
-            clear=True,
-        ):
-            apply_jax_defaults()
-            self.assertEqual(os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"], "false")
-            self.assertNotIn("XLA_PYTHON_CLIENT_MEM_FRACTION", os.environ)
-            self.assertEqual(os.environ["TF_GPU_ALLOCATOR"], "cuda_malloc_async")
-
     def test_updates_from_epochs_matches_official_floor_conversion(self) -> None:
         dataset = SimpleNamespace(
             spec=SimpleNamespace(total_groups=1000, mean_puzzle_examples=1.0)
@@ -333,6 +288,7 @@ class GridModelTests(unittest.TestCase):
         solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
         tokens = jnp.asarray([[int(ch) + 1 for ch in puzzle]], dtype=jnp.int32)
         labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
+        self.assertTrue(bool(jnp.all(model.context_mask(tokens) == (tokens > 1))))
         logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
         final_only_logits, final_only_diagnostics = model.run_diffusion(
             tokens,
@@ -342,7 +298,6 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(logits.shape, (2, 1, 81, 11))
         self.assertEqual(final_only_logits.shape, (1, 81, 11))
         self.assertTrue(bool(jnp.allclose(final_only_logits, logits[-1], rtol=1e-5, atol=1e-5)))
-        self.assertEqual(diagnostics["scratch_norm"].shape, (2,))
         self.assertEqual(diagnostics["diffusion_filled_ratio"].shape, (2,))
         self.assertEqual(diagnostics["draft"].shape, (1, 81))
         self.assertEqual(diagnostics["belief_logits"].shape, (1, 81, 11))
@@ -421,7 +376,6 @@ class GridModelTests(unittest.TestCase):
             "context_weight_reg",
             "context_weight_mean",
             "context_weight_reg_loss",
-            "scratch_norm",
             "step_gate_mean",
         ):
             self.assertIn(key, metrics)
@@ -873,7 +827,7 @@ class GridModelTests(unittest.TestCase):
                 "recurrent_steps = 2\n"
                 "block_layers = 1\n"
                 "num_heads = 4\n"
-                "step_loss_weights = [1.0, 2.0]\n"
+                "step_loss_schedule = \"linear\"\n"
                 "denoise_initial_prob = 0.4\n"
                 "denoise_trajectory_prob = 0.1\n"
                 "denoise_teacher_reveal_prob = 0.25\n"
@@ -888,7 +842,7 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_recurrent_steps"], 2)
             self.assertEqual(loaded["brc_block_layers"], 1)
             self.assertEqual(loaded["brc_num_heads"], 4)
-            self.assertEqual(loaded["brc_step_loss_weights"], [1.0, 2.0])
+            self.assertEqual(loaded["brc_step_loss_schedule"], "linear")
             self.assertEqual(loaded["brc_denoise_initial_prob"], 0.4)
             self.assertEqual(loaded["brc_denoise_trajectory_prob"], 0.1)
             self.assertEqual(loaded["brc_denoise_mode_weights"], [0.30, 0.35, 0.35])

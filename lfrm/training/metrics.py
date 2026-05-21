@@ -93,7 +93,6 @@ CORE_SCALAR_METRICS = (
     "invalid_rate",
     "conflicts",
     "diffusion_filled_ratio",
-    "scratch_norm",
     "step_gate_mean",
     "step_gate_std",
     "belief_init_noise_rate",
@@ -212,7 +211,6 @@ BRC_CONSOLE_GROUPS = (
     (
         "dynamics",
         (
-            "scratch_norm",
             "diffusion_filled_ratio",
             "step_gate_mean",
             "step_gate_std",

@@ -204,7 +204,11 @@ def _refine_belief_step(
 
 
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
-    return _normalized_step_loss_weights(model.brc.step_loss_weights, rollout_steps)
+    if model.brc.step_loss_schedule == "linear":
+        weights = jnp.arange(1, rollout_steps + 1, dtype=jnp.float32)
+    else:
+        weights = jnp.ones((rollout_steps,), dtype=jnp.float32)
+    return weights / jnp.maximum(jnp.sum(weights), 1e-6)
 
 
 def _brc_compact_training_rollout(
@@ -238,7 +242,6 @@ def _brc_compact_training_rollout(
                 belief_logits,
                 noise_key,
             )
-            active = targets != 0
             noise_active = (
                 jax.random.uniform(active_key, (inputs.shape[0],)) < model.brc.denoise_trajectory_prob
             )
@@ -246,7 +249,6 @@ def _brc_compact_training_rollout(
             trajectory_noise_count = trajectory_noise_count + jnp.mean(noise_active.astype(jnp.float32))
         else:
             refine_input_belief = belief_logits
-            active = targets != 0
         next_belief, scratch, _alpha, block_diagnostics = _refine_belief_step(
             model,
             inputs,
@@ -264,9 +266,7 @@ def _brc_compact_training_rollout(
         early_candidate = jnp.where(step_index == early_index, predictions, early_candidate)
         mid_candidate = jnp.where(step_index == mid_index, predictions, mid_candidate)
 
-        scratch_norm = jnp.sum(
-            jnp.linalg.norm(scratch.astype(jnp.float32), axis=-1) * query_mask
-        ) / query_normalizer
+        del scratch
         belief_probs = jax.nn.softmax(next_belief, axis=-1)
         confidence = jnp.max(belief_probs, axis=-1)
         filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
@@ -285,7 +285,6 @@ def _brc_compact_training_rollout(
         )
         return (next_belief, early_candidate, mid_candidate, trajectory_noise_count), (
             per_step_loss,
-            scratch_norm,
             filled_ratio,
             block_diagnostics["step_gate_mean"],
             block_diagnostics["step_gate_std"],
@@ -312,7 +311,6 @@ def _brc_compact_training_rollout(
     )
     (
         per_step_loss,
-        scratch_norm,
         filled_ratio,
         gate_mean,
         gate_std,
@@ -328,7 +326,6 @@ def _brc_compact_training_rollout(
     final_logits = model._belief_to_token_logits(belief_final, inputs, final_step)
     final_candidate = jnp.argmax(final_logits, axis=-1).astype(jnp.int32)
     diagnostics = {
-        "scratch_norm": scratch_norm,
         "diffusion_filled_ratio": filled_ratio,
         "step_gate_mean": jnp.mean(gate_mean),
         "step_gate_std": jnp.mean(gate_std),
@@ -491,7 +488,6 @@ def brc_loss_and_metrics(
         "trajectory_noise_rate": diagnostics.get("trajectory_noise_rate", zero),
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_loss_weights,
-        "scratch_norm": jnp.mean(diagnostics["scratch_norm"]),
         "diffusion_filled_ratio": diagnostics["diffusion_filled_ratio"],
         "step_gate_mean": diagnostics["step_gate_mean"],
         "step_gate_std": diagnostics["step_gate_std"],

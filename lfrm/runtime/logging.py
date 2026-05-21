@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
-import os
 
 from lfrm.config import ExperimentConfig
 from lfrm.runtime.checkpoints import wandb_run_id_path
@@ -64,19 +63,6 @@ def upload_wandb_profile(wandb_run, profile_dir: Path, *, step: int) -> None:
         wandb_run.log_artifact(artifact)
     with suppress(Exception):
         wandb_run.save(str(profile_dir / "**" / "*"), base_path=str(profile_dir.parent), policy="now")
-
-
-def jax_env_echo() -> str:
-    return " ; ".join(
-        f"echo {name}={os.environ.get(name, '<unset>')}"
-        for name in (
-            "XLA_PYTHON_CLIENT_PREALLOCATE",
-            "XLA_PYTHON_CLIENT_MEM_FRACTION",
-            "XLA_PYTHON_CLIENT_ALLOCATOR",
-            "TF_GPU_ALLOCATOR",
-            "XLA_FLAGS",
-        )
-    )
 
 
 def finish_wandb(wandb_run: Any) -> None:
