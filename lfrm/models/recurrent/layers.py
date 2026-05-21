@@ -48,24 +48,16 @@ def dot_product_attention(
     """Scaled dot-product attention in JAX's fused-friendly layout.
 
     Inputs and output use the public JAX SDPA layout `(batch, seq, heads,
-    head_dim)`. Attention defaults to cuDNN fused attention because XLA's auto
-    choice can still lower to explicit dot/softmax on some JAX/CUDA stacks. Set
+    head_dim)`. Attention defaults to JAX/XLA auto selection. Set
     `LFRM_ATTENTION_IMPLEMENTATION=auto|cudnn|xla` to override this selection.
     """
     attention_bias = None if bias is None else bias[None, :, :, :].astype(jnp.float32)
-    requested = os.environ.get("LFRM_ATTENTION_IMPLEMENTATION", "cudnn").strip().lower()
-    cudnn_supported = (
-        attention_bias is None
-        and jax.default_backend() == "gpu"
-        and query.dtype in (jnp.float16, jnp.bfloat16)
-        and key.dtype == query.dtype
-        and value.dtype == query.dtype
-    )
+    requested = os.environ.get("LFRM_ATTENTION_IMPLEMENTATION", "auto").strip().lower()
     implementation: str | None
     if requested in ("", "auto", "none"):
-        implementation = "cudnn" if cudnn_supported else None
+        implementation = None
     elif requested in ("cudnn", "xla"):
-        implementation = requested if requested == "xla" or cudnn_supported else None
+        implementation = requested
     else:
         raise ValueError(
             "LFRM_ATTENTION_IMPLEMENTATION must be one of auto, cudnn, or xla; "
