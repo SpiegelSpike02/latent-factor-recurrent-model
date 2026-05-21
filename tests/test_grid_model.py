@@ -265,7 +265,7 @@ class GridModelTests(unittest.TestCase):
         )
         self.assertEqual(logits.shape, (1, 1, 9, 11))
 
-    def test_brc_forward_and_fixed_point_energy_are_finite(self) -> None:
+    def test_brc_forward_is_finite_without_optional_energy(self) -> None:
         model = BRCModel(
             ModelConfig(
                 vocab_size=11,
@@ -311,11 +311,8 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(diagnostics["draft"].shape, (1, 81))
         self.assertEqual(diagnostics["belief_logits"].shape, (1, 81, 11))
         self.assertEqual(final_only_diagnostics["belief_logits"].shape, (1, 81, 11))
-        for key in ("denoise_energy", "belief_kl_delta", "belief_entropy", "belief_update_norm"):
-            self.assertIn(key, diagnostics)
-            self.assertTrue(bool(jnp.isfinite(diagnostics[key])))
-        self.assertEqual(diagnostics["per_step_denoise_energy"].shape, (2,))
-        self.assertEqual(diagnostics["per_step_belief_entropy"].shape, (2,))
+        self.assertNotIn("denoise_energy", diagnostics)
+        self.assertNotIn("per_step_denoise_energy", diagnostics)
     def test_brc_losses_are_finite(self) -> None:
         model = BRCModel(
             ModelConfig(
@@ -375,28 +372,22 @@ class GridModelTests(unittest.TestCase):
             "context_consistency",
             "invalid_rate",
             "conflicts",
-            "belief_init_noise_rate",
-            "trajectory_noise_rate",
-            "belief_init_prior_rate",
-            "belief_init_teacher_rate",
-            "belief_init_self_rate",
-            "denoise_energy",
-            "belief_kl_delta",
-            "belief_entropy",
-            "belief_confidence",
-            "belief_update_norm",
-            "fixed_point_loss",
-            "context_weight_reg",
-            "context_weight_mean",
-            "context_weight_reg_loss",
-            "step_gate_mean",
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
         self.assertEqual(metrics["per_step_loss"].shape, (2,))
         self.assertEqual(metrics["step_loss_weights"].shape, (2,))
-        self.assertEqual(metrics["per_step_denoise_energy"].shape, (2,))
-        self.assertEqual(metrics["per_step_belief_entropy"].shape, (2,))
+        for key in (
+            "belief_init_noise_rate",
+            "trajectory_noise_rate",
+            "belief_init_prior_rate",
+            "belief_init_teacher_rate",
+            "belief_init_self_rate",
+            "fixed_point_loss",
+        ):
+            self.assertNotIn(key, metrics)
+        self.assertNotIn("denoise_energy", metrics)
+        self.assertNotIn("per_step_denoise_energy", metrics)
 
     def test_brc_arc_canvas_belief_loss_is_finite(self) -> None:
         model = BRCModel(
@@ -431,7 +422,7 @@ class GridModelTests(unittest.TestCase):
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
         _, metrics = loss_and_metrics(model, batch, True, jax.random.key(37))
-        for key in ("loss", "lm_loss", "accuracy", "exact_accuracy", "denoise_energy", "belief_kl_delta"):
+        for key in ("loss", "lm_loss", "accuracy", "exact_accuracy"):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
 
@@ -476,7 +467,7 @@ class GridModelTests(unittest.TestCase):
         metrics = train_step(model, optimizer, batch, jax.random.key(35))
         after = model.input_to_hidden.kernel[...]
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
-        self.assertTrue(bool(jnp.isfinite(metrics["denoise_energy"])))
+        self.assertNotIn("denoise_energy", metrics)
         self.assertGreater(float(jnp.sum(jnp.abs(after - before))), 0.0)
 
     def test_trm_breaks_blank_symbol_symmetry(self) -> None:
@@ -844,12 +835,7 @@ class GridModelTests(unittest.TestCase):
                 "l_layers = 1\n"
                 "num_heads = 4\n"
                 "step_loss_schedule = \"linear\"\n"
-                "denoise_initial_prob = 0.4\n"
-                "denoise_trajectory_prob = 0.1\n"
-                "denoise_teacher_reveal_prob = 0.25\n"
-                "denoise_mode_weights = [0.30, 0.35, 0.35]\n"
-                "fixed_point_loss_weight = 0.01\n"
-                "context_weight_reg_weight = 0.001\n",
+                "fixed_point_loss_weight = 0.01\n",
                 encoding="utf-8",
             )
             loaded = load_toml_config(str(config_path))
@@ -862,11 +848,7 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_l_layers"], 1)
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_step_loss_schedule"], "linear")
-            self.assertEqual(loaded["brc_denoise_initial_prob"], 0.4)
-            self.assertEqual(loaded["brc_denoise_trajectory_prob"], 0.1)
-            self.assertEqual(loaded["brc_denoise_mode_weights"], [0.30, 0.35, 0.35])
             self.assertEqual(loaded["brc_fixed_point_loss_weight"], 0.01)
-            self.assertEqual(loaded["brc_context_weight_reg_weight"], 0.001)
 
             eval_config_path = Path(tmpdir) / "eval.toml"
             eval_config_path.write_text(

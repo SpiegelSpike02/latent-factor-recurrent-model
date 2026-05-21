@@ -211,8 +211,8 @@ def _refine_belief_step(
     *,
     train: bool,
     dropout_key: jax.Array | None,
-) -> tuple[jax.Array, jax.Array, jax.Array, dict[str, jax.Array]]:
-    next_belief, next_hidden, alpha, block_diagnostics = model._belief_step(
+) -> tuple[jax.Array, jax.Array]:
+    next_belief, next_hidden = model._belief_step(
         inputs,
         belief_logits,
         hidden_state,
@@ -222,7 +222,7 @@ def _refine_belief_step(
         train=train,
         dropout_key=dropout_key,
     )
-    return next_belief, next_hidden, alpha, block_diagnostics
+    return next_belief, next_hidden
 
 
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
@@ -271,7 +271,7 @@ def _brc_compact_training_rollout(
             trajectory_noise_count = trajectory_noise_count + jnp.mean(noise_active.astype(jnp.float32))
         else:
             refine_input_belief = belief_logits
-        next_belief, next_hidden, _alpha, block_diagnostics = _refine_belief_step(
+        next_belief, next_hidden = _refine_belief_step(
             model,
             inputs,
             refine_input_belief,
@@ -292,31 +292,23 @@ def _brc_compact_training_rollout(
         belief_probs = jax.nn.softmax(next_belief, axis=-1)
         confidence = jnp.max(belief_probs, axis=-1)
         filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
-        (
-            energy,
-            kl_delta,
-            entropy,
-            mean_confidence,
-            update_norm,
-            context_weight_reg,
-            context_weight_mean,
-        ) = model._fixed_point_stats(
-            refine_input_belief,
-            next_belief,
-            base_embeddings,
-        )
+        if model._compute_fixed_point_metrics():
+            energy, kl_delta, entropy, mean_confidence, update_norm = model._fixed_point_stats(
+                refine_input_belief,
+                next_belief,
+            )
+            return (jax.lax.stop_gradient(next_belief), next_hidden, early_candidate, mid_candidate, trajectory_noise_count), (
+                per_step_loss,
+                filled_ratio,
+                energy,
+                kl_delta,
+                entropy,
+                mean_confidence,
+                update_norm,
+            )
         return (jax.lax.stop_gradient(next_belief), next_hidden, early_candidate, mid_candidate, trajectory_noise_count), (
             per_step_loss,
             filled_ratio,
-            block_diagnostics["step_gate_mean"],
-            block_diagnostics["step_gate_std"],
-            energy,
-            kl_delta,
-            entropy,
-            mean_confidence,
-            update_norm,
-            context_weight_reg,
-            context_weight_mean,
         )
 
     step_indices = jnp.arange(model.belief_steps, dtype=jnp.int32)
@@ -345,36 +337,24 @@ def _brc_compact_training_rollout(
         initial_carry,
         (step_indices, step_dropout_keys, step_noise_keys, step_active_keys, time_embeddings),
     )
-    (
-        per_step_loss,
-        filled_ratio,
-        gate_mean,
-        gate_std,
-        energy,
-        kl_delta,
-        entropy,
-        confidence,
-        update_norm,
-        context_weight_reg,
-        context_weight_mean,
-    ) = scan_outputs
+    if model._compute_fixed_point_metrics():
+        (
+            per_step_loss,
+            filled_ratio,
+            energy,
+            kl_delta,
+            entropy,
+            confidence,
+            update_norm,
+        ) = scan_outputs
+    else:
+        per_step_loss, filled_ratio = scan_outputs
     final_step = jnp.asarray(model.belief_steps - 1, dtype=jnp.int32)
     final_logits = model._belief_to_token_logits(belief_final, inputs, final_step)
     final_candidate = jnp.argmax(final_logits, axis=-1).astype(jnp.int32)
     diagnostics = {
         "diffusion_filled_ratio": filled_ratio,
-        "step_gate_mean": jnp.mean(gate_mean),
-        "step_gate_std": jnp.mean(gate_std),
-        "denoise_energy": jnp.mean(energy),
-        "belief_kl_delta": jnp.mean(kl_delta),
-        "belief_entropy": jnp.mean(entropy),
-        "belief_confidence": jnp.mean(confidence),
-        "belief_update_norm": jnp.mean(update_norm),
-        "context_weight_reg": jnp.mean(context_weight_reg),
-        "context_weight_mean": jnp.mean(context_weight_mean),
         "trajectory_noise_rate": trajectory_noise_count / jnp.asarray(model.belief_steps, dtype=jnp.float32),
-        "per_step_denoise_energy": energy,
-        "per_step_belief_entropy": entropy,
         "unroll_steps": jnp.asarray(model.belief_steps, dtype=jnp.float32),
         "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32),
         "belief_logits": belief_final,
@@ -382,6 +362,18 @@ def _brc_compact_training_rollout(
         "mid_candidate": mid_candidate,
         "final_candidate": final_candidate,
     }
+    if model._compute_fixed_point_metrics():
+        diagnostics.update(
+            {
+                "denoise_energy": jnp.mean(energy),
+                "belief_kl_delta": jnp.mean(kl_delta),
+                "belief_entropy": jnp.mean(entropy),
+                "belief_confidence": jnp.mean(confidence),
+                "belief_update_norm": jnp.mean(update_norm),
+                "per_step_denoise_energy": energy,
+                "per_step_belief_entropy": entropy,
+            }
+        )
     return final_logits, per_step_loss, diagnostics
 
 
@@ -478,9 +470,12 @@ def brc_loss_and_metrics(
     step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
     step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
     solution_loss = per_step_loss[-1]
-    fixed_point_loss = brc.fixed_point_loss_weight * diagnostics["denoise_energy"]
-    context_weight_reg_loss = brc.context_weight_reg_weight * diagnostics["context_weight_reg"]
-    loss = step_ce_loss + fixed_point_loss + context_weight_reg_loss
+    fixed_point_loss = (
+        brc.fixed_point_loss_weight * diagnostics["denoise_energy"]
+        if model._compute_fixed_point_metrics()
+        else zero
+    )
+    loss = step_ce_loss + fixed_point_loss
 
     predictions = jnp.argmax(final_logits, axis=-1)
     metric_correct = (predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
@@ -512,8 +507,6 @@ def brc_loss_and_metrics(
     metrics = {
         "loss": loss,
         "lm_loss": step_ce_loss,
-        "fixed_point_loss": fixed_point_loss,
-        "context_weight_reg_loss": context_weight_reg_loss,
         "final_lm_loss": solution_loss,
         "mean_lm_loss": jnp.mean(per_step_loss),
         "final_target_probability": target_probability,
@@ -528,26 +521,34 @@ def brc_loss_and_metrics(
         "context_consistency": context_consistency,
         "invalid_rate": invalid_rate,
         "conflicts": conflicts,
-        "belief_init_noise_rate": belief_init_noise_rate,
-        "belief_init_prior_rate": belief_init_prior_rate,
-        "belief_init_teacher_rate": belief_init_teacher_rate,
-        "belief_init_self_rate": belief_init_self_rate,
-        "trajectory_noise_rate": diagnostics.get("trajectory_noise_rate", zero),
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_loss_weights,
         "diffusion_filled_ratio": diagnostics["diffusion_filled_ratio"],
-        "step_gate_mean": diagnostics["step_gate_mean"],
-        "step_gate_std": diagnostics["step_gate_std"],
-        "denoise_energy": diagnostics["denoise_energy"],
-        "belief_kl_delta": diagnostics["belief_kl_delta"],
-        "belief_entropy": diagnostics["belief_entropy"],
-        "belief_confidence": diagnostics["belief_confidence"],
-        "belief_update_norm": diagnostics["belief_update_norm"],
-        "context_weight_reg": diagnostics["context_weight_reg"],
-        "context_weight_mean": diagnostics["context_weight_mean"],
-        "per_step_denoise_energy": diagnostics["per_step_denoise_energy"],
-        "per_step_belief_entropy": diagnostics["per_step_belief_entropy"],
     }
+    if train and brc.denoise_initial_prob > 0.0:
+        metrics.update(
+            {
+                "belief_init_noise_rate": belief_init_noise_rate,
+                "belief_init_prior_rate": belief_init_prior_rate,
+                "belief_init_teacher_rate": belief_init_teacher_rate,
+                "belief_init_self_rate": belief_init_self_rate,
+            }
+        )
+    if train and brc.denoise_trajectory_prob > 0.0:
+        metrics["trajectory_noise_rate"] = diagnostics["trajectory_noise_rate"]
+    if model._compute_fixed_point_metrics():
+        metrics.update(
+            {
+                "fixed_point_loss": fixed_point_loss,
+                "denoise_energy": diagnostics["denoise_energy"],
+                "belief_kl_delta": diagnostics["belief_kl_delta"],
+                "belief_entropy": diagnostics["belief_entropy"],
+                "belief_confidence": diagnostics["belief_confidence"],
+                "belief_update_norm": diagnostics["belief_update_norm"],
+                "per_step_denoise_energy": diagnostics["per_step_denoise_energy"],
+                "per_step_belief_entropy": diagnostics["per_step_belief_entropy"],
+            }
+        )
     return loss, metrics
 
 

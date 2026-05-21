@@ -172,8 +172,8 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC denoise_mode_weights must contain a positive weight")
         if brc.fixed_point_entropy_weight < 0.0:
             raise ValueError("BRC fixed_point_entropy_weight must be non-negative")
-        if min(brc.fixed_point_loss_weight, brc.context_weight_reg_weight) < 0.0:
-            raise ValueError("BRC fixed-point loss weights must be non-negative")
+        if brc.fixed_point_loss_weight < 0.0:
+            raise ValueError("BRC fixed_point_loss_weight must be non-negative")
 
         self.config = config
         self.runtime = runtime
@@ -249,32 +249,6 @@ class BRCModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.readout_gate = nnx.Linear(
-            self.hidden_dim * 4,
-            self.hidden_dim,
-            dtype=self.dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            bias_init=nnx.initializers.constant(-1.0),
-            rngs=rngs,
-        )
-        readout_mlp_dim = max(self.hidden_dim, brc.mlp_ratio * self.hidden_dim)
-        self.readout_fuse_in = nnx.Linear(
-            self.hidden_dim * 4,
-            readout_mlp_dim,
-            dtype=self.dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.readout_fuse_out = nnx.Linear(
-            readout_mlp_dim,
-            self.hidden_dim,
-            dtype=self.dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
         self.solver_blocks = nnx.List(
             [
                 BRCSolverBlock(
@@ -296,25 +270,6 @@ class BRCModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.step_gate = nnx.Linear(
-            self.hidden_dim,
-            1,
-            dtype=self.dtype,
-            param_dtype=jnp.float32,
-            kernel_init=nnx.initializers.zeros,
-            bias_init=nnx.initializers.zeros,
-            rngs=rngs,
-        )
-        self.energy_context_gate = nnx.Linear(
-            config.d_model,
-            1,
-            dtype=self.dtype,
-            param_dtype=jnp.float32,
-            kernel_init=nnx.initializers.zeros,
-            bias_init=nnx.initializers.zeros,
-            rngs=rngs,
-        )
-
     @staticmethod
     def _box_shape(grid_height: int, grid_width: int) -> tuple[int, int]:
         box_height = int(math.sqrt(grid_height))
@@ -398,18 +353,20 @@ class BRCModel(nnx.Module):
         del step_index
         return self._normalize_belief_logits(belief_logits, tokens)
 
-    def _belief_update(self, tokens: Array, belief_logits: Array, delta_logits: Array, alpha: Array, step_index: Array) -> Array:
+    def _belief_update(self, tokens: Array, belief_logits: Array, delta_logits: Array, step_index: Array) -> Array:
         del step_index
         delta = delta_logits.astype(jnp.float32)
-        next_belief = belief_logits.astype(jnp.float32) + alpha.astype(jnp.float32) * delta
+        next_belief = belief_logits.astype(jnp.float32) + delta
         return self._normalize_belief_logits(next_belief, tokens)
+
+    def _compute_fixed_point_metrics(self) -> bool:
+        return self.brc.fixed_point_loss_weight > 0.0
 
     def _fixed_point_stats(
         self,
         belief_logits: Array,
         next_belief: Array,
-        context_features: Array,
-    ) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+    ) -> tuple[Array, Array, Array, Array, Array]:
         prev_log_probs = jax.nn.log_softmax(belief_logits.astype(jnp.float32), axis=-1)
         next_log_probs = jax.nn.log_softmax(next_belief.astype(jnp.float32), axis=-1)
         prev_probs = jax.lax.stop_gradient(jnp.exp(prev_log_probs))
@@ -421,14 +378,9 @@ class BRCModel(nnx.Module):
         confidence = jnp.mean(jnp.max(next_probs, axis=-1))
         cell_update_norm = jnp.linalg.norm((next_belief - belief_logits).astype(jnp.float32), axis=-1)
         update_norm = jnp.mean(cell_update_norm)
-        context_weight = 2.0 * jax.nn.sigmoid(
-            self.energy_context_gate(maybe_cast(context_features, self.dtype)).astype(jnp.float32)
-        ).squeeze(-1)
         cell_energy = cell_update_norm + self.brc.fixed_point_entropy_weight * cell_entropy
-        energy = jnp.sum(context_weight * cell_energy) / jnp.maximum(jnp.sum(context_weight), 1.0)
-        context_weight_reg = jnp.mean(jnp.square(context_weight - 1.0))
-        context_weight_mean = jnp.mean(context_weight)
-        return energy, kl_delta, entropy, confidence, update_norm, context_weight_reg, context_weight_mean
+        energy = jnp.mean(cell_energy)
+        return energy, kl_delta, entropy, confidence, update_norm
 
     def _hidden_l_cycle(self, hidden_state: Array, cell_input: Array) -> Array:
         hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
@@ -446,20 +398,7 @@ class BRCModel(nnx.Module):
         hidden = _rms_norm(hidden_state.astype(jnp.float32), self.brc.rms_norm_eps).astype(self.dtype)
         condition = self.readout_condition(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
         condition = _rms_norm(condition.astype(jnp.float32), self.brc.rms_norm_eps).astype(self.dtype)
-        gate_input = jnp.concatenate(
-            (
-                hidden,
-                condition,
-                (hidden.astype(jnp.float32) * condition.astype(jnp.float32)).astype(self.dtype),
-                (hidden.astype(jnp.float32) - condition.astype(jnp.float32)).astype(self.dtype),
-            ),
-            axis=-1,
-        )
-        gate = jax.nn.sigmoid(self.readout_gate(maybe_cast(gate_input, self.dtype)).astype(jnp.float32))
-        update = self.readout_fuse_out(
-            jax.nn.silu(self.readout_fuse_in(maybe_cast(gate_input, self.dtype)))
-        ).astype(jnp.float32)
-        fused = hidden.astype(jnp.float32) + gate * (condition.astype(jnp.float32) + update)
+        fused = hidden.astype(jnp.float32) + condition.astype(jnp.float32)
         return _rms_norm(fused, self.brc.rms_norm_eps).astype(self.dtype)
 
     def _h_cycle_step(
@@ -473,7 +412,7 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None,
-    ) -> tuple[Array, Array, Array, dict[str, Array]]:
+    ) -> tuple[Array, Array]:
         cell_input = self._cell_embeddings(
             tokens,
             belief_logits,
@@ -484,13 +423,9 @@ class BRCModel(nnx.Module):
         )
         hidden = self._hidden_l_cycle(hidden_state, cell_input)
         read_state = self._readout_fuse(hidden, cell_input)
-        alpha = jax.nn.sigmoid(self.step_gate(maybe_cast(read_state, self.dtype)).astype(jnp.float32))
         delta_logits = self.lm_head(maybe_cast(read_state, self.dtype))
-        next_belief = self._belief_update(tokens, belief_logits, delta_logits, alpha, step_index)
-        return next_belief, hidden, alpha, {
-            "step_gate_mean": jnp.mean(alpha),
-            "step_gate_std": jnp.std(alpha),
-        }
+        next_belief = self._belief_update(tokens, belief_logits, delta_logits, step_index)
+        return next_belief, hidden
 
     def _belief_step(
         self,
@@ -503,18 +438,13 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None,
-    ) -> tuple[Array, Array, Array, dict[str, Array]]:
-        alpha = jnp.zeros((*tokens.shape, 1), dtype=jnp.float32)
-        diagnostics = {
-            "step_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
-            "step_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
-        }
+    ) -> tuple[Array, Array]:
         if dropout_key is None:
             h_dropout_keys = jax.random.split(jax.random.key(0), self.h_cycles)
         else:
             h_dropout_keys = jax.random.split(dropout_key, self.h_cycles)
         for h_index in range(self.h_cycles - 1):
-            belief_logits, hidden_state, alpha, diagnostics = self._h_cycle_step(
+            belief_logits, hidden_state = self._h_cycle_step(
                 tokens,
                 belief_logits,
                 hidden_state,
@@ -526,7 +456,7 @@ class BRCModel(nnx.Module):
             )
             belief_logits = jax.lax.stop_gradient(belief_logits)
             hidden_state = jax.lax.stop_gradient(hidden_state)
-        belief_logits, hidden_state, alpha, diagnostics = self._h_cycle_step(
+        belief_logits, hidden_state = self._h_cycle_step(
             tokens,
             belief_logits,
             hidden_state,
@@ -536,7 +466,7 @@ class BRCModel(nnx.Module):
             train=train,
             dropout_key=h_dropout_keys[self.h_cycles - 1],
         )
-        return belief_logits, jax.lax.stop_gradient(hidden_state), alpha, diagnostics
+        return belief_logits, jax.lax.stop_gradient(hidden_state)
 
     def initial_hidden_state(
         self,
@@ -589,7 +519,7 @@ class BRCModel(nnx.Module):
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key, time_embedding = scan_inputs
             belief_logits, hidden_state = carry
-            next_belief, next_hidden, _alpha, block_diagnostics = self._belief_step(
+            next_belief, next_hidden = self._belief_step(
                 tokens,
                 belief_logits,
                 hidden_state,
@@ -606,31 +536,23 @@ class BRCModel(nnx.Module):
             belief_probs = jax.nn.softmax(next_belief, axis=-1)
             confidence = jnp.max(belief_probs, axis=-1)
             filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
-            (
-                energy,
-                kl_delta,
-                entropy,
-                mean_confidence,
-                update_norm,
-                context_weight_reg,
-                context_weight_mean,
-            ) = self._fixed_point_stats(
-                belief_logits,
-                next_belief,
-                base_embeddings,
-            )
+            if self._compute_fixed_point_metrics():
+                energy, kl_delta, entropy, mean_confidence, update_norm = self._fixed_point_stats(
+                    belief_logits,
+                    next_belief,
+                )
+                return next_carry, (
+                    logits,
+                    filled_ratio,
+                    energy,
+                    kl_delta,
+                    entropy,
+                    mean_confidence,
+                    update_norm,
+                )
             return next_carry, (
                 logits,
                 filled_ratio,
-                block_diagnostics["step_gate_mean"],
-                block_diagnostics["step_gate_std"],
-                energy,
-                kl_delta,
-                entropy,
-                mean_confidence,
-                update_norm,
-                context_weight_reg,
-                context_weight_mean,
             )
 
         step_indices = jnp.arange(self.belief_steps, dtype=jnp.int32)
@@ -654,68 +576,60 @@ class BRCModel(nnx.Module):
             (step_indices, step_dropout_keys, time_embeddings),
         )
         belief_final, _hidden_final = final_carry
-        (
-            final_energy,
-            final_kl_delta,
-            final_entropy,
-            final_confidence,
-            final_update_norm,
-            final_context_weight_reg,
-            final_context_weight_mean,
-        ) = self._fixed_point_stats(
-            initial_belief.astype(jnp.float32),
-            belief_final,
-            base_embeddings,
-        )
         if return_final_only:
             final_step = jnp.asarray(self.belief_steps - 1, dtype=jnp.int32)
             logits = self._belief_to_token_logits(belief_final, tokens, final_step)
             diagnostics = {
                 "diffusion_filled_ratio": jnp.zeros((self.belief_steps,), dtype=jnp.float32),
-                "step_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
-                "step_gate_std": jnp.asarray(0.0, dtype=jnp.float32),
-                "denoise_energy": final_energy,
-                "belief_kl_delta": final_kl_delta,
-                "belief_entropy": final_entropy,
-                "belief_confidence": final_confidence,
-                "belief_update_norm": final_update_norm,
-                "context_weight_reg": final_context_weight_reg,
-                "context_weight_mean": final_context_weight_mean,
                 "unroll_steps": jnp.asarray(self.belief_steps, dtype=jnp.float32),
                 "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32),
                 "belief_logits": belief_final,
             }
+            if self._compute_fixed_point_metrics():
+                final_energy, final_kl_delta, final_entropy, final_confidence, final_update_norm = self._fixed_point_stats(
+                    initial_belief.astype(jnp.float32),
+                    belief_final,
+                )
+                diagnostics.update(
+                    {
+                        "denoise_energy": final_energy,
+                        "belief_kl_delta": final_kl_delta,
+                        "belief_entropy": final_entropy,
+                        "belief_confidence": final_confidence,
+                        "belief_update_norm": final_update_norm,
+                    }
+                )
             return logits, diagnostics
-        (
-            step_logits,
-            filled_ratio,
-            gate_mean,
-            gate_std,
-            energy,
-            kl_delta,
-            entropy,
-            confidence,
-            update_norm,
-            context_weight_reg,
-            context_weight_mean,
-        ) = scan_outputs
+        if self._compute_fixed_point_metrics():
+            (
+                step_logits,
+                filled_ratio,
+                energy,
+                kl_delta,
+                entropy,
+                confidence,
+                update_norm,
+            ) = scan_outputs
+        else:
+            step_logits, filled_ratio = scan_outputs
         diagnostics = {
             "diffusion_filled_ratio": filled_ratio,
-            "step_gate_mean": jnp.mean(gate_mean),
-            "step_gate_std": jnp.mean(gate_std),
-            "denoise_energy": jnp.mean(energy),
-            "belief_kl_delta": jnp.mean(kl_delta),
-            "belief_entropy": jnp.mean(entropy),
-            "belief_confidence": jnp.mean(confidence),
-            "belief_update_norm": jnp.mean(update_norm),
-            "context_weight_reg": jnp.mean(context_weight_reg),
-            "context_weight_mean": jnp.mean(context_weight_mean),
-            "per_step_denoise_energy": energy,
-            "per_step_belief_entropy": entropy,
             "unroll_steps": jnp.asarray(self.belief_steps, dtype=jnp.float32),
             "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32),
             "belief_logits": belief_final,
         }
+        if self._compute_fixed_point_metrics():
+            diagnostics.update(
+                {
+                    "denoise_energy": jnp.mean(energy),
+                    "belief_kl_delta": jnp.mean(kl_delta),
+                    "belief_entropy": jnp.mean(entropy),
+                    "belief_confidence": jnp.mean(confidence),
+                    "belief_update_norm": jnp.mean(update_norm),
+                    "per_step_denoise_energy": energy,
+                    "per_step_belief_entropy": entropy,
+                }
+            )
         return step_logits, diagnostics
 
     def forward_all_steps_with_diagnostics(
