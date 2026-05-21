@@ -8,11 +8,42 @@ from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
 from .common import Array, casted_linear_init, compute_dtype, maybe_cast, trunc_normal_init
-from .recurrent.layers import FullAttention, apply_rope, dot_product_attention, rms_norm as _shared_rms_norm
+from .recurrent.layers import apply_rope, dot_product_attention
 
 
-def _rms_norm(x: Array, eps: float = 1e-5) -> Array:
-    return _shared_rms_norm(x, eps)
+def _unscaled_rms_norm(num_features: int, eps: float, dtype: jnp.dtype, rngs: nnx.Rngs) -> nnx.RMSNorm:
+    return nnx.RMSNorm(
+        num_features,
+        epsilon=eps,
+        dtype=dtype,
+        param_dtype=jnp.float32,
+        use_scale=False,
+        rngs=rngs,
+    )
+
+
+def _attention_with_rope(
+    attention: nnx.MultiHeadAttention,
+    query_input: Array,
+    key_input: Array,
+    value_input: Array,
+    *,
+    num_heads: int,
+    head_dim: int,
+    dtype: jnp.dtype,
+    rope_cos: Array | None,
+    rope_sin: Array | None,
+) -> Array:
+    q = attention.query(maybe_cast(query_input, dtype))
+    k = attention.key(maybe_cast(key_input, dtype))
+    v = attention.value(maybe_cast(value_input, dtype))
+    expected_shape = q.shape[:-2] + (num_heads, head_dim)
+    if q.shape[-2:] != expected_shape[-2:] or k.shape[-2:] != expected_shape[-2:] or v.shape[-2:] != expected_shape[-2:]:
+        raise ValueError("BRC attention projection shape does not match configured heads")
+    if rope_cos is not None and rope_sin is not None:
+        q, k = apply_rope(q, k, rope_cos, rope_sin)
+    attended = dot_product_attention(q, k, v)
+    return attention.out(attended)
 
 
 class BRCSolverBlock(nnx.Module):
@@ -29,40 +60,40 @@ class BRCSolverBlock(nnx.Module):
         self.config = config
         self.dtype = dtype
         mlp_hidden_dim = max(hidden_dim, mlp_ratio * hidden_dim)
-        self.attention = FullAttention(
-            hidden_dim,
+        self.self_attention = nnx.MultiHeadAttention(
             num_heads,
-            dtype,
-            name="BRC",
+            in_features=hidden_dim,
+            qkv_features=hidden_dim,
+            out_features=hidden_dim,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            use_bias=False,
+            dropout_rate=0.0,
+            attention_fn=dot_product_attention,
+            kernel_init=casted_linear_init,
+            out_kernel_init=casted_linear_init,
             rngs=rngs,
         )
+        self.self_norm = _unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
+        self.cross_norm = _unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
+        self.film_input_norm = _unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
+        self.film_output_norm = _unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
+        self.message_norm = _unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.cross_q = nnx.Linear(
-            hidden_dim,
-            hidden_dim,
-            use_bias=False,
+        self.cross_attention = nnx.MultiHeadAttention(
+            num_heads,
+            in_features=hidden_dim,
+            qkv_features=hidden_dim,
+            out_features=hidden_dim,
+            in_kv_features=hidden_dim,
             dtype=dtype,
             param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.cross_kv = nnx.Linear(
-            hidden_dim,
-            2 * hidden_dim,
             use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
+            dropout_rate=0.0,
+            attention_fn=dot_product_attention,
             kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.cross_out = nnx.Linear(
-            hidden_dim,
-            hidden_dim,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
+            out_kernel_init=casted_linear_init,
             rngs=rngs,
         )
         self.film = nnx.Linear(
@@ -97,29 +128,40 @@ class BRCSolverBlock(nnx.Module):
         rope_cos: Array | None,
         rope_sin: Array | None,
     ) -> Array:
-        attn = self.attention(h, rope_cos=rope_cos, rope_sin=rope_sin)
-        h = _rms_norm(h.astype(jnp.float32) + attn.astype(jnp.float32), self.config.brc_config.rms_norm_eps).astype(self.dtype)
-        batch_size, seq_len, hidden_dim = h.shape
-        q = self.cross_q(maybe_cast(h, self.dtype))
-        k, v = jnp.split(self.cross_kv(maybe_cast(condition, self.dtype)), 2, axis=-1)
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        if rope_cos is not None and rope_sin is not None:
-            q, k = apply_rope(q, k, rope_cos, rope_sin)
-        cross = dot_product_attention(q, k, v).reshape(batch_size, seq_len, hidden_dim)
-        h = _rms_norm(h.astype(jnp.float32) + self.cross_out(cross).astype(jnp.float32), self.config.brc_config.rms_norm_eps).astype(self.dtype)
+        attn = _attention_with_rope(
+            self.self_attention,
+            h,
+            h,
+            h,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+        )
+        h = self.self_norm(h.astype(jnp.float32) + attn.astype(jnp.float32)).astype(self.dtype)
+        cross = _attention_with_rope(
+            self.cross_attention,
+            h,
+            condition,
+            condition,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+        )
+        h = self.cross_norm(h.astype(jnp.float32) + cross.astype(jnp.float32)).astype(self.dtype)
         pooled_condition = jnp.mean(condition.astype(jnp.float32), axis=1)
         scale, shift = jnp.split(self.film(maybe_cast(pooled_condition, self.dtype)).astype(jnp.float32), 2, axis=-1)
-        h_norm = _rms_norm(h.astype(jnp.float32), self.config.brc_config.rms_norm_eps).astype(jnp.float32)
-        h = _rms_norm(
+        h_norm = self.film_input_norm(h.astype(jnp.float32)).astype(jnp.float32)
+        h = self.film_output_norm(
             h.astype(jnp.float32)
             + h_norm * jnp.tanh(scale)[:, None, :]
-            + shift[:, None, :],
-            self.config.brc_config.rms_norm_eps,
+            + shift[:, None, :]
         ).astype(self.dtype)
         msg = self.msg_out(jax.nn.silu(self.msg_in(maybe_cast(h, self.dtype)))).astype(jnp.float32)
-        return _rms_norm(h.astype(jnp.float32) + msg, self.config.brc_config.rms_norm_eps).astype(self.dtype)
+        return self.message_norm(h.astype(jnp.float32) + msg).astype(self.dtype)
 
 
 class BRCModel(nnx.Module):
@@ -241,6 +283,10 @@ class BRCModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
+        self.hidden_anchor_norm = _unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
+        self.readout_hidden_norm = _unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
+        self.readout_condition_norm = _unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
+        self.readout_output_norm = _unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
         self.readout_condition = nnx.Linear(
             config.d_model,
             self.hidden_dim,
@@ -386,20 +432,17 @@ class BRCModel(nnx.Module):
         hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
         hidden = hidden_state.astype(self.dtype)
         for _ in range(self.l_cycles):
-            hidden = _rms_norm(
-                hidden.astype(jnp.float32) + hidden_input.astype(jnp.float32),
-                self.brc.rms_norm_eps,
-            ).astype(self.dtype)
+            hidden = self.hidden_anchor_norm(hidden.astype(jnp.float32) + hidden_input.astype(jnp.float32)).astype(self.dtype)
             for block in self.solver_blocks:
                 hidden = block(hidden, hidden_input, self.rope_cos, self.rope_sin)
         return hidden
 
     def _readout_fuse(self, hidden_state: Array, cell_input: Array) -> Array:
-        hidden = _rms_norm(hidden_state.astype(jnp.float32), self.brc.rms_norm_eps).astype(self.dtype)
+        hidden = self.readout_hidden_norm(hidden_state.astype(jnp.float32)).astype(self.dtype)
         condition = self.readout_condition(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
-        condition = _rms_norm(condition.astype(jnp.float32), self.brc.rms_norm_eps).astype(self.dtype)
+        condition = self.readout_condition_norm(condition.astype(jnp.float32)).astype(self.dtype)
         fused = hidden.astype(jnp.float32) + condition.astype(jnp.float32)
-        return _rms_norm(fused, self.brc.rms_norm_eps).astype(self.dtype)
+        return self.readout_output_norm(fused).astype(self.dtype)
 
     def _h_cycle_step(
         self,
