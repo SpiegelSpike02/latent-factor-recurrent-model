@@ -309,11 +309,8 @@ class BRCModel(nnx.Module):
         return self.dropout(x, deterministic=not train, rngs=dropout_key).astype(self.dtype)
 
     def _belief_to_token_logits(self, belief_logits: Array, tokens: Array, step_index: Array) -> Array:
-        total_steps = jnp.maximum(jnp.asarray(self.recurrent_steps - 1, dtype=jnp.float32), 1.0)
-        progress = step_index.astype(jnp.float32) / total_steps
-        sharpen = jnp.where(step_index >= jnp.maximum(self.recurrent_steps - 4, 0), 1.0 + 2.0 * progress, 1.0)
-        belief_logits = self._normalize_belief_logits(belief_logits, tokens) * sharpen
-        return belief_logits
+        del step_index
+        return self._normalize_belief_logits(belief_logits, tokens)
 
     def _belief_update(self, tokens: Array, belief_logits: Array, raw_delta: Array, alpha: Array, step_index: Array) -> Array:
         del step_index
@@ -490,7 +487,7 @@ class BRCModel(nnx.Module):
                 "context_weight_reg": final_context_weight_reg,
                 "context_weight_mean": final_context_weight_mean,
                 "unroll_steps": jnp.asarray(self.recurrent_steps, dtype=jnp.float32),
-                "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
+                "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32),
                 "belief_logits": belief_final,
             }
             if return_raw_final_logits:
@@ -523,7 +520,7 @@ class BRCModel(nnx.Module):
             "per_step_denoise_energy": energy,
             "per_step_belief_entropy": entropy,
             "unroll_steps": jnp.asarray(self.recurrent_steps, dtype=jnp.float32),
-            "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
+            "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32),
             "belief_logits": belief_final,
         }
         if return_raw_final_logits:

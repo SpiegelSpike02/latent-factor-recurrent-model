@@ -298,6 +298,15 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(logits.shape, (2, 1, 81, 11))
         self.assertEqual(final_only_logits.shape, (1, 81, 11))
         self.assertTrue(bool(jnp.allclose(final_only_logits, logits[-1], rtol=1e-5, atol=1e-5)))
+        belief = jnp.arange(2 * 81 * 11, dtype=jnp.float32).reshape(2, 81, 11) / 100.0
+        self.assertTrue(
+            bool(
+                jnp.allclose(
+                    model._belief_to_token_logits(belief, tokens, jnp.asarray(0, dtype=jnp.int32)),
+                    model._belief_to_token_logits(belief, tokens, jnp.asarray(1, dtype=jnp.int32)),
+                )
+            )
+        )
         self.assertEqual(diagnostics["diffusion_filled_ratio"].shape, (2,))
         self.assertEqual(diagnostics["draft"].shape, (1, 81))
         self.assertEqual(diagnostics["belief_logits"].shape, (1, 81, 11))

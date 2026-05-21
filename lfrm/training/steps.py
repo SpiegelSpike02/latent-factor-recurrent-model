@@ -340,7 +340,7 @@ def _brc_compact_training_rollout(
         "per_step_denoise_energy": energy,
         "per_step_belief_entropy": entropy,
         "unroll_steps": jnp.asarray(model.recurrent_steps, dtype=jnp.float32),
-        "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
+        "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32),
         "belief_logits": belief_final,
         "early_candidate": early_candidate,
         "mid_candidate": mid_candidate,
