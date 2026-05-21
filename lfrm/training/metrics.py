@@ -82,26 +82,16 @@ CORE_SCALAR_METRICS = (
     "unroll_steps",
     "belief_entropy",
     "belief_confidence",
-    "latent_fit_loss",
-    "fit_given_loss",
-    "fit_energy",
-    "fit_consistency_loss",
-    "fit_prior_loss",
-    "latent_update_norm",
-    "latent_grad_norm",
-    "latent_step_norm",
-    "meta_outer_loss",
-    "verifier_loss",
-    "verifier_accuracy",
-    "given_consistency",
+    "belief_kl_delta",
+    "belief_update_norm",
+    "denoise_energy",
+    "context_consistency",
     "invalid_rate",
     "conflicts",
     "diffusion_filled_ratio",
-    "brc_gate_mean",
-    "brc_gate_std",
-    "brc_z_delta_norm",
-    "true_energy",
-    "fake_energy",
+    "scratch_norm",
+    "step_gate_mean",
+    "step_gate_std",
     "belief_init_noise_rate",
     "belief_init_uniform_rate",
     "belief_init_teacher_rate",
@@ -133,9 +123,7 @@ CORE_SCALAR_METRICS = (
     "final_path_recall",
     "final_path_f1",
 )
-WANDB_HISTORY_EXCLUDED_SCALAR_METRICS = {
-    "verifier_accuracy",
-}
+WANDB_HISTORY_EXCLUDED_SCALAR_METRICS: set[str] = set()
 TERMINAL_DIAGNOSTIC_METRICS = (
     "terminal_belief_delta",
     "terminal_belief_mse",
@@ -175,7 +163,6 @@ LEGACY_METRIC_NAMES = {
     "final_solved_count",
     "invalid_board_rate",
     "conflict_count",
-    "verifier_ranking_accuracy",
 }
 BRC_CONSOLE_GROUPS = (
     ("objective", ("loss", "lm_loss", "final_lm_loss", "mean_lm_loss")),
@@ -191,41 +178,27 @@ BRC_CONSOLE_GROUPS = (
     (
         "sudoku",
         (
-            "given_consistency",
+            "context_consistency",
             "invalid_rate",
             "conflicts",
         ),
     ),
     (
-        "verifier",
-        (
-            "verifier_loss",
-            "verifier_accuracy",
-            "true_energy",
-            "fake_energy",
-            "meta_outer_loss",
-        ),
-    ),
-    (
         "belief",
         (
+            "denoise_energy",
+            "belief_kl_delta",
+            "belief_entropy",
+            "belief_confidence",
+            "belief_update_norm",
+            "scratch_norm",
             "diffusion_filled_ratio",
-            "brc_gate_mean",
-            "brc_z_delta_norm",
+            "step_gate_mean",
             "belief_init_noise_rate",
             "belief_init_uniform_rate",
             "belief_init_teacher_rate",
             "belief_init_corrupt_rate",
             "belief_init_soft_rate",
-        ),
-    ),
-    (
-        "latent",
-        (
-            "latent_fit_loss",
-            "fit_energy",
-            "latent_update_norm",
-            "latent_grad_norm",
         ),
     ),
 )
@@ -252,7 +225,7 @@ TRM_CONSOLE_GROUPS = (
 )
 METRIC_GROUPS = BRC_CONSOLE_GROUPS
 CONSOLE_GROUPS_BY_MODEL = {
-    "brc_sudoku": BRC_CONSOLE_GROUPS,
+    "brc": BRC_CONSOLE_GROUPS,
     "trm": TRM_CONSOLE_GROUPS,
     "urm": TRM_CONSOLE_GROUPS,
 }

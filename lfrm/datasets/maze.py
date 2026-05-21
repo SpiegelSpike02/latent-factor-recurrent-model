@@ -159,12 +159,6 @@ def build_maze_dataset(
             dtype=np.uint8,
             shape=(num_examples, seq_len),
         )
-        given_mask = open_memmap(
-            split_dir / "given_mask.npy",
-            mode="w+",
-            dtype=bool,
-            shape=(num_examples, seq_len),
-        )
         puzzle_indices = open_memmap(
             split_dir / "puzzle_indices.npy",
             mode="w+",
@@ -200,14 +194,12 @@ def build_maze_dataset(
                 aug_solution = np.ascontiguousarray(solution_variants[aug_idx])
                 encoded_inputs[output_idx] = aug_maze.reshape(-1)
                 encoded_labels[output_idx] = aug_solution.reshape(-1)
-                given_mask[output_idx] = (aug_maze.reshape(-1) != MAZE_VOCAB[" "])
                 puzzle_identifiers[output_idx] = 0
                 output_idx += 1
                 puzzle_indices[output_idx] = output_idx
                 if progress_every > 0 and output_idx % progress_every == 0:
                     encoded_inputs.flush()
                     encoded_labels.flush()
-                    given_mask.flush()
                     puzzle_indices.flush()
                     group_indices.flush()
                     puzzle_identifiers.flush()
@@ -221,7 +213,6 @@ def build_maze_dataset(
             raise RuntimeError(f"Expected to write {num_examples} {split_name} examples, wrote {output_idx}")
         encoded_inputs.flush()
         encoded_labels.flush()
-        given_mask.flush()
         puzzle_indices.flush()
         group_indices.flush()
         puzzle_identifiers.flush()

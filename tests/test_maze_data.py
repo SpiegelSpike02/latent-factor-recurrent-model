@@ -55,9 +55,8 @@ class MazeDatasetTests(unittest.TestCase):
             self.assertTrue((output_dir / "train" / "puzzle_identifiers.npy").is_file())
             self.assertTrue((output_dir / "train" / "puzzle_indices.npy").is_file())
             self.assertTrue((output_dir / "train" / "group_indices.npy").is_file())
-            np.testing.assert_array_equal(dataset.train_given_mask[0], dataset.train_inputs[0] != 2)
-            self.assertTrue(bool(np.any(dataset.train_given_mask)))
-            self.assertTrue(bool(np.any(~dataset.train_given_mask)))
+            self.assertFalse((output_dir / "train" / "given_mask.npy").exists())
+            self.assertFalse(bool(np.any(dataset.train_given_mask)))
 
             batch = sample_batch(np.random.default_rng(0), dataset, batch_size=2, seq_len=9, split="train")
             self.assertEqual(batch["inputs"].shape, (2, 9))

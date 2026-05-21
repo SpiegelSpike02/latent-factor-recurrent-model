@@ -3,7 +3,6 @@ dataset_path = "data/sudoku-extreme-1k-aug-1000"
 
 [task]
 type = "sudoku"
-supervision = "full_grid"
 
 [model]
 model_type = "urm"

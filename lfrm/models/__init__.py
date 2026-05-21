@@ -1,4 +1,4 @@
-from .brc_sudoku import BRCSudokuModel
+from .brc import BRCModel
 from .recurrent import TinyRecursiveModel, UnifiedReasoningModel
 
-__all__ = ["BRCSudokuModel", "TinyRecursiveModel", "UnifiedReasoningModel"]
+__all__ = ["BRCModel", "TinyRecursiveModel", "UnifiedReasoningModel"]

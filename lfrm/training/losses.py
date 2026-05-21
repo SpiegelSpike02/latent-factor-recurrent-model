@@ -44,20 +44,9 @@ def target_probability(model: object, logits: jax.Array, targets: jax.Array) -> 
     return jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
 
 
-def masked_token_ce(model: object, logits: jax.Array, targets: jax.Array, mask: jax.Array) -> jax.Array:
-    mask_f32 = mask.astype(jnp.float32)
-    normalizer = jnp.maximum(jnp.sum(mask_f32), 1.0)
-    token_loss = token_cross_entropy(model, logits, targets)
-    return jnp.sum(token_loss * mask_f32) / normalizer
-
-
 def loss_mask_from_given(model: object, given_mask: jax.Array) -> jax.Array:
-    supervision = getattr(getattr(model, "config", None), "supervision", "unknown_only")
-    if supervision == "unknown_only":
-        return (~given_mask).astype(jnp.float32)
-    if supervision == "full_grid":
-        return jnp.ones_like(given_mask, dtype=jnp.float32)
-    raise ValueError(f"Unsupported supervision mode: {supervision}")
+    del model
+    return jnp.ones_like(given_mask, dtype=jnp.float32)
 
 
 def supervised_loss_mask(model: object, given_mask: jax.Array, targets: jax.Array) -> jax.Array:

@@ -7,8 +7,6 @@ from pathlib import Path
 @dataclass(frozen=True)
 class TaskConfig:
     type: str = "sudoku"
-    supervision: str = "unknown_only"
-    clamp_given: bool = False
 
 
 @dataclass(frozen=True)
@@ -32,33 +30,21 @@ class TRMConfig:
 
 
 @dataclass(frozen=True)
-class BRCSudokuConfig:
+class BRCConfig:
     recurrent_steps: int = 6
-    deep_recursion: int = 1
-    latent_recursion: int = 1
+    refinement_cycles: int = 1
+    refinement_steps: int = 1
     block_layers: int = 1
-    latent_dim: int = 128
     num_heads: int = 4
     mlp_ratio: int = 2
     position_encoding: str = "rope"
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     step_loss_weights: tuple[float, ...] | None = None
-    latent_fit_steps: int = 4
-    latent_lr: float = 0.1
-    latent_grad_clip_norm: float = 1.0
-    latent_update_clip_norm: float = 0.5
     denoise_initial_prob: float = 0.4
     denoise_teacher_reveal_prob: float = 0.25
     denoise_mode_weights: tuple[float, ...] = (0.35, 0.20, 0.30, 0.15)
-    verifier_loss_weight: float = 0.2
-    meta_loss_weight: float = 0.0
-    fit_given_weight: float = 0.2
-    fit_energy_weight: float = 1.0
-    fit_consistency_weight: float = 0.1
-    fit_prior_weight: float = 0.02
-    verifier_layers: int = 4
-    verifier_margin: float = 1.0
+    fixed_point_entropy_weight: float = 0.01
 
 
 @dataclass(frozen=True)
@@ -81,7 +67,7 @@ class URMConfig:
 @dataclass(frozen=True)
 class ModelConfig:
     vocab_size: int
-    model_type: str = "brc_sudoku"
+    model_type: str = "brc"
     num_puzzle_identifiers: int = 1
     seq_len: int = 81
     grid_height: int = 9
@@ -92,7 +78,7 @@ class ModelConfig:
     loss_type: str = "softmax"
     task: TaskConfig | None = None
     trm: TRMConfig | None = None
-    brc: BRCSudokuConfig | None = None
+    brc: BRCConfig | None = None
     urm: URMConfig | None = None
 
     @property
@@ -100,20 +86,12 @@ class ModelConfig:
         return (self.task or TaskConfig()).type
 
     @property
-    def supervision(self) -> str:
-        return (self.task or TaskConfig()).supervision
-
-    @property
-    def clamp_given(self) -> bool:
-        return (self.task or TaskConfig()).clamp_given
-
-    @property
     def trm_config(self) -> TRMConfig:
         return self.trm or TRMConfig()
 
     @property
-    def brc_config(self) -> BRCSudokuConfig:
-        return self.brc or BRCSudokuConfig()
+    def brc_config(self) -> BRCConfig:
+        return self.brc or BRCConfig()
 
     @property
     def urm_config(self) -> URMConfig:

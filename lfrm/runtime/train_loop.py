@@ -392,7 +392,7 @@ def run_training(
 
     current_batch = prefetcher.next()
     use_recurrent_act = config.model.model_type in ("trm", "urm") and config.train.trm_train_mode == "act"
-    console_model_label = "brc" if config.model.model_type == "brc_sudoku" else config.model.model_type
+    console_model_label = "brc" if config.model.model_type == "brc" else config.model.model_type
     train_carry = place_tree(model.initial_carry(current_batch), data_sharding) if use_recurrent_act else None
     eval_interval = eval_interval_updates(config)
     profile_active = False

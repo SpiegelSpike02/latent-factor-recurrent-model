@@ -17,7 +17,7 @@ from lfrm.config import (
     DataConfig,
     EvalConfig,
     ExperimentConfig,
-    BRCSudokuConfig,
+    BRCConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
@@ -34,7 +34,7 @@ from lfrm.runtime import (
     small_metric_items,
     updates_from_epochs,
 )
-from lfrm.models import BRCSudokuModel, TinyRecursiveModel
+from lfrm.models import BRCModel, TinyRecursiveModel
 from lfrm.jax_defaults import apply_jax_defaults
 from lfrm.training import (
     build_train_step_runner,
@@ -48,7 +48,6 @@ from lfrm.training import (
     trm_dense_unroll_loss_and_metrics,
 )
 from lfrm.training.optim import scheduled_lr
-from lfrm.training.steps import _clamp_logits_to_given
 
 
 class GridModelTests(unittest.TestCase):
@@ -189,13 +188,13 @@ class GridModelTests(unittest.TestCase):
         brc_config = ExperimentConfig(
             model=ModelConfig(
                 vocab_size=11,
-                model_type="brc_sudoku",
+                model_type="brc",
                 seq_len=81,
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
                 rollout_steps=1,
-                brc=BRCSudokuConfig(recurrent_steps=1, latent_dim=16, num_heads=4, verifier_layers=1),
+                brc=BRCConfig(recurrent_steps=1, num_heads=4),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),
@@ -203,7 +202,7 @@ class GridModelTests(unittest.TestCase):
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
         )
-        self.assertIsInstance(create_model(brc_config), BRCSudokuModel)
+        self.assertIsInstance(create_model(brc_config), BRCModel)
         invalid = ExperimentConfig(
             model=ModelConfig(vocab_size=11, model_type="legacy_shared_block"),
             optimizer=OptimizerConfig(),
@@ -212,7 +211,7 @@ class GridModelTests(unittest.TestCase):
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
         )
-        with self.assertRaisesRegex(ValueError, "brc_sudoku"):
+        with self.assertRaisesRegex(ValueError, "brc"):
             create_model(invalid)
 
     def test_stablemax_forward_backward_are_finite(self) -> None:
@@ -311,23 +310,20 @@ class GridModelTests(unittest.TestCase):
         )
         self.assertEqual(logits.shape, (1, 1, 9, 11))
 
-    def test_brc_forward_and_verifier_are_finite(self) -> None:
-        model = BRCSudokuModel(
+    def test_brc_forward_and_fixed_point_energy_are_finite(self) -> None:
+        model = BRCModel(
             ModelConfig(
                 vocab_size=11,
-                model_type="brc_sudoku",
+                model_type="brc",
                 seq_len=81,
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
                 rollout_steps=2,
-                brc=BRCSudokuConfig(
+                brc=BRCConfig(
                     recurrent_steps=2,
-                    latent_dim=16,
                     num_heads=4,
                     mlp_ratio=1,
-                    latent_fit_steps=1,
-                    verifier_layers=1,
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -346,49 +342,30 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(logits.shape, (2, 1, 81, 11))
         self.assertEqual(final_only_logits.shape, (1, 81, 11))
         self.assertTrue(bool(jnp.allclose(final_only_logits, logits[-1], rtol=1e-5, atol=1e-5)))
-        self.assertEqual(diagnostics["hidden_delta_mean"].shape, (2,))
+        self.assertEqual(diagnostics["scratch_norm"].shape, (2,))
         self.assertEqual(diagnostics["diffusion_filled_ratio"].shape, (2,))
         self.assertEqual(diagnostics["draft"].shape, (1, 81))
-        self.assertEqual(diagnostics["belief_logits"].shape, (1, 81, 9))
-        self.assertEqual(final_only_diagnostics["belief_logits"].shape, (1, 81, 9))
-        self.assertIn("brc_z_delta_norm", diagnostics)
-        self.assertTrue(bool(jnp.isfinite(diagnostics["brc_z_delta_norm"])))
-        predictions = jnp.argmax(logits[-1], axis=-1)
-        given_mask = tokens != 1
-        self.assertTrue(bool(jnp.all(predictions[given_mask] == tokens[given_mask])))
-        energy = model.verifier_energy(tokens, labels)
-        self.assertEqual(energy.shape, (1,))
-        self.assertTrue(bool(jnp.all(jnp.isfinite(energy))))
-        soft_candidate = jax.nn.one_hot(labels, 11)
-        soft_energy = model.verifier_energy_from_probs(tokens, soft_candidate)
-        self.assertEqual(soft_energy.shape, (1,))
-        self.assertTrue(bool(jnp.all(jnp.isfinite(soft_energy))))
-        refined_belief, refine_metrics = model.refine_belief_with_verifier(
-            tokens,
-            diagnostics["belief_logits"],
-            steps=1,
-        )
-        self.assertEqual(refined_belief.shape, (1, 81, 9))
-        self.assertTrue(bool(jnp.isfinite(refine_metrics["belief_refine_loss"])))
-
+        self.assertEqual(diagnostics["belief_logits"].shape, (1, 81, 11))
+        self.assertEqual(final_only_diagnostics["belief_logits"].shape, (1, 81, 11))
+        for key in ("denoise_energy", "belief_kl_delta", "belief_entropy", "belief_update_norm"):
+            self.assertIn(key, diagnostics)
+            self.assertTrue(bool(jnp.isfinite(diagnostics[key])))
+        self.assertEqual(diagnostics["per_step_denoise_energy"].shape, (2,))
+        self.assertEqual(diagnostics["per_step_belief_entropy"].shape, (2,))
     def test_brc_losses_are_finite(self) -> None:
-        model = BRCSudokuModel(
+        model = BRCModel(
             ModelConfig(
                 vocab_size=11,
-                model_type="brc_sudoku",
+                model_type="brc",
                 seq_len=81,
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
                 rollout_steps=2,
-                brc=BRCSudokuConfig(
+                brc=BRCConfig(
                     recurrent_steps=2,
-                    latent_dim=16,
                     num_heads=4,
                     mlp_ratio=1,
-                    latent_fit_steps=1,
-                    latent_lr=0.05,
-                    verifier_layers=1,
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -418,7 +395,6 @@ class GridModelTests(unittest.TestCase):
             "blank_cell_accuracy",
             "solved_rate",
             "solved_count",
-            "verifier_ranking_accuracy",
             "invalid_board_rate",
             "conflict_count",
         }
@@ -428,18 +404,7 @@ class GridModelTests(unittest.TestCase):
             "lm_loss",
             "final_lm_loss",
             "mean_lm_loss",
-            "latent_fit_loss",
-            "fit_given_loss",
-            "fit_energy",
-            "fit_consistency_loss",
-            "fit_prior_loss",
-            "latent_update_norm",
-            "latent_grad_norm",
-            "latent_step_norm",
-            "meta_outer_loss",
-            "verifier_loss",
-            "verifier_accuracy",
-            "given_consistency",
+            "context_consistency",
             "invalid_rate",
             "conflicts",
             "belief_init_noise_rate",
@@ -447,32 +412,72 @@ class GridModelTests(unittest.TestCase):
             "belief_init_teacher_rate",
             "belief_init_corrupt_rate",
             "belief_init_soft_rate",
-            "brc_z_delta_norm",
+            "denoise_energy",
+            "belief_kl_delta",
+            "belief_entropy",
+            "belief_confidence",
+            "belief_update_norm",
+            "scratch_norm",
+            "step_gate_mean",
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
         self.assertEqual(metrics["per_step_loss"].shape, (2,))
         self.assertEqual(metrics["step_loss_weights"].shape, (2,))
+        self.assertEqual(metrics["per_step_denoise_energy"].shape, (2,))
+        self.assertEqual(metrics["per_step_belief_entropy"].shape, (2,))
+
+    def test_brc_arc_canvas_belief_loss_is_finite(self) -> None:
+        model = BRCModel(
+            ModelConfig(
+                vocab_size=12,
+                model_type="brc",
+                task=TaskConfig(type="arc"),
+                seq_len=16,
+                grid_height=4,
+                grid_width=4,
+                d_model=16,
+                rollout_steps=2,
+                loss_type="stablemax",
+                brc=BRCConfig(
+                    recurrent_steps=2,
+                    num_heads=4,
+                    mlp_ratio=1,
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(36),
+        )
+        inputs = jnp.asarray([[2, 3, 1, 0, 4, 5, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0]], dtype=jnp.int32)
+        labels = jnp.asarray([[6, 7, 1, 0, 8, 9, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0]], dtype=jnp.int32)
+        logits, diagnostics = model.forward_all_steps_with_diagnostics(inputs, train=False)
+        self.assertEqual(logits.shape, (2, 1, 16, 12))
+        self.assertEqual(diagnostics["belief_logits"].shape, (1, 16, 12))
+        batch = {
+            "inputs": inputs,
+            "labels": labels,
+            "given_mask": jnp.zeros_like(inputs, dtype=bool),
+            "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
+        }
+        _, metrics = loss_and_metrics(model, batch, True, jax.random.key(37))
+        for key in ("loss", "lm_loss", "accuracy", "exact_accuracy", "denoise_energy", "belief_kl_delta"):
+            self.assertIn(key, metrics)
+            self.assertTrue(bool(jnp.isfinite(metrics[key])))
 
     def test_brc_train_step_updates_parameters(self) -> None:
         config = ExperimentConfig(
             model=ModelConfig(
                 vocab_size=11,
-                model_type="brc_sudoku",
+                model_type="brc",
                 seq_len=81,
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
                 rollout_steps=1,
-                brc=BRCSudokuConfig(
+                brc=BRCConfig(
                     recurrent_steps=1,
-                    latent_dim=16,
                     num_heads=4,
                     mlp_ratio=1,
-                    latent_fit_steps=1,
-                    latent_lr=0.05,
-                    meta_loss_weight=0.5,
-                    verifier_layers=1,
                 ),
             ),
             optimizer=OptimizerConfig(learning_rate=1e-4, lr_warmup_steps=1),
@@ -495,13 +500,12 @@ class GridModelTests(unittest.TestCase):
             "given_mask": tokens != 1,
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
-        before = model.z_global[...]
+        before = model.input_to_scratch.kernel[...]
         metrics = train_step(model, optimizer, batch, jax.random.key(34))
         metrics = train_step(model, optimizer, batch, jax.random.key(35))
-        after = model.z_global[...]
+        after = model.input_to_scratch.kernel[...]
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
-        self.assertTrue(bool(jnp.isfinite(metrics["meta_outer_loss"])))
-        self.assertTrue(bool(jnp.isfinite(metrics["latent_fit_loss"])))
+        self.assertTrue(bool(jnp.isfinite(metrics["denoise_energy"])))
         self.assertGreater(float(jnp.sum(jnp.abs(after - before))), 0.0)
 
     def test_trm_breaks_blank_symbol_symmetry(self) -> None:
@@ -732,7 +736,7 @@ class GridModelTests(unittest.TestCase):
 
     def test_urm_muon_train_step_finite(self) -> None:
         config = ExperimentConfig(
-            task=TaskConfig(type="arc", supervision="full_grid"),
+            task=TaskConfig(type="arc"),
             model=ModelConfig(
                 vocab_size=12,
                 model_type="urm",
@@ -812,30 +816,18 @@ class GridModelTests(unittest.TestCase):
         self.assertAlmostEqual(float(metrics["selected_accuracy"]), 0.5, places=6)
         self.assertAlmostEqual(float(metrics["selected_step"]), 1.0, places=6)
 
-    def test_clamp_logits_to_given_uses_given_mask_not_blank_id(self) -> None:
-        logits = jnp.zeros((2, 1, 4, 6), dtype=jnp.float32)
-        inputs = jnp.asarray([[2, 1, 3, 4]], dtype=jnp.int32)
-        given_mask = jnp.asarray([[False, True, False, True]], dtype=bool)
-
-        clamped = _clamp_logits_to_given(logits, inputs, given_mask, vocab_size=6)
-        predictions = jnp.argmax(clamped, axis=-1)
-
-        self.assertTrue(bool(jnp.all(predictions[:, 0, 1] == 1)))
-        self.assertTrue(bool(jnp.all(predictions[:, 0, 3] == 4)))
-        self.assertTrue(bool(jnp.all(clamped[:, 0, 0] == logits[:, 0, 0])))
-
     def test_num_heads_must_divide_d_model(self) -> None:
         with self.assertRaisesRegex(ValueError, "divisible by num_heads"):
-            BRCSudokuModel(
+            BRCModel(
                 ModelConfig(
                     vocab_size=11,
-                    model_type="brc_sudoku",
+                    model_type="brc",
                     seq_len=81,
                     grid_height=9,
                     grid_width=9,
                     d_model=10,
                     rollout_steps=1,
-                    brc=BRCSudokuConfig(recurrent_steps=1, latent_dim=16, num_heads=4),
+                    brc=BRCConfig(recurrent_steps=1, num_heads=4),
                 ),
                 RuntimeConfig(compute_dtype="float32"),
                 rngs=nnx.Rngs(0),
@@ -846,7 +838,7 @@ class GridModelTests(unittest.TestCase):
             config_path = Path(tmpdir) / "legacy.toml"
             config_path.write_text(
                 "[model]\n"
-                "model_type = \"brc_sudoku\"\n"
+                "model_type = \"brc\"\n"
                 "legacy_field = \"old\"\n",
                 encoding="utf-8",
             )
@@ -868,39 +860,32 @@ class GridModelTests(unittest.TestCase):
             config_path.write_text(
                 "[task]\n"
                 "type = \"sudoku\"\n"
-                "supervision = \"unknown_only\"\n"
-                "clamp_given = true\n"
                 "\n"
                 "[model]\n"
-                "model_type = \"brc_sudoku\"\n"
+                "model_type = \"brc\"\n"
                 "d_model = 16\n"
                 "\n"
                 "[model.brc]\n"
                 "recurrent_steps = 2\n"
+                "refinement_cycles = 1\n"
+                "refinement_steps = 1\n"
                 "block_layers = 1\n"
-                "latent_dim = 16\n"
                 "num_heads = 4\n"
                 "step_loss_weights = [1.0, 2.0]\n"
-                "latent_fit_steps = 1\n"
-                "meta_loss_weight = 0.5\n"
-                "fit_energy_weight = 0.75\n"
                 "denoise_initial_prob = 0.4\n"
                 "denoise_teacher_reveal_prob = 0.25\n"
                 "denoise_mode_weights = [0.35, 0.20, 0.30, 0.15]\n",
                 encoding="utf-8",
             )
             loaded = load_toml_config(str(config_path))
-            self.assertEqual(loaded["model_type"], "brc_sudoku")
+            self.assertEqual(loaded["model_type"], "brc")
             self.assertEqual(loaded["task_type"], "sudoku")
-            self.assertEqual(loaded["supervision"], "unknown_only")
-            self.assertTrue(loaded["clamp_given"])
             self.assertEqual(loaded["brc_recurrent_steps"], 2)
+            self.assertEqual(loaded["brc_refinement_cycles"], 1)
+            self.assertEqual(loaded["brc_refinement_steps"], 1)
             self.assertEqual(loaded["brc_block_layers"], 1)
-            self.assertEqual(loaded["brc_latent_dim"], 16)
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_step_loss_weights"], [1.0, 2.0])
-            self.assertEqual(loaded["brc_meta_loss_weight"], 0.5)
-            self.assertEqual(loaded["brc_fit_energy_weight"], 0.75)
             self.assertEqual(loaded["brc_denoise_initial_prob"], 0.4)
             self.assertEqual(loaded["brc_denoise_mode_weights"], [0.35, 0.20, 0.30, 0.15])
 

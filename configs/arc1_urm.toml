@@ -3,8 +3,6 @@ dataset_path = "data/arc1concept-aug-1000"
 
 [task]
 type = "arc"
-supervision = "full_grid"
-clamp_given = false
 
 [model]
 model_type = "urm"

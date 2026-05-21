@@ -13,7 +13,7 @@ from lfrm.config import (
     EMAConfig,
     ExperimentConfig,
     EvalConfig,
-    BRCSudokuConfig,
+    BRCConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
@@ -37,7 +37,7 @@ NESTED_SECTIONS = {
 }
 ALLOWED_SECTION_KEYS = {
     "data": {"dataset_path"},
-    "task": {"type", "supervision", "clamp_given"},
+    "task": {"type"},
     "model": {
         "model_type",
         "seq_len",
@@ -117,31 +117,19 @@ ALLOWED_NESTED_KEYS = {
     },
     "brc": {
         "recurrent_steps",
-        "deep_recursion",
-        "latent_recursion",
+        "refinement_cycles",
+        "refinement_steps",
         "block_layers",
-        "latent_dim",
         "num_heads",
         "mlp_ratio",
         "position_encoding",
         "rms_norm_eps",
         "rope_theta",
         "step_loss_weights",
-        "latent_fit_steps",
-        "latent_lr",
-        "latent_grad_clip_norm",
-        "latent_update_clip_norm",
         "denoise_initial_prob",
         "denoise_teacher_reveal_prob",
         "denoise_mode_weights",
-        "verifier_loss_weight",
-        "meta_loss_weight",
-        "fit_given_weight",
-        "fit_energy_weight",
-        "fit_consistency_weight",
-        "fit_prior_weight",
-        "verifier_layers",
-        "verifier_margin",
+        "fixed_point_entropy_weight",
     },
     "urm": {
         "recurrent_steps",
@@ -199,12 +187,10 @@ def load_toml_config(path: str | None) -> dict[str, object]:
                 normalized_key = "task_type"
             flat[normalized_key] = value
 
-    if flat.get("model_type", "brc_sudoku") not in ("trm", "brc_sudoku", "urm"):
-        raise ValueError("Only model_type=trm, brc_sudoku, or urm is supported")
+    if flat.get("model_type", "brc") not in ("trm", "brc", "urm"):
+        raise ValueError("Only model_type=trm, brc, or urm is supported")
     if flat.get("task_type", "sudoku") not in ("sudoku", "maze", "arc"):
         raise ValueError("Only task_type='sudoku', 'maze', or 'arc' is supported")
-    if flat.get("supervision", "unknown_only") not in ("unknown_only", "full_grid"):
-        raise ValueError("Only supervision='unknown_only' or 'full_grid' is supported")
     if flat.get("loss_type", "softmax") not in ("softmax", "stablemax"):
         raise ValueError("Only loss_type='softmax' or loss_type='stablemax' is supported")
     if flat.get("optimizer_type", "adamw") not in ("adamw", "adam_atan2", "muon"):
@@ -252,14 +238,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--terminal-residual-weight", type=float, default=0.0)
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ema-decay", type=float, default=0.999)
-    parser.add_argument("--model-type", choices=("trm", "brc_sudoku", "urm"), default="brc_sudoku")
+    parser.add_argument("--model-type", choices=("trm", "brc", "urm"), default="brc")
     parser.add_argument("--task-type", choices=("sudoku", "maze", "arc"), default="sudoku")
-    parser.add_argument("--supervision", choices=("unknown_only", "full_grid"), default="unknown_only")
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--rollout-steps", type=int, default=6)
     parser.add_argument("--dropout-rate", type=float, default=0.0)
     parser.add_argument("--loss-type", choices=("softmax", "stablemax"), default="softmax")
-    parser.add_argument("--clamp-given", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trm-deep-recursion", type=int, default=3)
     parser.add_argument("--trm-latent-recursion", type=int, default=6)
     parser.add_argument("--trm-block-layers", type=int, default=2)
@@ -276,10 +260,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--brc-latent-dim", type=int, default=128)
     parser.add_argument("--brc-recurrent-steps", type=int, default=6)
-    parser.add_argument("--brc-deep-recursion", type=int, default=1)
-    parser.add_argument("--brc-latent-recursion", type=int, default=1)
+    parser.add_argument("--brc-refinement-cycles", type=int, default=1)
+    parser.add_argument("--brc-refinement-steps", type=int, default=1)
     parser.add_argument("--brc-block-layers", type=int, default=1)
     parser.add_argument("--brc-num-heads", type=int, default=4)
     parser.add_argument("--brc-mlp-ratio", type=int, default=2)
@@ -287,21 +270,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
     parser.add_argument("--brc-step-loss-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--brc-latent-fit-steps", type=int, default=4)
-    parser.add_argument("--brc-latent-lr", type=float, default=0.1)
-    parser.add_argument("--brc-latent-grad-clip-norm", type=float, default=1.0)
-    parser.add_argument("--brc-latent-update-clip-norm", type=float, default=0.5)
     parser.add_argument("--brc-denoise-initial-prob", type=float, default=0.4)
     parser.add_argument("--brc-denoise-teacher-reveal-prob", type=float, default=0.25)
     parser.add_argument("--brc-denoise-mode-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--brc-verifier-loss-weight", type=float, default=0.2)
-    parser.add_argument("--brc-meta-loss-weight", type=float, default=0.0)
-    parser.add_argument("--brc-fit-given-weight", type=float, default=0.2)
-    parser.add_argument("--brc-fit-energy-weight", type=float, default=1.0)
-    parser.add_argument("--brc-fit-consistency-weight", type=float, default=0.1)
-    parser.add_argument("--brc-fit-prior-weight", type=float, default=0.02)
-    parser.add_argument("--brc-verifier-layers", type=int, default=4)
-    parser.add_argument("--brc-verifier-margin", type=float, default=1.0)
+    parser.add_argument("--brc-fixed-point-entropy-weight", type=float, default=0.01)
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-deep-recursion", type=int, default=2)
     parser.add_argument("--urm-latent-recursion", type=int, default=6)
@@ -403,8 +375,6 @@ def build_config(
 ) -> ExperimentConfig:
     task = TaskConfig(
         type=args.task_type,
-        supervision=args.supervision,
-        clamp_given=args.clamp_given,
     )
     model = ModelConfig(
         vocab_size=vocab_size,
@@ -436,37 +406,25 @@ def build_config(
             no_act_continue=args.trm_no_act_continue,
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
-        brc=BRCSudokuConfig(
+        brc=BRCConfig(
             recurrent_steps=args.brc_recurrent_steps,
-            deep_recursion=args.brc_deep_recursion,
-            latent_recursion=args.brc_latent_recursion,
+            refinement_cycles=args.brc_refinement_cycles,
+            refinement_steps=args.brc_refinement_steps,
             block_layers=args.brc_block_layers,
-            latent_dim=args.brc_latent_dim,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,
             position_encoding=args.brc_position_encoding,
             rms_norm_eps=args.brc_rms_norm_eps,
             rope_theta=args.brc_rope_theta,
             step_loss_weights=tuple(args.brc_step_loss_weights) if args.brc_step_loss_weights is not None else None,
-            latent_fit_steps=args.brc_latent_fit_steps,
-            latent_lr=args.brc_latent_lr,
-            latent_grad_clip_norm=args.brc_latent_grad_clip_norm,
-            latent_update_clip_norm=args.brc_latent_update_clip_norm,
             denoise_initial_prob=args.brc_denoise_initial_prob,
             denoise_teacher_reveal_prob=args.brc_denoise_teacher_reveal_prob,
             denoise_mode_weights=(
                 tuple(args.brc_denoise_mode_weights)
                 if args.brc_denoise_mode_weights is not None
-                else BRCSudokuConfig().denoise_mode_weights
+                else BRCConfig().denoise_mode_weights
             ),
-            verifier_loss_weight=args.brc_verifier_loss_weight,
-            meta_loss_weight=args.brc_meta_loss_weight,
-            fit_given_weight=args.brc_fit_given_weight,
-            fit_energy_weight=args.brc_fit_energy_weight,
-            fit_consistency_weight=args.brc_fit_consistency_weight,
-            fit_prior_weight=args.brc_fit_prior_weight,
-            verifier_layers=args.brc_verifier_layers,
-            verifier_margin=args.brc_verifier_margin,
+            fixed_point_entropy_weight=args.brc_fixed_point_entropy_weight,
         ),
         urm=URMConfig(
             recurrent_steps=args.urm_recurrent_steps,

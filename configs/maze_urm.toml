@@ -3,8 +3,6 @@ dataset_path = "data/maze-30x30-hard-1k-aug"
 
 [task]
 type = "maze"
-supervision = "full_grid"
-clamp_given = false
 
 [model]
 model_type = "urm"

@@ -72,8 +72,7 @@ class SudokuDataTests(unittest.TestCase):
             self.assertEqual(batch["given_mask"].dtype, np.bool_)
             self.assertEqual(batch["puzzle_identifiers"].shape, (2,))
             self.assertTrue(np.all(batch["puzzle_identifiers"] == 0))
-            self.assertTrue(np.any(batch["given_mask"]))
-            self.assertTrue(np.any(~batch["given_mask"]))
+            self.assertFalse(np.any(batch["given_mask"]))
 
     def test_load_legacy_sudoku_dataset_without_puzzle_identifiers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -241,10 +241,8 @@ def _load_optional_split_array(split_dir: Path, name: str) -> np.ndarray | None:
 
 
 def _load_given_mask(split_dir: Path, inputs: np.ndarray) -> np.ndarray:
-    path = split_dir / "given_mask.npy"
-    if not path.is_file():
-        return np.asarray(inputs != 1, dtype=bool)
-    return np.load(path, mmap_mode="r")
+    del split_dir
+    return np.zeros_like(inputs, dtype=bool)
 
 
 def _load_puzzle_identifiers(split_dir: Path, num_examples: int, puzzle_indices: np.ndarray | None) -> np.ndarray:
