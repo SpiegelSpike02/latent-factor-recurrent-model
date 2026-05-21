@@ -31,8 +31,12 @@ step_loss_weights = [
   19, 20, 21, 22, 23, 24,
 ]
 denoise_initial_prob = 0.0
+denoise_trajectory_prob = 0.0
 denoise_teacher_reveal_prob = 0.25
-denoise_mode_weights = [0.35, 0.20, 0.30, 0.15]
+denoise_mode_weights = [0.30, 0.35, 0.35]
+fixed_point_entropy_weight = 0.01
+fixed_point_loss_weight = 0.0
+context_weight_reg_weight = 0.0
 
 [optimizer]
 learning_rate = 1e-4

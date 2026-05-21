@@ -106,16 +106,20 @@ class BRCModel(nnx.Module):
                 raise ValueError("BRC step_loss_weights must contain a positive weight")
         if not 0.0 <= brc.denoise_initial_prob <= 1.0:
             raise ValueError("BRC denoise_initial_prob must be in [0, 1]")
+        if not 0.0 <= brc.denoise_trajectory_prob <= 1.0:
+            raise ValueError("BRC denoise_trajectory_prob must be in [0, 1]")
         if not 0.0 <= brc.denoise_teacher_reveal_prob <= 1.0:
             raise ValueError("BRC denoise_teacher_reveal_prob must be in [0, 1]")
-        if len(brc.denoise_mode_weights) != 4:
-            raise ValueError("BRC denoise_mode_weights must contain four weights")
+        if len(brc.denoise_mode_weights) != 3:
+            raise ValueError("BRC denoise_mode_weights must contain three weights")
         if any(weight < 0.0 for weight in brc.denoise_mode_weights):
             raise ValueError("BRC denoise_mode_weights must be non-negative")
         if sum(brc.denoise_mode_weights) <= 0.0:
             raise ValueError("BRC denoise_mode_weights must contain a positive weight")
         if brc.fixed_point_entropy_weight < 0.0:
             raise ValueError("BRC fixed_point_entropy_weight must be non-negative")
+        if min(brc.fixed_point_loss_weight, brc.context_weight_reg_weight) < 0.0:
+            raise ValueError("BRC fixed-point loss weights must be non-negative")
 
         self.config = config
         self.runtime = runtime
@@ -201,6 +205,15 @@ class BRCModel(nnx.Module):
             rngs=rngs,
         )
         self.step_gate = nnx.Linear(
+            config.d_model,
+            1,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=nnx.initializers.zeros,
+            bias_init=nnx.initializers.zeros,
+            rngs=rngs,
+        )
+        self.energy_context_gate = nnx.Linear(
             config.d_model,
             1,
             dtype=self.dtype,
@@ -313,17 +326,31 @@ class BRCModel(nnx.Module):
         next_belief = belief_logits.astype(jnp.float32) + alpha.astype(jnp.float32) * delta
         return self._normalize_belief_logits(next_belief, tokens)
 
-    def _fixed_point_stats(self, belief_logits: Array, next_belief: Array) -> tuple[Array, Array, Array, Array, Array]:
+    def _fixed_point_stats(
+        self,
+        belief_logits: Array,
+        next_belief: Array,
+        context_features: Array,
+    ) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
         prev_log_probs = jax.nn.log_softmax(belief_logits.astype(jnp.float32), axis=-1)
         next_log_probs = jax.nn.log_softmax(next_belief.astype(jnp.float32), axis=-1)
         prev_probs = jax.lax.stop_gradient(jnp.exp(prev_log_probs))
         next_probs = jnp.exp(next_log_probs)
-        kl_delta = jnp.mean(jnp.sum(prev_probs * (prev_log_probs - next_log_probs), axis=-1))
-        entropy = jnp.mean(-jnp.sum(next_probs * next_log_probs, axis=-1))
+        cell_kl = jnp.sum(prev_probs * (prev_log_probs - next_log_probs), axis=-1)
+        cell_entropy = -jnp.sum(next_probs * next_log_probs, axis=-1)
+        kl_delta = jnp.mean(cell_kl)
+        entropy = jnp.mean(cell_entropy)
         confidence = jnp.mean(jnp.max(next_probs, axis=-1))
-        update_norm = jnp.mean(jnp.linalg.norm((next_belief - belief_logits).astype(jnp.float32), axis=-1))
-        energy = update_norm + self.brc.fixed_point_entropy_weight * entropy
-        return energy, kl_delta, entropy, confidence, update_norm
+        cell_update_norm = jnp.linalg.norm((next_belief - belief_logits).astype(jnp.float32), axis=-1)
+        update_norm = jnp.mean(cell_update_norm)
+        context_weight = 2.0 * jax.nn.sigmoid(
+            self.energy_context_gate(maybe_cast(context_features, self.dtype)).astype(jnp.float32)
+        ).squeeze(-1)
+        cell_energy = cell_update_norm + self.brc.fixed_point_entropy_weight * cell_entropy
+        energy = jnp.sum(context_weight * cell_energy) / jnp.maximum(jnp.sum(context_weight), 1.0)
+        context_weight_reg = jnp.mean(jnp.square(context_weight - 1.0))
+        context_weight_mean = jnp.mean(context_weight)
+        return energy, kl_delta, entropy, confidence, update_norm, context_weight_reg, context_weight_mean
 
     def _scratch_refine(self, cell_input: Array) -> tuple[Array, dict[str, Array]]:
         scratch = self.input_to_scratch(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
@@ -399,7 +426,19 @@ class BRCModel(nnx.Module):
             belief_probs = jax.nn.softmax(next_belief, axis=-1)
             confidence = jnp.max(belief_probs, axis=-1)
             filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
-            energy, kl_delta, entropy, mean_confidence, update_norm = self._fixed_point_stats(belief_logits, next_belief)
+            (
+                energy,
+                kl_delta,
+                entropy,
+                mean_confidence,
+                update_norm,
+                context_weight_reg,
+                context_weight_mean,
+            ) = self._fixed_point_stats(
+                belief_logits,
+                next_belief,
+                base_embeddings,
+            )
             return next_carry, (
                 logits,
                 scratch_norm,
@@ -411,6 +450,8 @@ class BRCModel(nnx.Module):
                 entropy,
                 mean_confidence,
                 update_norm,
+                context_weight_reg,
+                context_weight_mean,
             )
 
         step_indices = jnp.arange(self.recurrent_steps, dtype=jnp.int32)
@@ -432,9 +473,18 @@ class BRCModel(nnx.Module):
             belief_final, raw_final_logits = final_carry
         else:
             belief_final = final_carry
-        final_energy, final_kl_delta, final_entropy, final_confidence, final_update_norm = self._fixed_point_stats(
+        (
+            final_energy,
+            final_kl_delta,
+            final_entropy,
+            final_confidence,
+            final_update_norm,
+            final_context_weight_reg,
+            final_context_weight_mean,
+        ) = self._fixed_point_stats(
             initial_belief.astype(jnp.float32),
             belief_final,
+            base_embeddings,
         )
         if return_final_only:
             final_step = jnp.asarray(self.recurrent_steps - 1, dtype=jnp.int32)
@@ -449,6 +499,8 @@ class BRCModel(nnx.Module):
                 "belief_entropy": final_entropy,
                 "belief_confidence": final_confidence,
                 "belief_update_norm": final_update_norm,
+                "context_weight_reg": final_context_weight_reg,
+                "context_weight_mean": final_context_weight_mean,
                 "unroll_steps": jnp.asarray(self.recurrent_steps, dtype=jnp.float32),
                 "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
                 "belief_logits": belief_final,
@@ -456,7 +508,20 @@ class BRCModel(nnx.Module):
             if return_raw_final_logits:
                 diagnostics["raw_final_logits"] = raw_final_logits
             return logits, diagnostics
-        step_logits, scratch_norm, filled_ratio, gate_mean, gate_std, energy, kl_delta, entropy, confidence, update_norm = scan_outputs
+        (
+            step_logits,
+            scratch_norm,
+            filled_ratio,
+            gate_mean,
+            gate_std,
+            energy,
+            kl_delta,
+            entropy,
+            confidence,
+            update_norm,
+            context_weight_reg,
+            context_weight_mean,
+        ) = scan_outputs
         diagnostics = {
             "scratch_norm": scratch_norm,
             "diffusion_filled_ratio": filled_ratio,
@@ -467,6 +532,8 @@ class BRCModel(nnx.Module):
             "belief_entropy": jnp.mean(entropy),
             "belief_confidence": jnp.mean(confidence),
             "belief_update_norm": jnp.mean(update_norm),
+            "context_weight_reg": jnp.mean(context_weight_reg),
+            "context_weight_mean": jnp.mean(context_weight_mean),
             "per_step_denoise_energy": energy,
             "per_step_belief_entropy": entropy,
             "unroll_steps": jnp.asarray(self.recurrent_steps, dtype=jnp.float32),

@@ -42,9 +42,12 @@ class BRCConfig:
     rope_theta: float = 10000.0
     step_loss_weights: tuple[float, ...] | None = None
     denoise_initial_prob: float = 0.4
+    denoise_trajectory_prob: float = 0.0
     denoise_teacher_reveal_prob: float = 0.25
-    denoise_mode_weights: tuple[float, ...] = (0.35, 0.20, 0.30, 0.15)
+    denoise_mode_weights: tuple[float, ...] = (0.30, 0.35, 0.35)
     fixed_point_entropy_weight: float = 0.01
+    fixed_point_loss_weight: float = 0.0
+    context_weight_reg_weight: float = 0.0
 
 
 @dataclass(frozen=True)

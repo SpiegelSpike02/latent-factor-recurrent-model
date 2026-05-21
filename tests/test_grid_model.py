@@ -408,15 +408,19 @@ class GridModelTests(unittest.TestCase):
             "invalid_rate",
             "conflicts",
             "belief_init_noise_rate",
-            "belief_init_uniform_rate",
+            "trajectory_noise_rate",
+            "belief_init_prior_rate",
             "belief_init_teacher_rate",
-            "belief_init_corrupt_rate",
-            "belief_init_soft_rate",
+            "belief_init_self_rate",
             "denoise_energy",
             "belief_kl_delta",
             "belief_entropy",
             "belief_confidence",
             "belief_update_norm",
+            "fixed_point_loss",
+            "context_weight_reg",
+            "context_weight_mean",
+            "context_weight_reg_loss",
             "scratch_norm",
             "step_gate_mean",
         ):
@@ -873,8 +877,11 @@ class GridModelTests(unittest.TestCase):
                 "num_heads = 4\n"
                 "step_loss_weights = [1.0, 2.0]\n"
                 "denoise_initial_prob = 0.4\n"
+                "denoise_trajectory_prob = 0.1\n"
                 "denoise_teacher_reveal_prob = 0.25\n"
-                "denoise_mode_weights = [0.35, 0.20, 0.30, 0.15]\n",
+                "denoise_mode_weights = [0.30, 0.35, 0.35]\n"
+                "fixed_point_loss_weight = 0.01\n"
+                "context_weight_reg_weight = 0.001\n",
                 encoding="utf-8",
             )
             loaded = load_toml_config(str(config_path))
@@ -887,7 +894,10 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_step_loss_weights"], [1.0, 2.0])
             self.assertEqual(loaded["brc_denoise_initial_prob"], 0.4)
-            self.assertEqual(loaded["brc_denoise_mode_weights"], [0.35, 0.20, 0.30, 0.15])
+            self.assertEqual(loaded["brc_denoise_trajectory_prob"], 0.1)
+            self.assertEqual(loaded["brc_denoise_mode_weights"], [0.30, 0.35, 0.35])
+            self.assertEqual(loaded["brc_fixed_point_loss_weight"], 0.01)
+            self.assertEqual(loaded["brc_context_weight_reg_weight"], 0.001)
 
             eval_config_path = Path(tmpdir) / "eval.toml"
             eval_config_path.write_text(
