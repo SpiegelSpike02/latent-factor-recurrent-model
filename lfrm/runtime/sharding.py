@@ -53,20 +53,15 @@ def is_batch_sharded_device(device: jax.Device | NamedSharding) -> bool:
 
 
 def device_put_batch_sharded(batch: dict[str, np.ndarray], sharding: NamedSharding) -> dict[str, jax.Array]:
-    devices = tuple(sharding.mesh.devices.flat)
-    if not devices:
+    num_devices = len(tuple(sharding.mesh.devices.flat))
+    if num_devices == 0:
         raise ValueError("Cannot shard a batch over an empty mesh")
 
     def put_leaf(value: np.ndarray) -> jax.Array:
-        if value.shape[0] % len(devices) != 0:
+        if value.shape[0] % num_devices != 0:
             raise ValueError(
-                f"Leading batch dimension {value.shape[0]} must be divisible by data devices={len(devices)}"
+                f"Leading batch dimension {value.shape[0]} must be divisible by data devices={num_devices}"
             )
-        index_map = sharding.devices_indices_map(value.shape)
-        local_arrays = [
-            jax.device_put(value[index_map[device]], device)
-            for device in devices
-        ]
-        return jax.make_array_from_single_device_arrays(value.shape, sharding, local_arrays)
+        return jax.device_put(value, sharding)
 
     return jax.tree.map(put_leaf, batch)
