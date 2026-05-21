@@ -112,7 +112,6 @@ class OptimizerConfig:
     puzzle_embed_coalesce_updates: bool = True
     lr_warmup_steps: int = 100
     grad_clip_norm: float = 1.0
-    flatten_optimizer: bool = False
 
 
 @dataclass(frozen=True)

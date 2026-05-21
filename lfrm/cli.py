@@ -63,7 +63,6 @@ ALLOWED_SECTION_KEYS = {
         "puzzle_embed_coalesce_updates",
         "lr_warmup_steps",
         "grad_clip_norm",
-        "flatten_optimizer",
     },
     "train": {
         "batch_size",
@@ -300,7 +299,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--puzzle-embed-coalesce-updates", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lr-warmup-steps", type=int, default=100)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
-    parser.add_argument("--flatten-optimizer", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compute-dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument(
         "--data-parallel-devices",
@@ -457,7 +455,6 @@ def build_config(
         puzzle_embed_coalesce_updates=args.puzzle_embed_coalesce_updates,
         lr_warmup_steps=args.lr_warmup_steps,
         grad_clip_norm=args.grad_clip_norm,
-        flatten_optimizer=args.flatten_optimizer,
     )
     train = TrainConfig(
         batch_size=args.batch_size,

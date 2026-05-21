@@ -203,6 +203,4 @@ def build_optimizer(config: ExperimentConfig, model: object | None = None) -> op
         )
     else:
         optimizer = default_optimizer
-    if config.optimizer.flatten_optimizer:
-        optimizer = optax.flatten(optimizer)
     return optimizer

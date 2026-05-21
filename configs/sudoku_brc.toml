@@ -44,7 +44,6 @@ beta2 = 0.95
 weight_decay = 0.1
 lr_warmup_steps = 3000
 grad_clip_norm = 1.0
-flatten_optimizer = false
 
 [train]
 batch_size = 768
