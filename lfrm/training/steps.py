@@ -190,7 +190,7 @@ def _refine_belief_step(
     train: bool,
     dropout_key: jax.Array | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, dict[str, jax.Array]]:
-    next_belief, next_hidden, _raw_delta, alpha, block_diagnostics = model._belief_step(
+    next_belief, next_hidden, alpha, block_diagnostics = model._belief_step(
         inputs,
         belief_logits,
         hidden_state,
@@ -242,7 +242,6 @@ def _brc_compact_training_rollout(
                 belief_logits,
                 noise_key,
             )
-            active = targets != 0
             noise_active = (
                 jax.random.uniform(active_key, (inputs.shape[0],)) < model.brc.denoise_trajectory_prob
             )
@@ -250,7 +249,6 @@ def _brc_compact_training_rollout(
             trajectory_noise_count = trajectory_noise_count + jnp.mean(noise_active.astype(jnp.float32))
         else:
             refine_input_belief = belief_logits
-            active = targets != 0
         next_belief, next_hidden, _alpha, block_diagnostics = _refine_belief_step(
             model,
             inputs,

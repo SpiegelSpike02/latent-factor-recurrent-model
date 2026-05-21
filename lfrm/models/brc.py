@@ -340,12 +340,6 @@ class BRCModel(nnx.Module):
     def context_mask(self, tokens: Array) -> Array:
         return tokens != 0
 
-    def draft_from_tokens(self, tokens: Array) -> Array:
-        return tokens.astype(jnp.int32)
-
-    def initial_draft(self, tokens: Array) -> Array:
-        return self.draft_from_tokens(tokens)
-
     def _normalize_belief_logits(self, belief_logits: Array, tokens: Array) -> Array:
         del tokens
         return belief_logits.astype(jnp.float32)
@@ -360,13 +354,6 @@ class BRCModel(nnx.Module):
         if mask is not None:
             hard_logits = jnp.where(mask[..., None], hard_logits, 0.0)
         return self._normalize_belief_logits(hard_logits, puzzle)
-
-    def belief_logits_from_draft(self, tokens: Array, draft: Array) -> Array:
-        class_ids = jnp.clip(draft, 0, self.config.vocab_size - 1)
-        active = jnp.ones_like(draft, dtype=bool)
-        hard_logits = -1.0e4 + 2.0e4 * jax.nn.one_hot(class_ids.astype(jnp.int32), self.belief_vocab_size)
-        hard_logits = jnp.where(active[..., None], hard_logits, 0.0)
-        return self._normalize_belief_logits(hard_logits, tokens)
 
     def _position_embeddings(self) -> Array:
         if self.brc.position_encoding != "learned":
@@ -412,9 +399,9 @@ class BRCModel(nnx.Module):
         belief_logits = self._normalize_belief_logits(belief_logits, tokens) * sharpen
         return belief_logits
 
-    def _belief_update(self, tokens: Array, belief_logits: Array, raw_delta: Array, alpha: Array, step_index: Array) -> Array:
+    def _belief_update(self, tokens: Array, belief_logits: Array, delta_logits: Array, alpha: Array, step_index: Array) -> Array:
         del step_index
-        delta = raw_delta.astype(jnp.float32)
+        delta = delta_logits.astype(jnp.float32)
         next_belief = belief_logits.astype(jnp.float32) + alpha.astype(jnp.float32) * delta
         return self._normalize_belief_logits(next_belief, tokens)
 
@@ -487,7 +474,7 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None,
-    ) -> tuple[Array, Array, Array, Array, dict[str, Array]]:
+    ) -> tuple[Array, Array, Array, dict[str, Array]]:
         cell_input = self._cell_embeddings(
             tokens,
             belief_logits,
@@ -499,9 +486,9 @@ class BRCModel(nnx.Module):
         hidden = self._hidden_l_cycle(hidden_state, cell_input)
         read_state = self._readout_fuse(hidden, cell_input)
         alpha = jax.nn.sigmoid(self.step_gate(maybe_cast(read_state, self.dtype)).astype(jnp.float32))
-        raw_delta = self.lm_head(maybe_cast(read_state, self.dtype))
-        next_belief = self._belief_update(tokens, belief_logits, raw_delta, alpha, step_index)
-        return next_belief, hidden, raw_delta.astype(jnp.float32), alpha, {
+        delta_logits = self.lm_head(maybe_cast(read_state, self.dtype))
+        next_belief = self._belief_update(tokens, belief_logits, delta_logits, alpha, step_index)
+        return next_belief, hidden, alpha, {
             "step_gate_mean": jnp.mean(alpha),
             "step_gate_std": jnp.std(alpha),
         }
@@ -517,8 +504,7 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None,
-    ) -> tuple[Array, Array, Array, Array, dict[str, Array]]:
-        raw_delta = jnp.zeros((*tokens.shape, self.config.vocab_size), dtype=jnp.float32)
+    ) -> tuple[Array, Array, Array, dict[str, Array]]:
         alpha = jnp.zeros((*tokens.shape, 1), dtype=jnp.float32)
         diagnostics = {
             "step_gate_mean": jnp.asarray(0.0, dtype=jnp.float32),
@@ -529,7 +515,7 @@ class BRCModel(nnx.Module):
         else:
             h_dropout_keys = jax.random.split(dropout_key, self.h_cycles)
         for h_index in range(self.h_cycles - 1):
-            belief_logits, hidden_state, raw_delta, alpha, diagnostics = self._h_cycle_step(
+            belief_logits, hidden_state, alpha, diagnostics = self._h_cycle_step(
                 tokens,
                 belief_logits,
                 hidden_state,
@@ -541,7 +527,7 @@ class BRCModel(nnx.Module):
             )
             belief_logits = jax.lax.stop_gradient(belief_logits)
             hidden_state = jax.lax.stop_gradient(hidden_state)
-        belief_logits, hidden_state, raw_delta, alpha, diagnostics = self._h_cycle_step(
+        belief_logits, hidden_state, alpha, diagnostics = self._h_cycle_step(
             tokens,
             belief_logits,
             hidden_state,
@@ -551,7 +537,7 @@ class BRCModel(nnx.Module):
             train=train,
             dropout_key=h_dropout_keys[self.h_cycles - 1],
         )
-        return belief_logits, jax.lax.stop_gradient(hidden_state), raw_delta, alpha, diagnostics
+        return belief_logits, jax.lax.stop_gradient(hidden_state), alpha, diagnostics
 
     def initial_hidden_state(
         self,
@@ -590,29 +576,21 @@ class BRCModel(nnx.Module):
         self,
         tokens: Array,
         *,
-        initial_draft: Array | None = None,
         initial_belief: Array | None = None,
         train: bool,
         dropout_key: Array | None = None,
-        return_raw_final_logits: bool = False,
         return_final_only: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
         if initial_belief is None:
-            if initial_draft is None:
-                initial_belief = self.initial_belief_logits(tokens)
-            else:
-                initial_belief = self.belief_logits_from_draft(tokens, initial_draft)
+            initial_belief = self.initial_belief_logits(tokens)
         base_embeddings, context = self.context_memory(tokens)
         query_mask = (~context).astype(jnp.float32)
         query_normalizer = jnp.maximum(jnp.sum(query_mask), 1.0)
 
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key, time_embedding = scan_inputs
-            if return_raw_final_logits:
-                belief_logits, hidden_state, _raw_final_logits = carry
-            else:
-                belief_logits, hidden_state = carry
-            next_belief, next_hidden, raw_delta, _alpha, block_diagnostics = self._belief_step(
+            belief_logits, hidden_state = carry
+            next_belief, next_hidden, _alpha, block_diagnostics = self._belief_step(
                 tokens,
                 belief_logits,
                 hidden_state,
@@ -623,8 +601,6 @@ class BRCModel(nnx.Module):
                 dropout_key=step_dropout_key,
             )
             next_carry = (jax.lax.stop_gradient(next_belief), next_hidden)
-            if return_raw_final_logits:
-                next_carry = (jax.lax.stop_gradient(next_belief), next_hidden, raw_delta.astype(jnp.float32))
             if return_final_only:
                 return next_carry, None
             logits = self._belief_to_token_logits(next_belief, tokens, step_index)
@@ -673,18 +649,12 @@ class BRCModel(nnx.Module):
             dropout_key=step_dropout_keys[0],
         )
         initial_carry = (initial_belief.astype(jnp.float32), initial_hidden)
-        if return_raw_final_logits:
-            raw_final0 = jnp.zeros((*tokens.shape, self.config.vocab_size), dtype=jnp.float32)
-            initial_carry = (initial_belief.astype(jnp.float32), initial_hidden, raw_final0)
         final_carry, scan_outputs = jax.lax.scan(
             scan_step,
             initial_carry,
             (step_indices, step_dropout_keys, time_embeddings),
         )
-        if return_raw_final_logits:
-            belief_final, _hidden_final, raw_final_logits = final_carry
-        else:
-            belief_final, _hidden_final = final_carry
+        belief_final, _hidden_final = final_carry
         (
             final_energy,
             final_kl_delta,
@@ -716,8 +686,6 @@ class BRCModel(nnx.Module):
                 "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
                 "belief_logits": belief_final,
             }
-            if return_raw_final_logits:
-                diagnostics["raw_final_logits"] = raw_final_logits
             return logits, diagnostics
         (
             step_logits,
@@ -749,8 +717,6 @@ class BRCModel(nnx.Module):
             "draft": jnp.argmax(belief_final, axis=-1).astype(jnp.int32) + 1,
             "belief_logits": belief_final,
         }
-        if return_raw_final_logits:
-            diagnostics["raw_final_logits"] = raw_final_logits
         return step_logits, diagnostics
 
     def forward_all_steps_with_diagnostics(
@@ -759,14 +725,10 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
-        initial_draft: Array | None = None,
         initial_belief: Array | None = None,
-        compute_terminal_residual: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
-        del compute_terminal_residual
         return self.run_diffusion(
             tokens,
-            initial_draft=initial_draft,
             initial_belief=initial_belief,
             train=train,
             dropout_key=dropout_key,
@@ -778,17 +740,13 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
-        initial_draft: Array | None = None,
         initial_belief: Array | None = None,
-        compute_terminal_residual: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
         return self.forward_all_steps_with_diagnostics(
             tokens,
             train=train,
             dropout_key=dropout_key,
-            initial_draft=initial_draft,
             initial_belief=initial_belief,
-            compute_terminal_residual=compute_terminal_residual,
         )
 
     def forward_all_steps(
