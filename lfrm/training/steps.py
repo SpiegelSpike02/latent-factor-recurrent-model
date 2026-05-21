@@ -170,6 +170,28 @@ def _sudoku_board_metrics(
     return context_consistency, invalid_rate, conflicts
 
 
+def _brc_region_masks(model: BRCModel, inputs: jax.Array, loss_mask: jax.Array) -> tuple[jax.Array, jax.Array]:
+    context_mask = model.context_mask(inputs) & (loss_mask > 0.0)
+    query_mask = (~model.context_mask(inputs)) & (loss_mask > 0.0)
+    return context_mask.astype(jnp.float32), query_mask.astype(jnp.float32)
+
+
+def _masked_cell_accuracy(predictions: jax.Array, targets: jax.Array, mask: jax.Array) -> jax.Array:
+    correct = (predictions == targets).astype(jnp.float32) * mask.astype(jnp.float32)
+    return jnp.sum(correct) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
+
+
+def _masked_target_probability(
+    model: BRCModel,
+    logits: jax.Array,
+    targets: jax.Array,
+    mask: jax.Array,
+) -> jax.Array:
+    probability = token_target_probability(model, logits, targets)
+    mask_f32 = mask.astype(jnp.float32)
+    return jnp.sum(probability * mask_f32) / jnp.maximum(jnp.sum(mask_f32), 1.0)
+
+
 def _normalized_step_loss_weights(configured: tuple[float, ...] | None, rollout_steps: int) -> jax.Array:
     if configured is None:
         weights = jnp.arange(1, rollout_steps + 1, dtype=jnp.float32)
@@ -396,6 +418,8 @@ def brc_loss_and_metrics(
     loss_mask = _apply_example_mask(supervised_loss_mask(model, jnp.zeros_like(inputs, dtype=bool), targets), example_mask)
     brc = model.brc
     zero = jnp.asarray(0.0, dtype=jnp.float32)
+    context_mask, query_mask = _brc_region_masks(model, inputs, loss_mask)
+    metric_loss_mask = loss_mask
 
     initial_belief = model.initial_belief_logits(inputs)
     belief_init_noise_rate = zero
@@ -428,6 +452,7 @@ def brc_loss_and_metrics(
         belief_init_teacher_rate = jnp.sum(((denoise_mode == 1).astype(jnp.float32)) * denoise_active_f32) / active_normalizer
         belief_init_self_rate = jnp.sum(((denoise_mode == 2).astype(jnp.float32)) * denoise_active_f32) / active_normalizer
     normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32)), 1.0)
+    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32), axis=-1), 1.0)
     if train:
         final_logits, per_step_loss, diagnostics = _brc_compact_training_rollout(
             model,
@@ -453,16 +478,18 @@ def brc_loss_and_metrics(
     step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
     step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
     solution_loss = per_step_loss[-1]
-    supervised_cells_per_example = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
     fixed_point_loss = brc.fixed_point_loss_weight * diagnostics["denoise_energy"]
     context_weight_reg_loss = brc.context_weight_reg_weight * diagnostics["context_weight_reg"]
     loss = step_ce_loss + fixed_point_loss + context_weight_reg_loss
 
     predictions = jnp.argmax(final_logits, axis=-1)
-    correct = (predictions == targets).astype(jnp.float32) * loss_mask.astype(jnp.float32)
-    cell_accuracy = jnp.sum(correct) / normalizer
-    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32), axis=-1), 1.0)
-    correct_per_example = jnp.sum(correct, axis=-1)
+    metric_correct = (predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
+    metric_normalizer = jnp.maximum(jnp.sum(metric_loss_mask.astype(jnp.float32)), 1.0)
+    cell_accuracy = jnp.sum(metric_correct) / metric_normalizer
+    given_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
+    query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
+    supervised_cells_per_example = jnp.sum(metric_loss_mask.astype(jnp.float32), axis=-1)
+    correct_per_example = jnp.sum(metric_correct, axis=-1)
     exact_examples = jnp.where(
         supervised_cells_per_example > 0,
         correct_per_example == supervised_cells_per_example,
@@ -473,6 +500,8 @@ def brc_loss_and_metrics(
     exact_count = jnp.sum(exact_f32 * example_mask)
     target_probability = token_target_probability(model, final_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask.astype(jnp.float32)) / normalizer
+    given_target_probability = _masked_target_probability(model, final_logits, targets, context_mask)
+    query_target_probability = _masked_target_probability(model, final_logits, targets, query_mask)
     if train:
         oracle_step = jnp.argmin(per_step_loss)
     else:
@@ -489,8 +518,12 @@ def brc_loss_and_metrics(
         "mean_lm_loss": jnp.mean(per_step_loss),
         "final_target_probability": target_probability,
         "accuracy": cell_accuracy,
+        "given_accuracy": given_accuracy,
+        "query_accuracy": query_accuracy,
         "exact_accuracy": exact_accuracy,
         "exact_count": exact_count,
+        "given_target_probability": given_target_probability,
+        "query_target_probability": query_target_probability,
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "context_consistency": context_consistency,
         "invalid_rate": invalid_rate,
