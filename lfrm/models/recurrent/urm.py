@@ -14,9 +14,9 @@ from lfrm.models.recurrent.layers import (
     casted_linear_init,
     compute_dtype,
     maybe_cast,
-    rms_norm as _rms_norm,
     swiglu_intermediate_size,
     trunc_normal,
+    unscaled_rms_norm,
 )
 
 
@@ -80,7 +80,9 @@ class URMBlock(nnx.Module):
             name="URM",
             rngs=rngs,
         )
+        self.attention_norm = unscaled_rms_norm(config.d_model, self.norm_eps, dtype, rngs)
         self.conv_swiglu = ConvSwiGLU(config, dtype, rngs=rngs)
+        self.mlp_norm = unscaled_rms_norm(config.d_model, self.norm_eps, dtype, rngs)
 
     def __call__(self, h: Array, rope_cos: Array, rope_sin: Array) -> Array:
         attn_output = self.attention(
@@ -88,9 +90,9 @@ class URMBlock(nnx.Module):
             rope_cos=rope_cos,
             rope_sin=rope_sin,
         )
-        h = _rms_norm(h + attn_output.astype(h.dtype), self.norm_eps)
+        h = self.attention_norm(h + attn_output.astype(h.dtype))
         mlp_output = self.conv_swiglu(maybe_cast(h, self.dtype))
-        return _rms_norm(h + mlp_output.astype(h.dtype), self.norm_eps)
+        return self.mlp_norm(h + mlp_output.astype(h.dtype))
 
 
 class UnifiedReasoningModel(nnx.Module):

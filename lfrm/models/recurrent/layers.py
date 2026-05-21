@@ -24,6 +24,17 @@ def rms_norm(x: Array, eps: float) -> Array:
     return (x_f32 * jax.lax.rsqrt(variance + eps)).astype(x.dtype)
 
 
+def unscaled_rms_norm(num_features: int, eps: float, dtype: jnp.dtype, rngs: nnx.Rngs) -> nnx.RMSNorm:
+    return nnx.RMSNorm(
+        num_features,
+        epsilon=eps,
+        dtype=dtype,
+        param_dtype=jnp.float32,
+        use_scale=False,
+        rngs=rngs,
+    )
+
+
 def rotate_half(x: Array) -> Array:
     first, second = jnp.split(x, 2, axis=-1)
     return jnp.concatenate((-second, first), axis=-1)
@@ -70,6 +81,32 @@ def dot_product_attention(
         bias=attention_bias,
         implementation=implementation,
     )
+
+
+def multi_head_attention_with_rope(
+    attention: nnx.MultiHeadAttention,
+    query_input: Array,
+    key_input: Array,
+    value_input: Array,
+    *,
+    num_heads: int,
+    head_dim: int,
+    dtype: jnp.dtype,
+    rope_cos: Array | None = None,
+    rope_sin: Array | None = None,
+    bias: Array | None = None,
+    name: str = "attention",
+) -> Array:
+    q = attention.query(maybe_cast(query_input, dtype))
+    k = attention.key(maybe_cast(key_input, dtype))
+    v = attention.value(maybe_cast(value_input, dtype))
+    expected_heads = (num_heads, head_dim)
+    if q.shape[-2:] != expected_heads or k.shape[-2:] != expected_heads or v.shape[-2:] != expected_heads:
+        raise ValueError(f"{name} projection shape does not match configured heads")
+    if rope_cos is not None and rope_sin is not None:
+        q, k = apply_rope(q, k, rope_cos, rope_sin)
+    attended = dot_product_attention(q, k, v, bias=bias)
+    return attention.out(attended)
 
 
 def swiglu_intermediate_size(hidden_size: int, expansion: float, *, min_size: int = 1) -> int:
@@ -129,26 +166,23 @@ class FullAttention(nnx.Module):
     ) -> None:
         if d_model % num_heads != 0:
             raise ValueError(f"{name} d_model must be divisible by num_heads")
+        self.name = name
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.dtype = dtype
-        self.qkv = nnx.Linear(
-            d_model,
-            3 * d_model,
-            use_bias=False,
+        self.attention = nnx.MultiHeadAttention(
+            num_heads,
+            in_features=d_model,
+            qkv_features=d_model,
+            out_features=d_model,
             dtype=dtype,
             param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.out = nnx.Linear(
-            d_model,
-            d_model,
             use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
+            dropout_rate=0.0,
+            attention_fn=dot_product_attention,
             kernel_init=casted_linear_init,
+            out_kernel_init=casted_linear_init,
             rngs=rngs,
         )
 
@@ -160,17 +194,19 @@ class FullAttention(nnx.Module):
         rope_sin: Array | None = None,
         bias: Array | None = None,
     ) -> Array:
-        batch_size, seq_len, d_model = hidden_states.shape
-        qkv = self.qkv(maybe_cast(hidden_states, self.dtype))
-        q, k, v = jnp.split(qkv, 3, axis=-1)
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = v.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        if rope_cos is not None and rope_sin is not None:
-            q, k = apply_rope(q, k, rope_cos, rope_sin)
-        attended = dot_product_attention(q, k, v, bias=bias)
-        attended = attended.reshape(batch_size, seq_len, d_model)
-        return self.out(attended)
+        return multi_head_attention_with_rope(
+            self.attention,
+            hidden_states,
+            hidden_states,
+            hidden_states,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            bias=bias,
+            name=self.name,
+        )
 
 
 __all__ = [
@@ -183,9 +219,11 @@ __all__ = [
     "compute_dtype",
     "dot_product_attention",
     "maybe_cast",
+    "multi_head_attention_with_rope",
     "rms_norm",
     "rotate_half",
     "swiglu_intermediate_size",
     "trunc_normal",
     "trunc_normal_init",
+    "unscaled_rms_norm",
 ]

@@ -15,9 +15,9 @@ from lfrm.models.recurrent.layers import (
     casted_linear_init,
     compute_dtype,
     maybe_cast,
-    rms_norm as _rms_norm,
     trunc_normal,
     trunc_normal_init,
+    unscaled_rms_norm,
 )
 
 
@@ -105,6 +105,7 @@ class TRMBlock(nnx.Module):
         self.trm = trm
         if trm.mlp_t:
             self.token_mlp = SwiGLU(sequence_length, trm.mlp_ratio, dtype, rngs=rngs)
+            self.token_norm = unscaled_rms_norm(sequence_length, trm.rms_norm_eps, dtype, rngs)
         else:
             self.attention = FullAttention(
                 config.d_model,
@@ -113,9 +114,12 @@ class TRMBlock(nnx.Module):
                 name="TRM",
                 rngs=rngs,
             )
+            self.attention_norm = unscaled_rms_norm(config.d_model, trm.rms_norm_eps, dtype, rngs)
         if trm.local_mixing:
             self.local_mixing = LocalConvSwiGLU(config, prefix_len, dtype, rngs=rngs)
+            self.local_norm = unscaled_rms_norm(config.d_model, trm.rms_norm_eps, dtype, rngs)
         self.channel_mlp = SwiGLU(config.d_model, trm.mlp_ratio, dtype, rngs=rngs)
+        self.channel_norm = unscaled_rms_norm(config.d_model, trm.rms_norm_eps, dtype, rngs)
 
     def __call__(
         self,
@@ -126,7 +130,7 @@ class TRMBlock(nnx.Module):
     ) -> Array:
         if self.trm.mlp_t:
             mixed = jnp.swapaxes(hidden_states, 1, 2)
-            mixed = _rms_norm(mixed + self.token_mlp(mixed), self.trm.rms_norm_eps)
+            mixed = self.token_norm(mixed + self.token_mlp(mixed))
             hidden_states = jnp.swapaxes(mixed, 1, 2)
         else:
             attention_out = self.attention(
@@ -135,19 +139,10 @@ class TRMBlock(nnx.Module):
                 rope_sin=rope_sin,
                 bias=attention_bias,
             )
-            hidden_states = _rms_norm(
-                hidden_states + attention_out,
-                self.trm.rms_norm_eps,
-            )
+            hidden_states = self.attention_norm(hidden_states + attention_out)
         if self.trm.local_mixing:
-            hidden_states = _rms_norm(
-                hidden_states + self.local_mixing(hidden_states),
-                self.trm.rms_norm_eps,
-            )
-        hidden_states = _rms_norm(
-            hidden_states + self.channel_mlp(hidden_states),
-            self.trm.rms_norm_eps,
-        )
+            hidden_states = self.local_norm(hidden_states + self.local_mixing(hidden_states))
+        hidden_states = self.channel_norm(hidden_states + self.channel_mlp(hidden_states))
         return hidden_states
 
 
