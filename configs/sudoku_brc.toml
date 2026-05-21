@@ -23,11 +23,7 @@ mlp_ratio = 4
 position_encoding = "rope"
 rms_norm_eps = 1e-5
 rope_theta = 10000.0
-# Relative CE weights for belief steps 1..8. The training code normalizes
-# this vector, so the values control schedule shape rather than total scale.
-step_loss_weights = [
-  1, 2, 3, 4, 5, 6, 7, 8,
-]
+step_loss_schedule = "uniform"
 denoise_initial_prob = 0.0
 denoise_trajectory_prob = 0.0
 denoise_teacher_reveal_prob = 0.25

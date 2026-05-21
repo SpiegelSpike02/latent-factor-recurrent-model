@@ -204,7 +204,11 @@ def _refine_belief_step(
 
 
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
-    return _normalized_step_loss_weights(model.brc.step_loss_weights, rollout_steps)
+    if model.brc.step_loss_schedule == "linear":
+        weights = jnp.arange(1, rollout_steps + 1, dtype=jnp.float32)
+    else:
+        weights = jnp.ones((rollout_steps,), dtype=jnp.float32)
+    return weights / jnp.maximum(jnp.sum(weights), 1e-6)
 
 
 def _brc_compact_training_rollout(

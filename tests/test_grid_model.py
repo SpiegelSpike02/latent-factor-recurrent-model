@@ -829,7 +829,7 @@ class GridModelTests(unittest.TestCase):
                 "hidden_state_dim = 16\n"
                 "l_layers = 1\n"
                 "num_heads = 4\n"
-                "step_loss_weights = [1.0, 2.0]\n"
+                "step_loss_schedule = \"linear\"\n"
                 "denoise_initial_prob = 0.4\n"
                 "denoise_trajectory_prob = 0.1\n"
                 "denoise_teacher_reveal_prob = 0.25\n"
@@ -847,7 +847,7 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_hidden_state_dim"], 16)
             self.assertEqual(loaded["brc_l_layers"], 1)
             self.assertEqual(loaded["brc_num_heads"], 4)
-            self.assertEqual(loaded["brc_step_loss_weights"], [1.0, 2.0])
+            self.assertEqual(loaded["brc_step_loss_schedule"], "linear")
             self.assertEqual(loaded["brc_denoise_initial_prob"], 0.4)
             self.assertEqual(loaded["brc_denoise_trajectory_prob"], 0.1)
             self.assertEqual(loaded["brc_denoise_mode_weights"], [0.30, 0.35, 0.35])

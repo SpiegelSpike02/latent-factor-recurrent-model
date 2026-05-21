@@ -41,7 +41,7 @@ class BRCConfig:
     position_encoding: str = "rope"
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
-    step_loss_weights: tuple[float, ...] | None = None
+    step_loss_schedule: str = "uniform"
     denoise_initial_prob: float = 0.4
     denoise_trajectory_prob: float = 0.0
     denoise_teacher_reveal_prob: float = 0.25

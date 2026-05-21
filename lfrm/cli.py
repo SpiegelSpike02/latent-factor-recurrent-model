@@ -121,7 +121,7 @@ ALLOWED_NESTED_KEYS = {
         "position_encoding",
         "rms_norm_eps",
         "rope_theta",
-        "step_loss_weights",
+        "step_loss_schedule",
         "denoise_initial_prob",
         "denoise_trajectory_prob",
         "denoise_teacher_reveal_prob",
@@ -269,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-position-encoding", choices=("rope", "learned", "none"), default="rope")
     parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
-    parser.add_argument("--brc-step-loss-weights", type=float, nargs="*", default=None)
+    parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear"), default="uniform")
     parser.add_argument("--brc-denoise-initial-prob", type=float, default=0.4)
     parser.add_argument("--brc-denoise-trajectory-prob", type=float, default=0.0)
     parser.add_argument("--brc-denoise-teacher-reveal-prob", type=float, default=0.25)
@@ -419,7 +419,7 @@ def build_config(
             position_encoding=args.brc_position_encoding,
             rms_norm_eps=args.brc_rms_norm_eps,
             rope_theta=args.brc_rope_theta,
-            step_loss_weights=tuple(args.brc_step_loss_weights) if args.brc_step_loss_weights is not None else None,
+            step_loss_schedule=args.brc_step_loss_schedule,
             denoise_initial_prob=args.brc_denoise_initial_prob,
             denoise_trajectory_prob=args.brc_denoise_trajectory_prob,
             denoise_teacher_reveal_prob=args.brc_denoise_teacher_reveal_prob,
