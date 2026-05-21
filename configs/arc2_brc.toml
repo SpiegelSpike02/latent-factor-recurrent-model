@@ -16,8 +16,6 @@ loss_type = "stablemax"
 
 [model.brc]
 recurrent_steps = 16
-refinement_cycles = 1
-refinement_steps = 1
 block_layers = 1
 num_heads = 8
 mlp_ratio = 4

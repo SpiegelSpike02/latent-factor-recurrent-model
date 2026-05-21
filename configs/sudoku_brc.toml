@@ -14,8 +14,6 @@ dropout_rate = 0.05
 
 [model.brc]
 recurrent_steps = 24
-refinement_cycles = 1
-refinement_steps = 1
 block_layers = 1
 num_heads = 8
 mlp_ratio = 4
@@ -50,7 +48,7 @@ flatten_optimizer = true
 
 [train]
 batch_size = 768
-epochs = 23040
+epochs = 10000
 log_epochs = 10
 seed = 0
 checkpoint_dir = "checkpoints"
@@ -61,7 +59,7 @@ decay = 0.995
 
 [eval]
 batch_size = 8192
-epochs = 1920
+epochs = 1000
 diagnostics = false
 full_dataset = true
 
@@ -75,5 +73,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-belief-rope-dualrec-b768"
+name = "sudoku-brc-belief-rope-stateless-b768"
 mode = "online"

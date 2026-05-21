@@ -169,7 +169,17 @@ LEGACY_METRIC_NAMES = {
     "conflict_count",
 }
 BRC_CONSOLE_GROUPS = (
-    ("objective", ("loss", "lm_loss", "final_lm_loss", "mean_lm_loss")),
+    (
+        "objective",
+        (
+            "loss",
+            "lm_loss",
+            "final_lm_loss",
+            "mean_lm_loss",
+            "fixed_point_loss",
+            "context_weight_reg_loss",
+        ),
+    ),
     (
         "solve",
         (
@@ -188,19 +198,29 @@ BRC_CONSOLE_GROUPS = (
         ),
     ),
     (
-        "belief",
+        "energy",
         (
             "denoise_energy",
             "belief_kl_delta",
             "belief_entropy",
             "belief_confidence",
             "belief_update_norm",
-            "fixed_point_loss",
             "context_weight_reg",
             "context_weight_mean",
+        ),
+    ),
+    (
+        "dynamics",
+        (
             "scratch_norm",
             "diffusion_filled_ratio",
             "step_gate_mean",
+            "step_gate_std",
+        ),
+    ),
+    (
+        "noise",
+        (
             "belief_init_noise_rate",
             "trajectory_noise_rate",
             "belief_init_prior_rate",

@@ -188,7 +188,7 @@ def _refine_belief_step(
     *,
     train: bool,
     dropout_key: jax.Array | None,
-) -> tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
+) -> tuple[jax.Array, jax.Array, jax.Array, dict[str, jax.Array]]:
     cell_input = model._cell_embeddings(
         inputs,
         belief_logits,
@@ -197,11 +197,10 @@ def _refine_belief_step(
         train=train,
         dropout_key=dropout_key,
     )
-    scratch, block_diagnostics = model._scratch_refine(cell_input)
+    scratch, alpha, block_diagnostics = model._scratch_refine(cell_input)
     raw_delta = model.lm_head(scratch.astype(model.dtype))
-    alpha = jax.nn.sigmoid(model.step_gate(scratch.astype(model.dtype)).astype(jnp.float32))
     next_belief = model._belief_update(inputs, belief_logits, raw_delta, alpha, step_index)
-    return next_belief, scratch, block_diagnostics
+    return next_belief, scratch, alpha, block_diagnostics
 
 
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
@@ -248,7 +247,7 @@ def _brc_compact_training_rollout(
         else:
             refine_input_belief = belief_logits
             active = targets != 0
-        next_belief, scratch, block_diagnostics = _refine_belief_step(
+        next_belief, scratch, _alpha, block_diagnostics = _refine_belief_step(
             model,
             inputs,
             refine_input_belief,

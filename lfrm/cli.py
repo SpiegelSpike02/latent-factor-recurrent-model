@@ -117,8 +117,6 @@ ALLOWED_NESTED_KEYS = {
     },
     "brc": {
         "recurrent_steps",
-        "refinement_cycles",
-        "refinement_steps",
         "block_layers",
         "num_heads",
         "mlp_ratio",
@@ -264,8 +262,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-recurrent-steps", type=int, default=6)
-    parser.add_argument("--brc-refinement-cycles", type=int, default=1)
-    parser.add_argument("--brc-refinement-steps", type=int, default=1)
     parser.add_argument("--brc-block-layers", type=int, default=1)
     parser.add_argument("--brc-num-heads", type=int, default=4)
     parser.add_argument("--brc-mlp-ratio", type=int, default=2)
@@ -414,8 +410,6 @@ def build_config(
         ),
         brc=BRCConfig(
             recurrent_steps=args.brc_recurrent_steps,
-            refinement_cycles=args.brc_refinement_cycles,
-            refinement_steps=args.brc_refinement_steps,
             block_layers=args.brc_block_layers,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,

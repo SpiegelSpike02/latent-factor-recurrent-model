@@ -32,8 +32,6 @@ class TRMConfig:
 @dataclass(frozen=True)
 class BRCConfig:
     recurrent_steps: int = 6
-    refinement_cycles: int = 1
-    refinement_steps: int = 1
     block_layers: int = 1
     num_heads: int = 4
     mlp_ratio: int = 2

@@ -83,8 +83,6 @@ class BRCModel(nnx.Module):
         brc = config.brc_config
         if brc.recurrent_steps < 1:
             raise ValueError("BRC recurrent_steps must be at least 1")
-        if min(brc.refinement_cycles, brc.refinement_steps) < 1:
-            raise ValueError("BRC refinement_cycles and refinement_steps must be at least 1")
         if brc.block_layers < 1:
             raise ValueError("BRC block_layers must be at least 1")
         if brc.num_heads < 1:
@@ -352,12 +350,12 @@ class BRCModel(nnx.Module):
         context_weight_mean = jnp.mean(context_weight)
         return energy, kl_delta, entropy, confidence, update_norm, context_weight_reg, context_weight_mean
 
-    def _scratch_refine(self, cell_input: Array) -> tuple[Array, dict[str, Array]]:
+    def _scratch_refine(self, cell_input: Array) -> tuple[Array, Array, dict[str, Array]]:
         scratch = self.input_to_scratch(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
         for block in self.solver_blocks:
             scratch = block(scratch, self.rope_cos, self.rope_sin)
         alpha = jax.nn.sigmoid(self.step_gate(maybe_cast(scratch, self.dtype)).astype(jnp.float32))
-        return scratch, {
+        return scratch, alpha, {
             "step_gate_mean": jnp.mean(alpha),
             "step_gate_std": jnp.std(alpha),
             "scratch_norm": jnp.mean(jnp.linalg.norm(scratch.astype(jnp.float32), axis=-1)),
@@ -410,9 +408,8 @@ class BRCModel(nnx.Module):
                 train=train,
                 dropout_key=step_dropout_key,
             )
-            scratch, block_diagnostics = self._scratch_refine(cell_input)
+            scratch, alpha, block_diagnostics = self._scratch_refine(cell_input)
             raw_delta = self.lm_head(maybe_cast(scratch, self.dtype))
-            alpha = jax.nn.sigmoid(self.step_gate(maybe_cast(scratch, self.dtype)).astype(jnp.float32))
             next_belief = self._belief_update(tokens, belief_logits, raw_delta, alpha, step_index)
             next_carry = next_belief
             if return_raw_final_logits:
