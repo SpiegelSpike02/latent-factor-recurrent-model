@@ -14,11 +14,11 @@ dropout_rate = 0.0
 loss_type = "stablemax"
 
 [model.brc]
-belief_steps = 12
-h_cycles = 2
-l_cycles = 6
+belief_steps = 8
+h_cycles = 3
+l_cycles = 4
 hidden_state_dim = 256
-l_layers = 2
+l_layers = 1
 num_heads = 8
 mlp_ratio = 4
 position_encoding = "rope"
@@ -37,7 +37,7 @@ lr_warmup_steps = 2000
 grad_clip_norm = 1.0
 
 [train]
-batch_size = 768
+batch_size = 384
 epochs = 50000
 log_epochs = 10
 halt_loss_weight = 0.5
@@ -49,7 +49,7 @@ enabled = true
 decay = 0.999
 
 [eval]
-batch_size = 768
+batch_size = 384
 epochs = 5000
 diagnostics = false
 full_dataset = true
@@ -64,5 +64,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-brc-belief-dualtime-b768"
+name = "maze-brc-belief-dualtime-h3l4-b384"
 mode = "online"

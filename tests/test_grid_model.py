@@ -708,7 +708,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=4,
                 d_model=8,
                 urm=URMConfig(
-                    belief_steps=2,
+                    recurrent_steps=2,
                     h_cycles=1,
                     l_cycles=1,
                     l_layers=1,

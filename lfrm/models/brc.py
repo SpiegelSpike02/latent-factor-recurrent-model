@@ -40,27 +40,11 @@ class BRCSolverBlock(nnx.Module):
             rngs=rngs,
         )
         self.self_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
-        self.cross_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
         self.film_input_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
         self.film_output_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
         self.message_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.cross_attention = nnx.MultiHeadAttention(
-            num_heads,
-            in_features=hidden_dim,
-            qkv_features=hidden_dim,
-            out_features=hidden_dim,
-            in_kv_features=hidden_dim,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            use_bias=False,
-            dropout_rate=0.0,
-            attention_fn=dot_product_attention,
-            kernel_init=casted_linear_init,
-            out_kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
         self.film = nnx.Linear(
             hidden_dim,
             2 * hidden_dim,
@@ -93,6 +77,7 @@ class BRCSolverBlock(nnx.Module):
         rope_cos: Array | None,
         rope_sin: Array | None,
     ) -> Array:
+        h = self.self_norm(h.astype(jnp.float32) + condition.astype(jnp.float32)).astype(self.dtype)
         attn = multi_head_attention_with_rope(
             self.self_attention,
             h,
@@ -106,19 +91,6 @@ class BRCSolverBlock(nnx.Module):
             name="BRC self attention",
         )
         h = self.self_norm(h.astype(jnp.float32) + attn.astype(jnp.float32)).astype(self.dtype)
-        cross = multi_head_attention_with_rope(
-            self.cross_attention,
-            h,
-            condition,
-            condition,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            dtype=self.dtype,
-            rope_cos=rope_cos,
-            rope_sin=rope_sin,
-            name="BRC cross attention",
-        )
-        h = self.cross_norm(h.astype(jnp.float32) + cross.astype(jnp.float32)).astype(self.dtype)
         pooled_condition = jnp.mean(condition.astype(jnp.float32), axis=1)
         scale, shift = jnp.split(self.film(maybe_cast(pooled_condition, self.dtype)).astype(jnp.float32), 2, axis=-1)
         h_norm = self.film_input_norm(h.astype(jnp.float32)).astype(jnp.float32)
@@ -431,11 +403,10 @@ class BRCModel(nnx.Module):
         hidden_state: Array,
         base_embeddings: Array,
         time_embedding: Array,
-        step_index: Array,
         *,
         train: bool,
         dropout_key: Array | None,
-    ) -> tuple[Array, Array, Array]:
+    ) -> Array:
         cell_input = self._cell_embeddings(
             tokens,
             belief_logits,
@@ -444,12 +415,7 @@ class BRCModel(nnx.Module):
             train=train,
             dropout_key=dropout_key,
         )
-        hidden = self._hidden_l_cycle(hidden_state, cell_input)
-        read_state = self._readout_fuse(hidden, cell_input)
-        delta_logits = self.lm_head(maybe_cast(read_state, self.dtype))
-        halt_logits = self._halt_logits(read_state)
-        next_belief = self._belief_update(tokens, belief_logits, delta_logits, step_index)
-        return next_belief, hidden, halt_logits
+        return self._hidden_l_cycle(hidden_state, cell_input)
 
     def _belief_step(
         self,
@@ -467,31 +433,39 @@ class BRCModel(nnx.Module):
             h_dropout_keys = jax.random.split(jax.random.key(0), self.h_cycles)
         else:
             h_dropout_keys = jax.random.split(dropout_key, self.h_cycles)
-        halt_logits = jnp.zeros((tokens.shape[0],), dtype=jnp.float32)
         for h_index in range(self.h_cycles - 1):
-            belief_logits, hidden_state, halt_logits = self._h_cycle_step(
+            hidden_state = self._h_cycle_step(
                 tokens,
                 belief_logits,
                 hidden_state,
                 base_embeddings,
                 time_embedding,
-                step_index,
                 train=train,
                 dropout_key=h_dropout_keys[h_index],
             )
-            belief_logits = jax.lax.stop_gradient(belief_logits)
             hidden_state = jax.lax.stop_gradient(hidden_state)
-        belief_logits, hidden_state, halt_logits = self._h_cycle_step(
+        hidden_state = self._h_cycle_step(
             tokens,
             belief_logits,
             hidden_state,
             base_embeddings,
             time_embedding,
-            step_index,
             train=train,
             dropout_key=h_dropout_keys[self.h_cycles - 1],
         )
-        return belief_logits, jax.lax.stop_gradient(hidden_state), halt_logits
+        cell_input = self._cell_embeddings(
+            tokens,
+            belief_logits,
+            base_embeddings,
+            time_embedding,
+            train=train,
+            dropout_key=h_dropout_keys[self.h_cycles - 1],
+        )
+        read_state = self._readout_fuse(hidden_state, cell_input)
+        delta_logits = self.lm_head(maybe_cast(read_state, self.dtype))
+        halt_logits = self._halt_logits(read_state)
+        next_belief = self._belief_update(tokens, belief_logits, delta_logits, step_index)
+        return next_belief, jax.lax.stop_gradient(hidden_state), halt_logits
 
     def initial_hidden_state(
         self,
