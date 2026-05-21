@@ -20,7 +20,6 @@ from lfrm.runtime.checkpoints import (
 from lfrm.runtime.evaluation import evaluate
 from lfrm.runtime.logging import (
     init_wandb,
-    jax_env_echo,
     patch_wandb_tensorboard,
     resolve_profile_dir,
     upload_wandb_profile,
@@ -192,7 +191,6 @@ def print_run_overview(
             ("profile_start_step", config.runtime.profile_start_step),
             ("profile_steps", config.runtime.profile_steps),
             ("profile_dir", profile_dir if config.runtime.profile_enabled else None),
-            ("jax_env_echo", jax_env_echo()),
         ]
     )
     print(" ".join(f"{name}= {value}" for name, value in fields))

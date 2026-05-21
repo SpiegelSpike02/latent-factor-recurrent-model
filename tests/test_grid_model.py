@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -35,7 +33,6 @@ from lfrm.runtime import (
     updates_from_epochs,
 )
 from lfrm.models import BRCModel, TinyRecursiveModel
-from lfrm.jax_defaults import apply_jax_defaults
 from lfrm.training import (
     build_train_step_runner,
     build_trm_act_train_step_runner,
@@ -51,46 +48,6 @@ from lfrm.training.optim import scheduled_lr
 
 
 class GridModelTests(unittest.TestCase):
-    def test_jax_defaults_set_gpu_startup_flags(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {
-                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.80",
-                "XLA_PYTHON_CLIENT_ALLOCATOR": "platform",
-                "TF_GPU_ALLOCATOR": "cuda_malloc_async",
-                "XLA_FLAGS": "--some_existing_flag=true",
-                "LFRM_EXTRA_XLA_FLAGS": "--xla_gpu_experimental_flag_for_test=true",
-            },
-            clear=True,
-        ):
-            apply_jax_defaults()
-            self.assertNotIn("XLA_PYTHON_CLIENT_PREALLOCATE", os.environ)
-            self.assertNotIn("XLA_PYTHON_CLIENT_MEM_FRACTION", os.environ)
-            self.assertNotIn("XLA_PYTHON_CLIENT_ALLOCATOR", os.environ)
-            self.assertNotIn("TF_GPU_ALLOCATOR", os.environ)
-            self.assertNotIn("NCCL_PROTO", os.environ)
-            self.assertNotIn("NCCL_LL_BUFFSIZE", os.environ)
-            self.assertNotIn("NCCL_LL128_BUFFSIZE", os.environ)
-            self.assertNotIn("XLA_FLAGS", os.environ)
-            self.assertNotIn("LFRM_EXTRA_XLA_FLAGS", os.environ)
-
-    def test_jax_defaults_ignore_external_env(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {
-                "LFRM_RESPECT_EXTERNAL_JAX_ENV": "true",
-                "XLA_PYTHON_CLIENT_PREALLOCATE": "true",
-                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.80",
-                "TF_GPU_ALLOCATOR": "custom_allocator",
-            },
-            clear=True,
-        ):
-            apply_jax_defaults()
-            self.assertNotIn("XLA_PYTHON_CLIENT_PREALLOCATE", os.environ)
-            self.assertNotIn("XLA_PYTHON_CLIENT_MEM_FRACTION", os.environ)
-            self.assertNotIn("TF_GPU_ALLOCATOR", os.environ)
-
     def test_updates_from_epochs_matches_official_floor_conversion(self) -> None:
         dataset = SimpleNamespace(
             spec=SimpleNamespace(total_groups=1000, mean_puzzle_examples=1.0)

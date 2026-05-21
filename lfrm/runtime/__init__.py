@@ -11,7 +11,6 @@ from lfrm.runtime.evaluation import evaluate
 from lfrm.runtime.logging import (
     resolve_profile_dir,
     init_wandb,
-    jax_env_echo,
     patch_wandb_tensorboard,
     upload_wandb_profile,
 )
@@ -43,7 +42,6 @@ __all__ = [
     "eval_interval_updates",
     "evaluate",
     "init_wandb",
-    "jax_env_echo",
     "patch_wandb_tensorboard",
     "place_module_replicated",
     "place_tree",
