@@ -390,7 +390,6 @@ class TinyRecursiveModel(nnx.Module):
             "halted": jnp.ones((batch_size,), dtype=bool),
             "current_inputs": jnp.zeros_like(batch["inputs"]),
             "current_labels": jnp.zeros_like(batch["labels"]),
-            "current_given_mask": jnp.zeros_like(batch["given_mask"]),
             "current_puzzle_identifiers": jnp.zeros_like(puzzle_identifiers),
         }
 
@@ -407,7 +406,6 @@ class TinyRecursiveModel(nnx.Module):
         return {
             "inputs": jnp.where(reset[:, None], batch["inputs"], carry["current_inputs"]),
             "labels": jnp.where(reset[:, None], batch["labels"], carry["current_labels"]),
-            "given_mask": jnp.where(reset[:, None], batch["given_mask"], carry["current_given_mask"]),
             "puzzle_identifiers": jnp.where(
                 reset,
                 self._batch_puzzle_identifiers(batch),
@@ -505,7 +503,6 @@ class TinyRecursiveModel(nnx.Module):
             "halted": jax.lax.stop_gradient(halted),
             "current_inputs": current_batch["inputs"],
             "current_labels": current_batch["labels"],
-            "current_given_mask": current_batch["given_mask"],
             "current_puzzle_identifiers": current_batch["puzzle_identifiers"],
         }
         diagnostics = {

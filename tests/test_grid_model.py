@@ -115,7 +115,6 @@ class GridModelTests(unittest.TestCase):
         batch = {
             "inputs": jnp.zeros((2, 4), dtype=jnp.int32),
             "labels": jnp.asarray([[2, 3, 0, 0], [2, 3, 0, 0]], dtype=jnp.int32),
-            "given_mask": jnp.asarray([[False, False, True, True], [False, False, True, True]], dtype=bool),
         }
         _, metrics = loss_and_metrics(FixedModel(), batch, False, None)
         self.assertAlmostEqual(float(metrics["accuracy"]), 0.75, places=6)
@@ -201,7 +200,6 @@ class GridModelTests(unittest.TestCase):
         batch = {
             "inputs": jnp.asarray([[2, 1, 3, 1, 1, 4, 1, 5, 1]], dtype=jnp.int32),
             "labels": jnp.asarray([[2, 3, 3, 4, 5, 4, 6, 5, 7]], dtype=jnp.int32),
-            "given_mask": jnp.asarray([[True, False, True, False, False, True, False, True, False]], dtype=bool),
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
         logits, diagnostics = model.forward_all_steps_with_diagnostics(
@@ -336,7 +334,6 @@ class GridModelTests(unittest.TestCase):
         batch = {
             "inputs": tokens,
             "labels": labels,
-            "given_mask": tokens != 1,
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
         _, metrics = loss_and_metrics(
@@ -362,9 +359,9 @@ class GridModelTests(unittest.TestCase):
             "lm_loss",
             "final_lm_loss",
             "mean_lm_loss",
-            "given_accuracy",
+            "context_accuracy",
             "query_accuracy",
-            "given_target_probability",
+            "context_target_probability",
             "query_target_probability",
             "context_consistency",
             "invalid_rate",
@@ -403,7 +400,6 @@ class GridModelTests(unittest.TestCase):
         batch = {
             "inputs": inputs,
             "labels": labels,
-            "given_mask": jnp.zeros_like(inputs, dtype=bool),
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
         _, metrics = loss_and_metrics(model, batch, True, jax.random.key(37))
@@ -444,7 +440,6 @@ class GridModelTests(unittest.TestCase):
         batch = {
             "inputs": tokens,
             "labels": labels,
-            "given_mask": tokens != 1,
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
         before = model.input_to_hidden.kernel[...]
@@ -619,13 +614,6 @@ class GridModelTests(unittest.TestCase):
                 [[2, 3, 3, 4, 5, 4, 6, 5, 7], [3, 4, 2, 5, 6, 5, 7, 4, 8]],
                 dtype=jnp.int32,
             ),
-            "given_mask": jnp.asarray(
-                [
-                    [True, False, True, False, False, True, False, True, False],
-                    [True, False, True, False, False, True, False, True, False],
-                ],
-                dtype=bool,
-            ),
             "puzzle_identifiers": jnp.asarray([0, 0], dtype=jnp.int32),
         }
         before = model.puzzle_embed.weights[...]
@@ -722,7 +710,6 @@ class GridModelTests(unittest.TestCase):
         batch = {
             "inputs": jnp.full((2, 16), 2, dtype=jnp.int32),
             "labels": jnp.full((2, 16), 3, dtype=jnp.int32),
-            "given_mask": jnp.zeros((2, 16), dtype=bool),
             "puzzle_identifiers": jnp.asarray([0, 0], dtype=jnp.int32),
         }
 
@@ -755,7 +742,6 @@ class GridModelTests(unittest.TestCase):
         batch = {
             "inputs": jnp.zeros((1, 4), dtype=jnp.int32),
             "labels": jnp.asarray([[2, 3, 0, 0]], dtype=jnp.int32),
-            "given_mask": jnp.asarray([[False, False, True, True]], dtype=bool),
         }
         _, metrics = loss_and_metrics(HaltSelectedModel(), batch, False, None, halt_loss_weight=0.1)
         self.assertAlmostEqual(float(metrics["accuracy"]), 1.0, places=6)

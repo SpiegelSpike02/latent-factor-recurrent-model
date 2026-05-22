@@ -397,7 +397,6 @@ class BRCModel(nnx.Module):
             "halted": jnp.ones((batch_size,), dtype=bool),
             "current_inputs": jnp.zeros_like(batch["inputs"]),
             "current_labels": jnp.zeros_like(batch["labels"]),
-            "current_given_mask": jnp.zeros_like(batch["given_mask"]),
             "current_example_mask": jnp.zeros((batch_size,), dtype=jnp.float32),
         }
 
@@ -416,7 +415,6 @@ class BRCModel(nnx.Module):
         reset_state = reset[:, None, None]
         inputs = jnp.where(reset_cells, batch["inputs"], carry["current_inputs"])
         labels = jnp.where(reset_cells, batch["labels"], carry["current_labels"])
-        given_mask = jnp.where(reset_cells, batch["given_mask"], carry["current_given_mask"])
         batch_example_mask = batch.get(
             "example_mask",
             jnp.ones((inputs.shape[0],), dtype=jnp.float32),
@@ -459,7 +457,6 @@ class BRCModel(nnx.Module):
             "halted": jax.lax.stop_gradient(halted),
             "current_inputs": inputs,
             "current_labels": labels,
-            "current_given_mask": given_mask,
             "current_example_mask": example_mask,
         }
         diagnostics = {

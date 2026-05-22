@@ -44,13 +44,8 @@ def target_probability(model: object, logits: jax.Array, targets: jax.Array) -> 
     return jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
 
 
-def loss_mask_from_given(model: object, given_mask: jax.Array) -> jax.Array:
+def supervised_loss_mask(model: object, targets: jax.Array) -> jax.Array:
     del model
-    return jnp.ones_like(given_mask, dtype=jnp.float32)
-
-
-def supervised_loss_mask(model: object, given_mask: jax.Array, targets: jax.Array) -> jax.Array:
-    mask = loss_mask_from_given(model, given_mask)
     # ARC-style datasets use label 0 as padding / ignore_label_id. Sudoku and Maze
     # labels are non-zero, so this keeps their behavior unchanged.
-    return mask * (targets != 0).astype(jnp.float32)
+    return (targets != 0).astype(jnp.float32)

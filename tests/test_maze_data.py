@@ -56,12 +56,10 @@ class MazeDatasetTests(unittest.TestCase):
             self.assertTrue((output_dir / "train" / "puzzle_indices.npy").is_file())
             self.assertTrue((output_dir / "train" / "group_indices.npy").is_file())
             self.assertFalse((output_dir / "train" / "given_mask.npy").exists())
-            self.assertFalse(bool(np.any(dataset.train_given_mask)))
 
             batch = sample_batch(np.random.default_rng(0), dataset, batch_size=2, seq_len=9, split="train")
             self.assertEqual(batch["inputs"].shape, (2, 9))
             self.assertEqual(batch["labels"].shape, (2, 9))
-            self.assertEqual(batch["given_mask"].shape, (2, 9))
             self.assertEqual(batch["puzzle_identifiers"].shape, (2,))
 
             sampler = GridBatchSampler(np.random.default_rng(0), dataset)
@@ -102,15 +100,12 @@ class MazeDatasetTests(unittest.TestCase):
     def test_grouped_sampler_packs_multiple_examples_from_selected_puzzle(self) -> None:
         inputs = np.asarray([[10, 11], [20, 21], [30, 31]], dtype=np.int32)
         labels = inputs + 100
-        given_mask = np.zeros_like(inputs, dtype=bool)
         puzzle_identifiers = np.asarray([7, 7, 7], dtype=np.int32)
         dataset = GridDataset(
             train_inputs=inputs,
             train_labels=labels,
             eval_inputs=inputs[:1],
             eval_labels=labels[:1],
-            train_given_mask=given_mask,
-            eval_given_mask=given_mask[:1],
             train_puzzle_identifiers=puzzle_identifiers,
             eval_puzzle_identifiers=puzzle_identifiers[:1],
             train_puzzle_indices=np.asarray([0, 3], dtype=np.int32),

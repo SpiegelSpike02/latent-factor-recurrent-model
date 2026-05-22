@@ -239,7 +239,6 @@ class UnifiedReasoningModel(nnx.Module):
             "halted": jnp.ones((batch_size,), dtype=bool),
             "current_inputs": jnp.zeros_like(batch["inputs"]),
             "current_labels": jnp.zeros_like(batch["labels"]),
-            "current_given_mask": jnp.zeros_like(batch["given_mask"]),
             "current_puzzle_identifiers": jnp.zeros_like(batch["puzzle_identifiers"]),
         }
 
@@ -266,7 +265,6 @@ class UnifiedReasoningModel(nnx.Module):
         reset_hidden = reset[:, None, None]
         inputs = jnp.where(reset_broadcast, batch["inputs"], carry["current_inputs"])
         labels = jnp.where(reset_broadcast, batch["labels"], carry["current_labels"])
-        given_mask = jnp.where(reset_broadcast, batch["given_mask"], carry["current_given_mask"])
         puzzle_ids = jnp.where(reset, batch["puzzle_identifiers"], carry["current_puzzle_identifiers"])
         hidden = jnp.where(reset_hidden, self._reset_hidden(inputs.shape[0]), carry["hidden"])
         steps = jnp.where(reset, 0, carry["steps"])
@@ -299,7 +297,6 @@ class UnifiedReasoningModel(nnx.Module):
             "halted": jax.lax.stop_gradient(halted),
             "current_inputs": inputs,
             "current_labels": labels,
-            "current_given_mask": given_mask,
             "current_puzzle_identifiers": puzzle_ids,
         }
         diagnostics = {

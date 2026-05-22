@@ -79,7 +79,6 @@ def eval_device_batch(
     batch = {
         "inputs": np.asarray(dataset.eval_inputs[start:stop], dtype=np.int32),
         "labels": np.asarray(dataset.eval_labels[start:stop], dtype=np.int32),
-        "given_mask": np.asarray(dataset.eval_given_mask[start:stop], dtype=bool),
         "puzzle_identifiers": np.asarray(dataset.eval_puzzle_identifiers[start:stop], dtype=np.int32),
     }
     example_mask = np.ones((actual_batch_size,), dtype=np.float32)

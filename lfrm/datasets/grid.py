@@ -30,8 +30,6 @@ class GridDataset:
     train_labels: np.ndarray
     eval_inputs: np.ndarray
     eval_labels: np.ndarray
-    train_given_mask: np.ndarray
-    eval_given_mask: np.ndarray
     train_puzzle_identifiers: np.ndarray
     eval_puzzle_identifiers: np.ndarray
     train_puzzle_indices: np.ndarray | None
@@ -65,8 +63,6 @@ def load_dataset(*, dataset_path: str) -> GridDataset:
     train_labels = _load_split_array(train_dir, "labels")
     eval_inputs = _load_split_array(eval_dir, "inputs")
     eval_labels = _load_split_array(eval_dir, "labels")
-    train_given_mask = _load_given_mask(train_dir, train_inputs)
-    eval_given_mask = _load_given_mask(eval_dir, eval_inputs)
     train_puzzle_indices = _load_optional_split_array(train_dir, "puzzle_indices")
     eval_puzzle_indices = _load_optional_split_array(eval_dir, "puzzle_indices")
     train_group_indices = _load_optional_split_array(train_dir, "group_indices")
@@ -97,8 +93,6 @@ def load_dataset(*, dataset_path: str) -> GridDataset:
         train_labels=train_labels,
         eval_inputs=eval_inputs,
         eval_labels=eval_labels,
-        train_given_mask=train_given_mask,
-        eval_given_mask=eval_given_mask,
         train_puzzle_identifiers=train_puzzle_identifiers,
         eval_puzzle_identifiers=eval_puzzle_identifiers,
         train_puzzle_indices=train_puzzle_indices,
@@ -123,14 +117,12 @@ def sample_batch(
     if split == "train":
         inputs = dataset.train_inputs
         labels = dataset.train_labels
-        given_mask = dataset.train_given_mask
         puzzle_identifiers = dataset.train_puzzle_identifiers
         puzzle_indices = dataset.train_puzzle_indices
         group_indices = dataset.train_group_indices
     elif split == "test":
         inputs = dataset.eval_inputs
         labels = dataset.eval_labels
-        given_mask = dataset.eval_given_mask
         puzzle_identifiers = dataset.eval_puzzle_identifiers
         puzzle_indices = dataset.eval_puzzle_indices
         group_indices = dataset.eval_group_indices
@@ -145,7 +137,7 @@ def sample_batch(
     else:
         indices = rng.integers(total, size=batch_size, endpoint=False)
 
-    return _make_batch(inputs, labels, given_mask, puzzle_identifiers, indices)
+    return _make_batch(inputs, labels, puzzle_identifiers, indices)
 
 
 class GridBatchSampler:
@@ -171,7 +163,6 @@ class GridBatchSampler:
             return _make_batch(
                 self.dataset.train_inputs,
                 self.dataset.train_labels,
-                self.dataset.train_given_mask,
                 self.dataset.train_puzzle_identifiers,
                 indices,
             )
@@ -240,11 +231,6 @@ def _load_optional_split_array(split_dir: Path, name: str) -> np.ndarray | None:
     return np.load(path, mmap_mode=None)
 
 
-def _load_given_mask(split_dir: Path, inputs: np.ndarray) -> np.ndarray:
-    del split_dir
-    return np.zeros_like(inputs, dtype=bool)
-
-
 def _load_puzzle_identifiers(split_dir: Path, num_examples: int, puzzle_indices: np.ndarray | None) -> np.ndarray:
     path = split_dir / "puzzle_identifiers.npy"
     if not path.is_file():
@@ -287,14 +273,12 @@ def _sample_grouped_indices(
 def _make_batch(
     inputs: np.ndarray,
     labels: np.ndarray,
-    given_mask: np.ndarray,
     puzzle_identifiers: np.ndarray,
     indices: np.ndarray,
 ) -> dict[str, np.ndarray]:
     return {
         "inputs": np.asarray(inputs[indices], dtype=np.int32),
         "labels": np.asarray(labels[indices], dtype=np.int32),
-        "given_mask": np.asarray(given_mask[indices], dtype=bool),
         "puzzle_identifiers": np.asarray(puzzle_identifiers[indices], dtype=np.int32),
     }
 

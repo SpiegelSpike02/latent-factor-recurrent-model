@@ -327,7 +327,7 @@ def brc_loss_and_metrics(
     else:
         inputs, targets = batch["inputs"], batch["labels"]
     example_mask = _example_mask(batch, targets)
-    loss_mask = _apply_example_mask(supervised_loss_mask(model, jnp.zeros_like(inputs, dtype=bool), targets), example_mask)
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
     zero = jnp.asarray(0.0, dtype=jnp.float32)
     context_mask, query_mask = _brc_region_masks(model, inputs, loss_mask)
     metric_loss_mask = loss_mask
@@ -390,7 +390,7 @@ def brc_loss_and_metrics(
     metric_correct = (predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
     metric_normalizer = jnp.maximum(jnp.sum(metric_loss_mask.astype(jnp.float32)), 1.0)
     cell_accuracy = jnp.sum(metric_correct) / metric_normalizer
-    given_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
+    context_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
     query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
     supervised_cells_per_example = jnp.sum(metric_loss_mask.astype(jnp.float32), axis=-1)
     correct_per_example = jnp.sum(metric_correct, axis=-1)
@@ -404,7 +404,7 @@ def brc_loss_and_metrics(
     exact_count = jnp.sum(exact_f32 * example_mask)
     target_probability = token_target_probability(model, final_logits, targets)
     target_probability = jnp.sum(target_probability * loss_mask.astype(jnp.float32)) / normalizer
-    given_target_probability = _masked_target_probability(model, final_logits, targets, context_mask)
+    context_target_probability = _masked_target_probability(model, final_logits, targets, context_mask)
     query_target_probability = _masked_target_probability(model, final_logits, targets, query_mask)
     if train:
         oracle_step = jnp.argmin(per_step_loss)
@@ -429,11 +429,11 @@ def brc_loss_and_metrics(
         "mean_lm_loss": jnp.mean(per_step_loss),
         "final_target_probability": target_probability,
         "accuracy": cell_accuracy,
-        "given_accuracy": given_accuracy,
+        "context_accuracy": context_accuracy,
         "query_accuracy": query_accuracy,
         "exact_accuracy": exact_accuracy,
         "exact_count": exact_count,
-        "given_target_probability": given_target_probability,
+        "context_target_probability": context_target_probability,
         "query_target_probability": query_target_probability,
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "per_step_loss": per_step_loss,
@@ -488,7 +488,7 @@ def brc_act_loss_and_metrics(
     targets = new_carry["current_labels"]
     example_mask = new_carry["current_example_mask"].astype(jnp.float32)
     loss_mask = _apply_example_mask(
-        supervised_loss_mask(model, new_carry["current_given_mask"], targets),
+        supervised_loss_mask(model, targets),
         example_mask,
     )
     normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32)), 1.0)
@@ -498,7 +498,7 @@ def brc_act_loss_and_metrics(
     metric_correct = (predictions == targets).astype(jnp.float32) * loss_mask.astype(jnp.float32)
     context_mask, query_mask = _brc_region_masks(model, inputs, loss_mask)
     current_accuracy = jnp.sum(metric_correct) / normalizer
-    current_given_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
+    current_context_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
     current_query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
     supervised_cells_per_example = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
     correct_per_example = jnp.sum(metric_correct, axis=-1)
@@ -525,7 +525,7 @@ def brc_act_loss_and_metrics(
     query_accuracy_per_example = query_correct_per_example / jnp.maximum(query_cells_per_example, 1.0)
     valid_context_halted = valid_halted & (context_cells_per_example > 0)
     valid_query_halted = valid_halted & (query_cells_per_example > 0)
-    given_accuracy = _masked_example_mean(context_accuracy_per_example, valid_context_halted.astype(jnp.float32))
+    context_accuracy = _masked_example_mean(context_accuracy_per_example, valid_context_halted.astype(jnp.float32))
     query_accuracy = _masked_example_mean(query_accuracy_per_example, valid_query_halted.astype(jnp.float32))
     target_probability = token_target_probability(model, logits, targets)
     per_example_target_probability = (
@@ -533,7 +533,7 @@ def brc_act_loss_and_metrics(
         / jnp.maximum(supervised_cells_per_example, 1.0)
     )
     target_probability = jnp.sum(per_example_target_probability * valid_halted_f32) / valid_halted_normalizer
-    given_target_probability = _masked_target_probability(model, logits, targets, context_mask)
+    context_target_probability = _masked_target_probability(model, logits, targets, context_mask)
     query_target_probability = _masked_target_probability(model, logits, targets, query_mask)
     halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
     if halt_loss_weight != 0.0:
@@ -553,16 +553,16 @@ def brc_act_loss_and_metrics(
         "final_lm_loss": lm_loss,
         "mean_lm_loss": lm_loss,
         "accuracy": accuracy,
-        "given_accuracy": given_accuracy,
+        "context_accuracy": context_accuracy,
         "query_accuracy": query_accuracy,
         "exact_accuracy": exact_accuracy,
         "exact_count": exact_count,
         "final_target_probability": target_probability,
-        "given_target_probability": given_target_probability,
+        "context_target_probability": context_target_probability,
         "query_target_probability": query_target_probability,
         "count": valid_halted_count,
         "current_accuracy": current_accuracy,
-        "current_given_accuracy": current_given_accuracy,
+        "current_context_accuracy": current_context_accuracy,
         "current_query_accuracy": current_query_accuracy,
         "current_exact_accuracy": _masked_example_mean(exact_f32, example_mask),
         "act_step": diagnostics["act_step"],
@@ -604,9 +604,8 @@ def loss_and_metrics(
 
     inputs = batch["inputs"]
     targets = batch["labels"]
-    given_mask = batch["given_mask"]
     example_mask = _example_mask(batch, targets)
-    loss_mask = _apply_example_mask(supervised_loss_mask(model, given_mask, targets), example_mask)
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
 
@@ -786,9 +785,8 @@ def trm_act_loss_and_metrics(
         puzzle_embeddings=puzzle_embeddings,
     )
     targets = new_carry["current_labels"]
-    given_mask = new_carry["current_given_mask"]
     example_mask = _example_mask(batch, targets)
-    loss_mask = _apply_example_mask(supervised_loss_mask(model, given_mask, targets), example_mask)
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
@@ -866,9 +864,8 @@ def trm_dense_unroll_loss_and_metrics(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     inputs = batch["inputs"]
     targets = batch["labels"]
-    given_mask = batch["given_mask"]
     example_mask = _example_mask(batch, targets)
-    loss_mask = _apply_example_mask(supervised_loss_mask(model, given_mask, targets), example_mask)
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
@@ -968,9 +965,8 @@ def trm_eval_loss_and_metrics(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     inputs = batch["inputs"]
     targets = batch["labels"]
-    given_mask = batch["given_mask"]
     example_mask = _example_mask(batch, targets)
-    loss_mask = _apply_example_mask(supervised_loss_mask(model, given_mask, targets), example_mask)
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
     normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
