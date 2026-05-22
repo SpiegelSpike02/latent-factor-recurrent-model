@@ -31,6 +31,8 @@ artifacts/
 data/
 
 # Logs and temporary files
+debug_logs/
+lfrm/scripts/debug_single_brc_act.py
 *.log
 *.tmp
 *.temp

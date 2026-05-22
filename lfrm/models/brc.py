@@ -373,6 +373,8 @@ class BRCModel(nnx.Module):
         halt_logits = jnp.zeros((tokens.shape[0],), dtype=jnp.float32)
         evidence_delta_mass = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
         evidence_update_alpha = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
+        evidence_delta_mass_sum = jnp.zeros_like(evidence_delta_mass)
+        evidence_update_alpha_sum = jnp.zeros_like(evidence_update_alpha)
         for h_index in range(self.h_cycles):
             cell_input = self._cell_embeddings(
                 tokens,
@@ -391,10 +393,19 @@ class BRCModel(nnx.Module):
                 read_state,
                 step_index,
             )
+            evidence_delta_mass_sum = evidence_delta_mass_sum + evidence_delta_mass
+            evidence_update_alpha_sum = evidence_update_alpha_sum + evidence_update_alpha
             halt_logits = self._halt_logits(read_state)
             if h_index < self.h_cycles - 1:
                 hidden_state = jax.lax.stop_gradient(hidden_state)
-        return evidence, jax.lax.stop_gradient(hidden_state), halt_logits, evidence_delta_mass, evidence_update_alpha
+        h_cycles = jnp.asarray(self.h_cycles, dtype=jnp.float32)
+        return (
+            evidence,
+            jax.lax.stop_gradient(hidden_state),
+            halt_logits,
+            evidence_delta_mass_sum / h_cycles,
+            evidence_update_alpha_sum / h_cycles,
+        )
 
     def initial_hidden_state(
         self,
