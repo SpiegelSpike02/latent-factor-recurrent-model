@@ -39,20 +39,9 @@ class BRCSolverBlock(nnx.Module):
             rngs=rngs,
         )
         self.self_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
-        self.film_input_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
-        self.film_output_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
         self.message_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.film = nnx.Linear(
-            hidden_dim,
-            2 * hidden_dim,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            bias_init=nnx.initializers.zeros,
-            rngs=rngs,
-        )
         self.channel_mlp = SwiGLU(
             hidden_dim,
             mlp_ratio,
@@ -80,14 +69,6 @@ class BRCSolverBlock(nnx.Module):
             name="BRC self attention",
         )
         h = self.self_norm(h.astype(jnp.float32) + attn.astype(jnp.float32)).astype(self.dtype)
-        pooled_condition = jnp.mean(condition.astype(jnp.float32), axis=1)
-        scale, shift = jnp.split(self.film(maybe_cast(pooled_condition, self.dtype)).astype(jnp.float32), 2, axis=-1)
-        h_norm = self.film_input_norm(h.astype(jnp.float32)).astype(jnp.float32)
-        h = self.film_output_norm(
-            h.astype(jnp.float32)
-            + h_norm * jnp.tanh(scale)[:, None, :]
-            + shift[:, None, :]
-        ).astype(self.dtype)
         msg = self.channel_mlp(maybe_cast(h, self.dtype)).astype(jnp.float32)
         return self.message_norm(h.astype(jnp.float32) + msg).astype(self.dtype)
 
@@ -370,8 +351,7 @@ class BRCModel(nnx.Module):
         energy = jnp.mean(cell_energy)
         return energy, kl_delta, entropy, confidence, update_norm
 
-    def _hidden_l_cycle(self, hidden_state: Array, cell_input: Array) -> Array:
-        hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
+    def _hidden_l_cycle(self, hidden_state: Array, hidden_input: Array) -> Array:
         hidden = hidden_state.astype(self.dtype)
         for _ in range(self.l_cycles):
             hidden = self.hidden_anchor_norm(hidden.astype(jnp.float32) + hidden_input.astype(jnp.float32)).astype(self.dtype)
@@ -406,10 +386,11 @@ class BRCModel(nnx.Module):
             train=train,
             dropout_key=dropout_key,
         )
+        hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
         for h_index in range(self.h_cycles - 1):
-            hidden_state = self._hidden_l_cycle(hidden_state, cell_input)
+            hidden_state = self._hidden_l_cycle(hidden_state, hidden_input)
             hidden_state = jax.lax.stop_gradient(hidden_state)
-        hidden_state = self._hidden_l_cycle(hidden_state, cell_input)
+        hidden_state = self._hidden_l_cycle(hidden_state, hidden_input)
         read_state = self._readout_fuse(hidden_state, cell_input)
         delta_logits = self.lm_head(maybe_cast(read_state, self.dtype))
         halt_logits = self._halt_logits(read_state)
