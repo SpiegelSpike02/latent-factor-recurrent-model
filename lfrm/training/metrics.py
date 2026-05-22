@@ -207,6 +207,16 @@ BRC_CONSOLE_GROUPS = (
             "selected_exact_accuracy",
         ),
     ),
+    (
+        "path",
+        (
+            "path_precision",
+            "path_recall",
+            "path_f1",
+            "path_positive_rate",
+            "target_path_rate",
+        ),
+    ),
 )
 TRM_CONSOLE_GROUPS = (
     ("objective", ("loss", "lm_loss", "q_halt_loss")),

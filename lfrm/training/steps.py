@@ -102,6 +102,9 @@ def _sudoku_board_metrics(
 
 
 def _brc_region_masks(model: BRCModel, inputs: jax.Array, loss_mask: jax.Array) -> tuple[jax.Array, jax.Array]:
+    if model.config.task_type != "sudoku":
+        zero_context = jnp.zeros_like(loss_mask, dtype=jnp.float32)
+        return zero_context, (loss_mask > 0.0).astype(jnp.float32)
     context_mask = model.context_mask(inputs) & (loss_mask > 0.0)
     query_mask = (~model.context_mask(inputs)) & (loss_mask > 0.0)
     return context_mask.astype(jnp.float32), query_mask.astype(jnp.float32)
@@ -408,7 +411,6 @@ def brc_loss_and_metrics(
     else:
         per_step_example_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=-1) / per_example_normalizer[None, :]
         oracle_step = _masked_example_mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32), example_mask)
-    context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
     selected_predictions = diagnostics.get("selected_candidate", predictions)
     selected_correct = (selected_predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
     selected_accuracy = jnp.sum(selected_correct) / metric_normalizer
@@ -434,13 +436,19 @@ def brc_loss_and_metrics(
         "given_target_probability": given_target_probability,
         "query_target_probability": query_target_probability,
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
-        "context_consistency": context_consistency,
-        "invalid_rate": invalid_rate,
-        "conflicts": conflicts,
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_loss_weights,
         "diffusion_filled_ratio": diagnostics["diffusion_filled_ratio"],
     }
+    if model.config.task_type == "sudoku":
+        context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
+        metrics.update(
+            {
+                "context_consistency": context_consistency,
+                "invalid_rate": invalid_rate,
+                "conflicts": conflicts,
+            }
+        )
     if halt_loss_weight != 0.0:
         metrics.update(
             {
@@ -527,7 +535,6 @@ def brc_act_loss_and_metrics(
     target_probability = jnp.sum(per_example_target_probability * valid_halted_f32) / valid_halted_normalizer
     given_target_probability = _masked_target_probability(model, logits, targets, context_mask)
     query_target_probability = _masked_target_probability(model, logits, targets, query_mask)
-    context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
     halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
     if halt_loss_weight != 0.0:
         halt_targets = jax.lax.stop_gradient(exact_f32)
@@ -553,9 +560,6 @@ def brc_act_loss_and_metrics(
         "final_target_probability": target_probability,
         "given_target_probability": given_target_probability,
         "query_target_probability": query_target_probability,
-        "context_consistency": context_consistency,
-        "invalid_rate": invalid_rate,
-        "conflicts": conflicts,
         "count": valid_halted_count,
         "current_accuracy": current_accuracy,
         "current_given_accuracy": current_given_accuracy,
@@ -565,6 +569,15 @@ def brc_act_loss_and_metrics(
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
     }
+    if model.config.task_type == "sudoku":
+        context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
+        metrics.update(
+            {
+                "context_consistency": context_consistency,
+                "invalid_rate": invalid_rate,
+                "conflicts": conflicts,
+            }
+        )
     metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
     if halt_loss_weight != 0.0:
         metrics["halt_loss"] = halt_loss
