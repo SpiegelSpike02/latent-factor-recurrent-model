@@ -804,6 +804,7 @@ class GridModelTests(unittest.TestCase):
                 "hidden_state_dim = 16\n"
                 "l_layers = 1\n"
                 "num_heads = 4\n"
+                "halt_exploration_prob = 0.2\n"
                 "step_loss_schedule = \"linear\"\n",
                 encoding="utf-8",
             )
@@ -816,6 +817,7 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_hidden_state_dim"], 16)
             self.assertEqual(loaded["brc_l_layers"], 1)
             self.assertEqual(loaded["brc_num_heads"], 4)
+            self.assertEqual(loaded["brc_halt_exploration_prob"], 0.2)
             self.assertEqual(loaded["brc_step_loss_schedule"], "linear")
 
             eval_config_path = Path(tmpdir) / "eval.toml"

@@ -25,6 +25,7 @@ mlp_ratio = 4
 position_encoding = "rope"
 rms_norm_eps = 1e-5
 rope_theta = 10000.0
+halt_exploration_prob = 0.1
 step_loss_schedule = "uniform"
 
 [optimizer]

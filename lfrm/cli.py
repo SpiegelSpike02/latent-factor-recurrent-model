@@ -121,6 +121,7 @@ ALLOWED_NESTED_KEYS = {
         "position_encoding",
         "rms_norm_eps",
         "rope_theta",
+        "halt_exploration_prob",
         "step_loss_schedule",
     },
     "urm": {
@@ -223,7 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--trm-train-mode",
         choices=("act", "dense_unroll"),
         default="act",
-        help="TRM training path: ACT single-step carry or full-unroll dense CE.",
+        help="Recurrent training path: ACT single-step carry or full-unroll dense CE.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--halt-loss-weight", type=float, default=0.0)
@@ -262,6 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-position-encoding", choices=("rope", "learned", "none"), default="rope")
     parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
+    parser.add_argument("--brc-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear"), default="uniform")
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
@@ -405,6 +407,7 @@ def build_config(
             position_encoding=args.brc_position_encoding,
             rms_norm_eps=args.brc_rms_norm_eps,
             rope_theta=args.brc_rope_theta,
+            halt_exploration_prob=args.brc_halt_exploration_prob,
             step_loss_schedule=args.brc_step_loss_schedule,
         ),
         urm=URMConfig(

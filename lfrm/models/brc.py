@@ -213,7 +213,7 @@ class BRCModel(nnx.Module):
             dtype=self.dtype,
             param_dtype=jnp.float32,
             kernel_init=nnx.initializers.zeros,
-            bias_init=nnx.initializers.zeros,
+            bias_init=nnx.initializers.constant(-5.0),
             rngs=rngs,
         )
     @staticmethod
@@ -286,7 +286,7 @@ class BRCModel(nnx.Module):
             base_embeddings
             + belief_embedding
             + time
-        ) * math.sqrt(1.0 / 5.0)
+        ) * math.sqrt(1.0 / 3.0)
         return self.dropout(x, deterministic=not train, rngs=dropout_key).astype(self.dtype)
 
     def _belief_to_token_logits(self, belief_logits: Array, tokens: Array, step_index: Array) -> Array:
@@ -449,7 +449,20 @@ class BRCModel(nnx.Module):
         logits = self._belief_to_token_logits(next_belief, inputs, step_index)
         new_steps = steps + 1
         is_last_step = new_steps >= self.belief_steps
-        halted = is_last_step | (halt_logits > 0.0) if train else is_last_step
+        if train:
+            halted = is_last_step | (halt_logits > 0.0)
+            if self.belief_steps > 1 and self.brc.halt_exploration_prob > 0.0:
+                exploration_key = jax.random.fold_in(dropout_key, 1)
+                explore = jax.random.uniform(exploration_key, halt_logits.shape) < self.brc.halt_exploration_prob
+                random_step = jax.random.randint(
+                    exploration_key,
+                    halt_logits.shape,
+                    2,
+                    self.belief_steps + 1,
+                )
+                halted = halted | (explore & (new_steps >= random_step))
+        else:
+            halted = is_last_step
         new_carry = {
             "belief_logits": jax.lax.stop_gradient(next_belief),
             "hidden": jax.lax.stop_gradient(next_hidden),

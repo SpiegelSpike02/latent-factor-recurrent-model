@@ -99,8 +99,8 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
             raise ValueError("profile_start_step must be positive when profiling is enabled")
         if config.runtime.profile_steps <= 0:
             raise ValueError("profile_steps must be positive when profiling is enabled")
-    if config.model.model_type not in ("trm", "urm") and config.train.trm_train_mode != "act":
-        raise ValueError("trm_train_mode is only supported for model_type='trm' or 'urm'")
+    if config.model.model_type not in ("trm", "urm", "brc") and config.train.trm_train_mode != "act":
+        raise ValueError("trm_train_mode is only supported for recurrent model types")
 
 
 def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size: int) -> int:
@@ -118,7 +118,13 @@ def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size
 
 def build_step_runners(config: ExperimentConfig):
     if config.model.model_type == "brc":
-        train_step_fn = build_brc_act_train_step_runner(config.train.halt_loss_weight)
+        if config.train.trm_train_mode == "dense_unroll":
+            train_step_fn = build_train_step_runner(
+                config.train.halt_loss_weight,
+                config.train.terminal_residual_weight,
+            )
+        else:
+            train_step_fn = build_brc_act_train_step_runner(config.train.halt_loss_weight)
         eval_step_fn = build_eval_step_runner(
             config.train.halt_loss_weight,
             config.train.terminal_residual_weight,
@@ -404,7 +410,7 @@ def run_training(
 
     current_batch = prefetcher.next()
     use_recurrent_act = (
-        config.model.model_type == "brc"
+        (config.model.model_type == "brc" and config.train.trm_train_mode == "act")
         or (config.model.model_type in ("trm", "urm") and config.train.trm_train_mode == "act")
     )
     console_model_label = "brc" if config.model.model_type == "brc" else config.model.model_type
