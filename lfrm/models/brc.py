@@ -120,6 +120,7 @@ class BRCModel(nnx.Module):
         self.embed_scale = math.sqrt(config.d_model)
         self.evidence_vocab_size = config.vocab_size
         self.evidence_eps = 1e-4
+        self.output_logit_eps = 1e-9
         self.box_height, self.box_width = self._box_shape(config.grid_height, config.grid_width)
 
         rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
@@ -215,7 +216,7 @@ class BRCModel(nnx.Module):
             dtype=self.dtype,
             param_dtype=jnp.float32,
             kernel_init=nnx.initializers.zeros,
-            bias_init=nnx.initializers.constant(-2.0),
+            bias_init=nnx.initializers.zeros,
             rngs=rngs,
         )
         self.halt_head = nnx.Linear(
@@ -275,7 +276,7 @@ class BRCModel(nnx.Module):
     def _evidence_to_output_logits(self, evidence: Array, tokens: Array) -> Array:
         del tokens
         excess, _mass, _direction, _gamma, _uncertainty, _strength = self._evidence_stats(evidence)
-        return jnp.log(jnp.maximum(excess, self.evidence_eps))
+        return jnp.log(jnp.maximum(excess, self.output_logit_eps))
 
     def initial_evidence(self, tokens: Array) -> Array:
         return jnp.ones((*tokens.shape, self.evidence_vocab_size), dtype=jnp.float32)
@@ -328,17 +329,18 @@ class BRCModel(nnx.Module):
         return self._evidence_to_output_logits(evidence, tokens)
 
     def _proposal_budget(self, step_index: Array) -> Array:
-        gamma = self._proposal_gamma(step_index)
+        gamma = self._evidence_gamma(step_index)
         return float(self.evidence_vocab_size) * gamma / jnp.maximum(1.0 - gamma, self.evidence_eps)
 
-    def _proposal_gamma(self, step_index: Array) -> Array:
+    def _evidence_gamma(self, step_index: Array) -> Array:
         final_budget = float(self.evidence_vocab_size * self.evidence_steps * self.h_cycles)
-        gamma_final = final_budget / (float(self.evidence_vocab_size) + final_budget)
+        max_gamma = final_budget / (float(self.evidence_vocab_size) + final_budget)
         progress = (step_index.astype(jnp.float32) + 1.0) / float(self.evidence_steps)
-        return gamma_final * jnp.square(progress)
+        return max_gamma * jnp.square(progress)
 
     def _evidence_update(self, tokens: Array, evidence: Array, read_state: Array, step_index: Array) -> tuple[Array, Array, Array]:
         del tokens
+        _excess, _mass, current_direction, _gamma, _uncertainty, _strength = self._evidence_stats(evidence)
         class_logits = self.evidence_class_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         proposal_distribution = jax.nn.softmax(class_logits, axis=-1)
         proposal_mass = self._proposal_budget(step_index)
@@ -347,20 +349,19 @@ class BRCModel(nnx.Module):
         elif proposal_mass.ndim == 1:
             proposal_mass = proposal_mass[:, None, None]
         proposal_mass = jnp.broadcast_to(proposal_mass, (*read_state.shape[:-1], 1))
-        proposal = 1.0 + proposal_mass * proposal_distribution
         update_alpha = jax.nn.sigmoid(
             self.evidence_update_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         )
-        next_evidence = (1.0 - update_alpha) * self._evidence_alpha(evidence) + update_alpha * proposal
+        next_direction = (1.0 - update_alpha) * current_direction + update_alpha * proposal_distribution
+        next_evidence = 1.0 + proposal_mass * next_direction
         return next_evidence, proposal_mass, update_alpha
 
-    def _evidence_metric_values(self, evidence: Array, step_index: Array) -> tuple[Array, Array, Array, Array]:
-        _excess, _mass, _direction, gamma, uncertainty, strength = self._evidence_stats(evidence)
+    def _evidence_metric_values(self, evidence: Array, step_index: Array) -> tuple[Array, Array, Array]:
+        _excess, _mass, _direction, _gamma, uncertainty, strength = self._evidence_stats(evidence)
         return (
             jnp.mean(strength),
             jnp.mean(uncertainty),
-            jnp.mean(gamma),
-            jnp.mean(self._proposal_gamma(step_index).astype(jnp.float32)),
+            jnp.mean(self._evidence_gamma(step_index).astype(jnp.float32)),
         )
 
     def _halt_logits(self, read_state: Array) -> Array:
@@ -559,8 +560,7 @@ class BRCModel(nnx.Module):
         (
             diagnostics["evidence_strength"],
             diagnostics["evidence_uncertainty"],
-            diagnostics["evidence_actual_gamma"],
-            diagnostics["evidence_scheduled_gamma"],
+            diagnostics["evidence_gamma"],
         ) = self._evidence_metric_values(next_evidence, step_index)
         return new_carry, logits, diagnostics
 
@@ -599,7 +599,7 @@ class BRCModel(nnx.Module):
             _excess, _mass, direction, _gamma, _uncertainty, _strength = self._evidence_stats(next_evidence)
             confidence = jnp.max(direction, axis=-1)
             filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
-            evidence_strength, evidence_uncertainty, evidence_actual_gamma, evidence_scheduled_gamma = (
+            evidence_strength, evidence_uncertainty, evidence_gamma = (
                 self._evidence_metric_values(next_evidence, step_index)
             )
             return next_carry, (
@@ -610,8 +610,7 @@ class BRCModel(nnx.Module):
                 jnp.mean(evidence_update_alpha.astype(jnp.float32)),
                 evidence_strength,
                 evidence_uncertainty,
-                evidence_actual_gamma,
-                evidence_scheduled_gamma,
+                evidence_gamma,
             )
 
         step_indices = jnp.arange(self.evidence_steps, dtype=jnp.int32)
@@ -646,8 +645,7 @@ class BRCModel(nnx.Module):
                 "evidence_update_alpha": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
                 "evidence_strength": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
                 "evidence_uncertainty": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
-                "evidence_actual_gamma": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
-                "evidence_scheduled_gamma": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
+                "evidence_gamma": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
             }
             return logits, diagnostics
         (
@@ -658,8 +656,7 @@ class BRCModel(nnx.Module):
             evidence_update_alpha,
             evidence_strength,
             evidence_uncertainty,
-            evidence_actual_gamma,
-            evidence_scheduled_gamma,
+            evidence_gamma,
         ) = scan_outputs
         diagnostics = {
             "diffusion_filled_ratio": filled_ratio,
@@ -669,8 +666,7 @@ class BRCModel(nnx.Module):
             "evidence_update_alpha": evidence_update_alpha,
             "evidence_strength": evidence_strength,
             "evidence_uncertainty": evidence_uncertainty,
-            "evidence_actual_gamma": evidence_actual_gamma,
-            "evidence_scheduled_gamma": evidence_scheduled_gamma,
+            "evidence_gamma": evidence_gamma,
         }
         return step_logits, diagnostics
 

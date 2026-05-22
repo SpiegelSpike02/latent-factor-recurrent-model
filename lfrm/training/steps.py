@@ -228,8 +228,7 @@ def _brc_compact_training_rollout(
         (
             evidence_strength,
             evidence_uncertainty,
-            evidence_actual_gamma,
-            evidence_scheduled_gamma,
+            evidence_gamma,
         ) = model._evidence_metric_values(next_evidence, step_index)
         return (
             next_evidence,
@@ -248,8 +247,7 @@ def _brc_compact_training_rollout(
             jnp.mean(evidence_update_alpha.astype(jnp.float32)),
             evidence_strength,
             evidence_uncertainty,
-            evidence_actual_gamma,
-            evidence_scheduled_gamma,
+            evidence_gamma,
         )
 
     step_indices = jnp.arange(model.evidence_steps, dtype=jnp.int32)
@@ -294,8 +292,7 @@ def _brc_compact_training_rollout(
         evidence_update_alpha,
         evidence_strength,
         evidence_uncertainty,
-        evidence_actual_gamma,
-        evidence_scheduled_gamma,
+        evidence_gamma,
     ) = scan_outputs
     final_step = jnp.asarray(model.evidence_steps - 1, dtype=jnp.int32)
     final_logits = model._evidence_to_token_logits(evidence_final, inputs, final_step)
@@ -312,8 +309,7 @@ def _brc_compact_training_rollout(
         "evidence_update_alpha": evidence_update_alpha,
         "evidence_strength": evidence_strength,
         "evidence_uncertainty": evidence_uncertainty,
-        "evidence_actual_gamma": evidence_actual_gamma,
-        "evidence_scheduled_gamma": evidence_scheduled_gamma,
+        "evidence_gamma": evidence_gamma,
         "selected_candidate": selected_candidate,
         "selected_step": selected_step,
     }
@@ -467,8 +463,7 @@ def brc_loss_and_metrics(
         "evidence_update_alpha": diagnostics["evidence_update_alpha"],
         "evidence_strength": diagnostics["evidence_strength"],
         "evidence_uncertainty": diagnostics["evidence_uncertainty"],
-        "evidence_actual_gamma": diagnostics["evidence_actual_gamma"],
-        "evidence_scheduled_gamma": diagnostics["evidence_scheduled_gamma"],
+        "evidence_gamma": diagnostics["evidence_gamma"],
     }
     if model.config.task_type == "sudoku":
         context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
@@ -602,8 +597,7 @@ def brc_act_loss_and_metrics(
         "evidence_update_alpha": diagnostics["evidence_update_alpha"],
         "evidence_strength": diagnostics["evidence_strength"],
         "evidence_uncertainty": diagnostics["evidence_uncertainty"],
-        "evidence_actual_gamma": diagnostics["evidence_actual_gamma"],
-        "evidence_scheduled_gamma": diagnostics["evidence_scheduled_gamma"],
+        "evidence_gamma": diagnostics["evidence_gamma"],
     }
     if model.config.task_type == "sudoku":
         context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
