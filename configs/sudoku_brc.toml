@@ -10,7 +10,8 @@ seq_len = 81
 grid_height = 9
 grid_width = 9
 d_model = 512
-dropout_rate = 0.05
+dropout_rate = 0.0
+loss_type = "stablemax"
 
 [model.brc]
 belief_steps = 16
@@ -23,43 +24,45 @@ mlp_ratio = 4
 position_encoding = "rope"
 rms_norm_eps = 1e-5
 rope_theta = 10000.0
-step_loss_schedule = "uniform"
+step_loss_schedule = "linear"
 
 [optimizer]
+optimizer_type = "adam_atan2"
 learning_rate = 1e-4
-lr_min_ratio = 0.2
+lr_min_ratio = 1.0
 beta1 = 0.9
 beta2 = 0.95
-weight_decay = 0.1
-lr_warmup_steps = 3000
+weight_decay = 1.0
+lr_warmup_steps = 2000
 grad_clip_norm = 1.0
 
 [train]
-batch_size = 128
-epochs = 10000
+batch_size = 768
+epochs = 50000
 log_epochs = 10
+halt_loss_weight = 0.5
 seed = 0
 checkpoint_dir = "checkpoints"
 
 [train.ema]
 enabled = true
-decay = 0.995
+decay = 0.999
 
 [eval]
-batch_size = 128
-epochs = 1000
+batch_size = 768
+epochs = 5000
 diagnostics = false
 full_dataset = true
 
 [runtime]
 compute_dtype = "bfloat16"
 data_parallel_devices = 0
-prefetch_depth = 4
-prefetch_workers = 2
+prefetch_depth = 2
+prefetch_workers = 1
 profile_enabled = false
 
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-belief-dualtime-16x3x4x2-b128"
+name = "sudoku-brc-belief-dualtime-16x3x4x2-b768"
 mode = "online"
