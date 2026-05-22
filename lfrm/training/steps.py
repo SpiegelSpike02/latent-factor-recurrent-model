@@ -667,6 +667,91 @@ def brc_loss_and_metrics(
     return loss, metrics
 
 
+def brc_act_loss_and_metrics(
+    model: BRCModel,
+    carry: dict[str, jax.Array],
+    batch: dict[str, jax.Array],
+    train: bool,
+    dropout_key: jax.Array | None,
+    halt_loss_weight: float = 0.0,
+) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
+    if dropout_key is None:
+        dropout_key = jax.random.key(0)
+    new_carry, logits, diagnostics = model.forward_act_step(
+        carry,
+        batch,
+        train=train,
+        dropout_key=dropout_key,
+    )
+    inputs = new_carry["current_inputs"]
+    targets = new_carry["current_labels"]
+    example_mask = new_carry["current_example_mask"].astype(jnp.float32)
+    loss_mask = _apply_example_mask(
+        supervised_loss_mask(model, new_carry["current_given_mask"], targets),
+        example_mask,
+    )
+    normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32)), 1.0)
+    token_loss = token_cross_entropy(model, logits, targets)
+    lm_loss = jnp.sum(token_loss * loss_mask.astype(jnp.float32)) / normalizer
+    predictions = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    metric_correct = (predictions == targets).astype(jnp.float32) * loss_mask.astype(jnp.float32)
+    accuracy = jnp.sum(metric_correct) / normalizer
+    context_mask, query_mask = _brc_region_masks(model, inputs, loss_mask)
+    given_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
+    query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
+    supervised_cells_per_example = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
+    correct_per_example = jnp.sum(metric_correct, axis=-1)
+    exact_examples = jnp.where(
+        supervised_cells_per_example > 0,
+        correct_per_example == supervised_cells_per_example,
+        True,
+    )
+    exact_f32 = exact_examples.astype(jnp.float32)
+    exact_accuracy = _masked_example_mean(exact_f32, example_mask)
+    exact_count = jnp.sum(exact_f32 * example_mask)
+    target_probability = token_target_probability(model, logits, targets)
+    target_probability = jnp.sum(target_probability * loss_mask.astype(jnp.float32)) / normalizer
+    given_target_probability = _masked_target_probability(model, logits, targets, context_mask)
+    query_target_probability = _masked_target_probability(model, logits, targets, query_mask)
+    context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
+    halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    if halt_loss_weight != 0.0:
+        halt_targets = jax.lax.stop_gradient(exact_f32)
+        halt_loss_per_example = optax.sigmoid_binary_cross_entropy(
+            diagnostics["halt_logits"],
+            halt_targets,
+        )
+        halt_loss = jnp.sum(halt_loss_per_example * example_mask) / jnp.maximum(
+            jnp.sum(example_mask),
+            1.0,
+        )
+    loss = lm_loss + halt_loss_weight * halt_loss
+    metrics = {
+        "loss": loss,
+        "lm_loss": lm_loss,
+        "final_lm_loss": lm_loss,
+        "mean_lm_loss": lm_loss,
+        "accuracy": accuracy,
+        "given_accuracy": given_accuracy,
+        "query_accuracy": query_accuracy,
+        "exact_accuracy": exact_accuracy,
+        "exact_count": exact_count,
+        "final_target_probability": target_probability,
+        "given_target_probability": given_target_probability,
+        "query_target_probability": query_target_probability,
+        "context_consistency": context_consistency,
+        "invalid_rate": invalid_rate,
+        "conflicts": conflicts,
+        "act_step": diagnostics["act_step"],
+        "halted_rate": diagnostics["halted_rate"],
+        "reset_rate": diagnostics["reset_rate"],
+    }
+    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
+    if halt_loss_weight != 0.0:
+        metrics["halt_loss"] = halt_loss
+    return loss, (metrics, new_carry)
+
+
 def loss_and_metrics(
     model: GridReasoningModel,
     batch: dict[str, jax.Array],

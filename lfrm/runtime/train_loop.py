@@ -34,6 +34,7 @@ from lfrm.runtime.sharding import (
 )
 from lfrm.training import (
     build_ema_update_runner,
+    build_brc_act_train_step_runner,
     build_state_copy_runner,
     build_eval_step_runner,
     build_train_step_runner,
@@ -116,7 +117,13 @@ def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size
 
 
 def build_step_runners(config: ExperimentConfig):
-    if config.model.model_type in ("trm", "urm"):
+    if config.model.model_type == "brc":
+        train_step_fn = build_brc_act_train_step_runner(config.train.halt_loss_weight)
+        eval_step_fn = build_eval_step_runner(
+            config.train.halt_loss_weight,
+            config.train.terminal_residual_weight,
+        )
+    elif config.model.model_type in ("trm", "urm"):
         if config.train.trm_train_mode == "dense_unroll":
             train_step_fn = build_trm_dense_unroll_train_step_runner(
                 halt_loss_weight=config.train.halt_loss_weight,
@@ -396,7 +403,10 @@ def run_training(
     )
 
     current_batch = prefetcher.next()
-    use_recurrent_act = config.model.model_type in ("trm", "urm") and config.train.trm_train_mode == "act"
+    use_recurrent_act = (
+        config.model.model_type == "brc"
+        or (config.model.model_type in ("trm", "urm") and config.train.trm_train_mode == "act")
+    )
     console_model_label = "brc" if config.model.model_type == "brc" else config.model.model_type
     train_carry = place_tree(model.initial_carry(current_batch), data_sharding) if use_recurrent_act else None
     eval_interval = eval_interval_updates(config)

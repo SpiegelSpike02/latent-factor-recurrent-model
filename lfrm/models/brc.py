@@ -8,7 +8,7 @@ from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
 from .common import Array, casted_linear_init, compute_dtype, maybe_cast, trunc_normal_init
-from .recurrent.layers import dot_product_attention, multi_head_attention_with_rope, unscaled_rms_norm
+from .recurrent.layers import SwiGLU, dot_product_attention, multi_head_attention_with_rope, unscaled_rms_norm
 
 
 class BRCSolverBlock(nnx.Module):
@@ -24,7 +24,6 @@ class BRCSolverBlock(nnx.Module):
     ) -> None:
         self.config = config
         self.dtype = dtype
-        mlp_hidden_dim = max(hidden_dim, mlp_ratio * hidden_dim)
         self.self_attention = nnx.MultiHeadAttention(
             num_heads,
             in_features=hidden_dim,
@@ -54,20 +53,10 @@ class BRCSolverBlock(nnx.Module):
             bias_init=nnx.initializers.zeros,
             rngs=rngs,
         )
-        self.msg_in = nnx.Linear(
+        self.channel_mlp = SwiGLU(
             hidden_dim,
-            mlp_hidden_dim,
+            mlp_ratio,
             dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.msg_out = nnx.Linear(
-            mlp_hidden_dim,
-            hidden_dim,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
             rngs=rngs,
         )
     def __call__(
@@ -99,7 +88,7 @@ class BRCSolverBlock(nnx.Module):
             + h_norm * jnp.tanh(scale)[:, None, :]
             + shift[:, None, :]
         ).astype(self.dtype)
-        msg = self.msg_out(jax.nn.silu(self.msg_in(maybe_cast(h, self.dtype)))).astype(jnp.float32)
+        msg = self.channel_mlp(maybe_cast(h, self.dtype)).astype(jnp.float32)
         return self.message_norm(h.astype(jnp.float32) + msg).astype(self.dtype)
 
 
@@ -336,10 +325,11 @@ class BRCModel(nnx.Module):
         dropout_key: Array | None,
     ) -> Array:
         belief_embedding = self._belief_embedding(tokens, belief_logits)
+        time = time_embedding[None, None, :] if time_embedding.ndim == 1 else time_embedding[:, None, :]
         x = (
             base_embeddings
             + belief_embedding
-            + time_embedding[None, None, :]
+            + time
         ) * math.sqrt(1.0 / 5.0)
         return self.dropout(x, deterministic=not train, rngs=dropout_key).astype(self.dtype)
 
@@ -396,27 +386,6 @@ class BRCModel(nnx.Module):
         fused = hidden.astype(jnp.float32) + condition.astype(jnp.float32)
         return self.readout_output_norm(fused).astype(self.dtype)
 
-    def _h_cycle_step(
-        self,
-        tokens: Array,
-        belief_logits: Array,
-        hidden_state: Array,
-        base_embeddings: Array,
-        time_embedding: Array,
-        *,
-        train: bool,
-        dropout_key: Array | None,
-    ) -> tuple[Array, Array]:
-        cell_input = self._cell_embeddings(
-            tokens,
-            belief_logits,
-            base_embeddings,
-            time_embedding,
-            train=train,
-            dropout_key=dropout_key,
-        )
-        return self._hidden_l_cycle(hidden_state, cell_input), cell_input
-
     def _belief_step(
         self,
         tokens: Array,
@@ -429,30 +398,18 @@ class BRCModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
     ) -> tuple[Array, Array, Array]:
-        if dropout_key is None:
-            h_dropout_keys = jax.random.split(jax.random.key(0), self.h_cycles)
-        else:
-            h_dropout_keys = jax.random.split(dropout_key, self.h_cycles)
-        for h_index in range(self.h_cycles - 1):
-            hidden_state, _cell_input = self._h_cycle_step(
-                tokens,
-                belief_logits,
-                hidden_state,
-                base_embeddings,
-                time_embedding,
-                train=train,
-                dropout_key=h_dropout_keys[h_index],
-            )
-            hidden_state = jax.lax.stop_gradient(hidden_state)
-        hidden_state, cell_input = self._h_cycle_step(
+        cell_input = self._cell_embeddings(
             tokens,
             belief_logits,
-            hidden_state,
             base_embeddings,
             time_embedding,
             train=train,
-            dropout_key=h_dropout_keys[self.h_cycles - 1],
+            dropout_key=dropout_key,
         )
+        for h_index in range(self.h_cycles - 1):
+            hidden_state = self._hidden_l_cycle(hidden_state, cell_input)
+            hidden_state = jax.lax.stop_gradient(hidden_state)
+        hidden_state = self._hidden_l_cycle(hidden_state, cell_input)
         read_state = self._readout_fuse(hidden_state, cell_input)
         delta_logits = self.lm_head(maybe_cast(read_state, self.dtype))
         halt_logits = self._halt_logits(read_state)
@@ -491,6 +448,94 @@ class BRCModel(nnx.Module):
             + position_embeddings[None, :, :]
         )
         return base_embeddings, context
+
+    def initial_carry(self, batch: dict[str, Array]) -> dict[str, Array]:
+        batch_size = batch["inputs"].shape[0]
+        return {
+            "belief_logits": jnp.zeros(
+                (batch_size, self.config.seq_len, self.belief_vocab_size),
+                dtype=jnp.float32,
+            ),
+            "hidden": jnp.zeros(
+                (batch_size, self.config.seq_len, self.hidden_dim),
+                dtype=self.dtype,
+            ),
+            "steps": jnp.zeros((batch_size,), dtype=jnp.int32),
+            "halted": jnp.ones((batch_size,), dtype=bool),
+            "current_inputs": jnp.zeros_like(batch["inputs"]),
+            "current_labels": jnp.zeros_like(batch["labels"]),
+            "current_given_mask": jnp.zeros_like(batch["given_mask"]),
+            "current_example_mask": jnp.zeros((batch_size,), dtype=jnp.float32),
+        }
+
+    def forward_act_step(
+        self,
+        carry: dict[str, Array],
+        batch: dict[str, Array],
+        *,
+        train: bool,
+        dropout_key: Array | None = None,
+    ) -> tuple[dict[str, Array], Array, dict[str, Array]]:
+        if dropout_key is None:
+            dropout_key = jax.random.key(0)
+        reset = carry["halted"]
+        reset_cells = reset[:, None]
+        reset_state = reset[:, None, None]
+        inputs = jnp.where(reset_cells, batch["inputs"], carry["current_inputs"])
+        labels = jnp.where(reset_cells, batch["labels"], carry["current_labels"])
+        given_mask = jnp.where(reset_cells, batch["given_mask"], carry["current_given_mask"])
+        batch_example_mask = batch.get(
+            "example_mask",
+            jnp.ones((inputs.shape[0],), dtype=jnp.float32),
+        ).astype(jnp.float32)
+        example_mask = jnp.where(reset, batch_example_mask, carry["current_example_mask"])
+        steps = jnp.where(reset, 0, carry["steps"])
+
+        base_embeddings, _context = self.context_memory(inputs)
+        step_index = jnp.minimum(steps, self.belief_steps - 1)
+        time_embedding = self.time_embed(step_index)
+        reset_belief = self.initial_belief_logits(inputs)
+        belief_logits = jnp.where(reset_state, reset_belief, carry["belief_logits"])
+        reset_hidden = self.initial_hidden_state(
+            inputs,
+            reset_belief,
+            base_embeddings,
+            time_embedding,
+            train=train,
+            dropout_key=dropout_key,
+        )
+        hidden = jnp.where(reset_state, reset_hidden, carry["hidden"])
+        next_belief, next_hidden, halt_logits = self._belief_step(
+            inputs,
+            belief_logits,
+            hidden,
+            base_embeddings,
+            time_embedding,
+            step_index,
+            train=train,
+            dropout_key=dropout_key,
+        )
+        logits = self._belief_to_token_logits(next_belief, inputs, step_index)
+        new_steps = steps + 1
+        is_last_step = new_steps >= self.belief_steps
+        halted = is_last_step | (halt_logits > 0.0) if train else is_last_step
+        new_carry = {
+            "belief_logits": jax.lax.stop_gradient(next_belief),
+            "hidden": jax.lax.stop_gradient(next_hidden),
+            "steps": jax.lax.stop_gradient(new_steps),
+            "halted": jax.lax.stop_gradient(halted),
+            "current_inputs": inputs,
+            "current_labels": labels,
+            "current_given_mask": given_mask,
+            "current_example_mask": example_mask,
+        }
+        diagnostics = {
+            "halt_logits": halt_logits,
+            "act_step": jnp.mean(new_steps.astype(jnp.float32)),
+            "halted_rate": jnp.mean(halted.astype(jnp.float32)),
+            "reset_rate": jnp.mean(reset.astype(jnp.float32)),
+        }
+        return new_carry, logits, diagnostics
 
     def run_diffusion(
         self,
