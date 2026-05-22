@@ -105,8 +105,9 @@ def _brc_region_masks(model: BRCModel, inputs: jax.Array, loss_mask: jax.Array) 
     if model.config.task_type != "sudoku":
         zero_context = jnp.zeros_like(loss_mask, dtype=jnp.float32)
         return zero_context, (loss_mask > 0.0).astype(jnp.float32)
-    context_mask = model.context_mask(inputs) & (loss_mask > 0.0)
-    query_mask = (~model.context_mask(inputs)) & (loss_mask > 0.0)
+    input_context = model.context_mask(inputs)
+    context_mask = input_context & (loss_mask > 0.0)
+    query_mask = (~input_context) & (loss_mask > 0.0)
     return context_mask.astype(jnp.float32), query_mask.astype(jnp.float32)
 
 
@@ -115,13 +116,7 @@ def _masked_cell_accuracy(predictions: jax.Array, targets: jax.Array, mask: jax.
     return jnp.sum(correct) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
 
 
-def _masked_target_probability(
-    model: BRCModel,
-    logits: jax.Array,
-    targets: jax.Array,
-    mask: jax.Array,
-) -> jax.Array:
-    probability = token_target_probability(model, logits, targets)
+def _masked_probability(probability: jax.Array, mask: jax.Array) -> jax.Array:
     mask_f32 = mask.astype(jnp.float32)
     return jnp.sum(probability * mask_f32) / jnp.maximum(jnp.sum(mask_f32), 1.0)
 
@@ -402,10 +397,10 @@ def brc_loss_and_metrics(
     exact_f32 = exact_examples.astype(jnp.float32)
     exact_accuracy = _masked_example_mean(exact_f32, example_mask)
     exact_count = jnp.sum(exact_f32 * example_mask)
-    target_probability = token_target_probability(model, final_logits, targets)
-    target_probability = jnp.sum(target_probability * loss_mask.astype(jnp.float32)) / normalizer
-    context_target_probability = _masked_target_probability(model, final_logits, targets, context_mask)
-    query_target_probability = _masked_target_probability(model, final_logits, targets, query_mask)
+    target_probability_cells = token_target_probability(model, final_logits, targets)
+    target_probability = jnp.sum(target_probability_cells * loss_mask.astype(jnp.float32)) / normalizer
+    context_target_probability = _masked_probability(target_probability_cells, context_mask)
+    query_target_probability = _masked_probability(target_probability_cells, query_mask)
     if train:
         oracle_step = jnp.argmin(per_step_loss)
     else:
@@ -527,14 +522,14 @@ def brc_act_loss_and_metrics(
     valid_query_halted = valid_halted & (query_cells_per_example > 0)
     context_accuracy = _masked_example_mean(context_accuracy_per_example, valid_context_halted.astype(jnp.float32))
     query_accuracy = _masked_example_mean(query_accuracy_per_example, valid_query_halted.astype(jnp.float32))
-    target_probability = token_target_probability(model, logits, targets)
+    target_probability_cells = token_target_probability(model, logits, targets)
     per_example_target_probability = (
-        jnp.sum(target_probability * loss_mask.astype(jnp.float32), axis=-1)
+        jnp.sum(target_probability_cells * loss_mask.astype(jnp.float32), axis=-1)
         / jnp.maximum(supervised_cells_per_example, 1.0)
     )
     target_probability = jnp.sum(per_example_target_probability * valid_halted_f32) / valid_halted_normalizer
-    context_target_probability = _masked_target_probability(model, logits, targets, context_mask)
-    query_target_probability = _masked_target_probability(model, logits, targets, query_mask)
+    context_target_probability = _masked_probability(target_probability_cells, context_mask)
+    query_target_probability = _masked_probability(target_probability_cells, query_mask)
     halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
     if halt_loss_weight != 0.0:
         halt_targets = jax.lax.stop_gradient(exact_f32)

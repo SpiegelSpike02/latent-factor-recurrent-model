@@ -248,8 +248,7 @@ class BRCModel(nnx.Module):
         return belief_logits.astype(jnp.float32)
 
     def initial_belief_logits(self, tokens: Array) -> Array:
-        zeros = jnp.zeros((*tokens.shape, self.belief_vocab_size), dtype=jnp.float32)
-        return self._normalize_belief_logits(zeros, tokens)
+        return jnp.zeros((*tokens.shape, self.belief_vocab_size), dtype=jnp.float32)
 
     def _position_embeddings(self) -> Array:
         if self.brc.position_encoding != "learned":
@@ -360,27 +359,20 @@ class BRCModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
     ) -> Array:
-        cell_input = self._cell_embeddings(
-            tokens,
-            belief_logits,
-            base_embeddings,
-            time_embedding,
-            train=train,
-            dropout_key=dropout_key,
-        )
-        return self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
+        del belief_logits, base_embeddings, time_embedding, train, dropout_key
+        return jnp.zeros((tokens.shape[0], self.config.seq_len, self.hidden_dim), dtype=self.dtype)
 
     def context_memory(
         self,
         tokens: Array,
     ) -> tuple[Array, Array]:
-        position_embeddings = self._position_embeddings()
         context = self.context_mask(tokens)
         base_embeddings = (
             self.puzzle_embed(tokens.astype(jnp.int32))
             + self.context_embed(context.astype(jnp.int32))
-            + position_embeddings[None, :, :]
         )
+        if self.brc.position_encoding == "learned":
+            base_embeddings = base_embeddings + self._position_embeddings()[None, :, :]
         return base_embeddings, context
 
     def initial_carry(self, batch: dict[str, Array]) -> dict[str, Array]:
