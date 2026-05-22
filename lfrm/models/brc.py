@@ -51,11 +51,9 @@ class BRCSolverBlock(nnx.Module):
     def __call__(
         self,
         h: Array,
-        condition: Array,
         rope_cos: Array | None,
         rope_sin: Array | None,
     ) -> Array:
-        h = self.self_norm(h.astype(jnp.float32) + condition.astype(jnp.float32)).astype(self.dtype)
         attn = multi_head_attention_with_rope(
             self.self_attention,
             h,
@@ -356,7 +354,7 @@ class BRCModel(nnx.Module):
         for _ in range(self.l_cycles):
             hidden = self.hidden_anchor_norm(hidden.astype(jnp.float32) + hidden_input.astype(jnp.float32)).astype(self.dtype)
             for block in self.solver_blocks:
-                hidden = block(hidden, hidden_input, self.rope_cos, self.rope_sin)
+                hidden = block(hidden, self.rope_cos, self.rope_sin)
         return hidden
 
     def _readout_fuse(self, hidden_state: Array, cell_input: Array) -> Array:
