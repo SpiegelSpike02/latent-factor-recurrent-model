@@ -231,7 +231,7 @@ def _brc_compact_training_rollout(
         confidence = jnp.max(belief_probs, axis=-1)
         filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
         return (
-            jax.lax.stop_gradient(next_belief),
+            next_belief,
             next_hidden,
             early_candidate,
             mid_candidate,

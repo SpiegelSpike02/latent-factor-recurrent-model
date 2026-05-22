@@ -330,24 +330,25 @@ class BRCModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
     ) -> tuple[Array, Array, Array]:
-        cell_input = self._cell_embeddings(
-            tokens,
-            belief_logits,
-            base_embeddings,
-            time_embedding,
-            train=train,
-            dropout_key=dropout_key,
-        )
-        hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
-        for h_index in range(self.h_cycles - 1):
+        halt_logits = jnp.zeros((tokens.shape[0],), dtype=jnp.float32)
+        for h_index in range(self.h_cycles):
+            cell_input = self._cell_embeddings(
+                tokens,
+                belief_logits,
+                base_embeddings,
+                time_embedding,
+                train=train,
+                dropout_key=dropout_key,
+            )
+            hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
             hidden_state = self._hidden_l_cycle(hidden_state, hidden_input)
-            hidden_state = jax.lax.stop_gradient(hidden_state)
-        hidden_state = self._hidden_l_cycle(hidden_state, hidden_input)
-        read_state = self._readout_fuse(hidden_state, cell_input)
-        delta_logits = self.lm_head(maybe_cast(read_state, self.dtype))
-        halt_logits = self._halt_logits(read_state)
-        next_belief = self._belief_update(tokens, belief_logits, delta_logits, step_index)
-        return next_belief, jax.lax.stop_gradient(hidden_state), halt_logits
+            read_state = self._readout_fuse(hidden_state, cell_input)
+            delta_logits = self.lm_head(maybe_cast(read_state, self.dtype))
+            belief_logits = self._belief_update(tokens, belief_logits, delta_logits, step_index)
+            halt_logits = self._halt_logits(read_state)
+            if h_index < self.h_cycles - 1:
+                hidden_state = jax.lax.stop_gradient(hidden_state)
+        return belief_logits, jax.lax.stop_gradient(hidden_state), halt_logits
 
     def initial_hidden_state(
         self,
@@ -509,7 +510,7 @@ class BRCModel(nnx.Module):
                 train=train,
                 dropout_key=step_dropout_key,
             )
-            next_carry = (jax.lax.stop_gradient(next_belief), next_hidden)
+            next_carry = (next_belief, next_hidden)
             if return_final_only:
                 return next_carry, None
             logits = self._belief_to_token_logits(next_belief, tokens, step_index)
