@@ -406,7 +406,7 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None,
-    ) -> Array:
+    ) -> tuple[Array, Array]:
         cell_input = self._cell_embeddings(
             tokens,
             belief_logits,
@@ -415,7 +415,7 @@ class BRCModel(nnx.Module):
             train=train,
             dropout_key=dropout_key,
         )
-        return self._hidden_l_cycle(hidden_state, cell_input)
+        return self._hidden_l_cycle(hidden_state, cell_input), cell_input
 
     def _belief_step(
         self,
@@ -434,7 +434,7 @@ class BRCModel(nnx.Module):
         else:
             h_dropout_keys = jax.random.split(dropout_key, self.h_cycles)
         for h_index in range(self.h_cycles - 1):
-            hidden_state = self._h_cycle_step(
+            hidden_state, _cell_input = self._h_cycle_step(
                 tokens,
                 belief_logits,
                 hidden_state,
@@ -444,18 +444,10 @@ class BRCModel(nnx.Module):
                 dropout_key=h_dropout_keys[h_index],
             )
             hidden_state = jax.lax.stop_gradient(hidden_state)
-        hidden_state = self._h_cycle_step(
+        hidden_state, cell_input = self._h_cycle_step(
             tokens,
             belief_logits,
             hidden_state,
-            base_embeddings,
-            time_embedding,
-            train=train,
-            dropout_key=h_dropout_keys[self.h_cycles - 1],
-        )
-        cell_input = self._cell_embeddings(
-            tokens,
-            belief_logits,
             base_embeddings,
             time_embedding,
             train=train,
