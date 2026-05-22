@@ -122,12 +122,6 @@ ALLOWED_NESTED_KEYS = {
         "rms_norm_eps",
         "rope_theta",
         "step_loss_schedule",
-        "denoise_initial_prob",
-        "denoise_trajectory_prob",
-        "denoise_teacher_reveal_prob",
-        "denoise_mode_weights",
-        "fixed_point_entropy_weight",
-        "fixed_point_loss_weight",
     },
     "urm": {
         "recurrent_steps",
@@ -269,12 +263,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
     parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear"), default="uniform")
-    parser.add_argument("--brc-denoise-initial-prob", type=float, default=0.0)
-    parser.add_argument("--brc-denoise-trajectory-prob", type=float, default=0.0)
-    parser.add_argument("--brc-denoise-teacher-reveal-prob", type=float, default=0.25)
-    parser.add_argument("--brc-denoise-mode-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--brc-fixed-point-entropy-weight", type=float, default=0.0)
-    parser.add_argument("--brc-fixed-point-loss-weight", type=float, default=0.0)
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
     parser.add_argument("--urm-l-cycles", type=int, default=6)
@@ -418,16 +406,6 @@ def build_config(
             rms_norm_eps=args.brc_rms_norm_eps,
             rope_theta=args.brc_rope_theta,
             step_loss_schedule=args.brc_step_loss_schedule,
-            denoise_initial_prob=args.brc_denoise_initial_prob,
-            denoise_trajectory_prob=args.brc_denoise_trajectory_prob,
-            denoise_teacher_reveal_prob=args.brc_denoise_teacher_reveal_prob,
-            denoise_mode_weights=(
-                tuple(args.brc_denoise_mode_weights)
-                if args.brc_denoise_mode_weights is not None
-                else BRCConfig().denoise_mode_weights
-            ),
-            fixed_point_entropy_weight=args.brc_fixed_point_entropy_weight,
-            fixed_point_loss_weight=args.brc_fixed_point_loss_weight,
         ),
         urm=URMConfig(
             recurrent_steps=args.urm_recurrent_steps,
