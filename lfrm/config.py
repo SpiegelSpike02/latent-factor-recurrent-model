@@ -31,7 +31,7 @@ class TRMConfig:
 
 @dataclass(frozen=True)
 class BRCConfig:
-    belief_steps: int = 6
+    evidence_steps: int = 6
     h_cycles: int = 1
     l_cycles: int = 2
     l_layers: int = 1
