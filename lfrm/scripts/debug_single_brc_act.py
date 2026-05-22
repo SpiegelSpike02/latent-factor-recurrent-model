@@ -193,6 +193,8 @@ def main() -> None:
                     "halted_rate": _metric(host_metrics, "halted_rate"),
                     "reset_rate": _metric(host_metrics, "reset_rate"),
                     "act_step": _metric(host_metrics, "act_step"),
+                    "evidence_delta_mass": _metric(host_metrics, "evidence_delta_mass"),
+                    "evidence_update_alpha": _metric(host_metrics, "evidence_update_alpha"),
                     **probe,
                 }
                 if "halt_loss" in host_metrics:
@@ -214,6 +216,8 @@ def main() -> None:
                     f"{row['probe_confidence']:.2f} "
                     f"{row['probe_evidence_strength']:.2f} "
                     f"{row['probe_evidence_uncertainty']:.2f} "
+                    f"{row['evidence_delta_mass']:.2f} "
+                    f"{row['evidence_update_alpha']:.2f} "
                     f"{row['probe_evidence_delta_rms']:.3e} "
                     f"{row['probe_query_changed']:.3f}",
                     flush=True,

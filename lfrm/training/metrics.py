@@ -91,6 +91,7 @@ CORE_SCALAR_METRICS = (
     "conflicts",
     "diffusion_filled_ratio",
     "evidence_delta_mass",
+    "evidence_update_alpha",
     "evidence_strength",
     "evidence_uncertainty",
     "step_loss_weights",
@@ -205,6 +206,7 @@ BRC_CONSOLE_GROUPS = (
         (
             "diffusion_filled_ratio",
             "evidence_delta_mass",
+            "evidence_update_alpha",
             "evidence_strength",
             "evidence_uncertainty",
             "halt_loss",

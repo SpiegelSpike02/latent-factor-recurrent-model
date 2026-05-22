@@ -140,8 +140,8 @@ def _refine_evidence_step(
     *,
     train: bool,
     dropout_key: jax.Array | None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    next_evidence, next_hidden, halt_logits, evidence_delta_mass = model._evidence_step(
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    next_evidence, next_hidden, halt_logits, evidence_delta_mass, evidence_update_alpha = model._evidence_step(
         inputs,
         evidence,
         hidden_state,
@@ -151,7 +151,7 @@ def _refine_evidence_step(
         train=train,
         dropout_key=dropout_key,
     )
-    return next_evidence, next_hidden, halt_logits, evidence_delta_mass
+    return next_evidence, next_hidden, halt_logits, evidence_delta_mass, evidence_update_alpha
 
 
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
@@ -192,7 +192,7 @@ def _brc_compact_training_rollout(
             has_selected,
         ) = carry
         step_index, step_dropout_key, time_embedding = scan_inputs
-        next_evidence, next_hidden, halt_logits, evidence_delta_mass = _refine_evidence_step(
+        next_evidence, next_hidden, halt_logits, evidence_delta_mass, evidence_update_alpha = _refine_evidence_step(
             model,
             inputs,
             evidence,
@@ -241,6 +241,7 @@ def _brc_compact_training_rollout(
             halt_logits,
             step_exact.astype(jnp.float32),
             jnp.mean(evidence_delta_mass.astype(jnp.float32)),
+            jnp.mean(evidence_update_alpha.astype(jnp.float32)),
             evidence_strength,
             evidence_uncertainty,
         )
@@ -284,6 +285,7 @@ def _brc_compact_training_rollout(
         halt_logits,
         per_step_exact,
         evidence_delta_mass,
+        evidence_update_alpha,
         evidence_strength,
         evidence_uncertainty,
     ) = scan_outputs
@@ -299,6 +301,7 @@ def _brc_compact_training_rollout(
         "halt_logits": halt_logits,
         "per_step_exact": per_step_exact,
         "evidence_delta_mass": evidence_delta_mass,
+        "evidence_update_alpha": evidence_update_alpha,
         "evidence_strength": evidence_strength,
         "evidence_uncertainty": evidence_uncertainty,
         "selected_candidate": selected_candidate,
@@ -451,6 +454,7 @@ def brc_loss_and_metrics(
         "step_loss_weights": step_loss_weights,
         "diffusion_filled_ratio": diagnostics["diffusion_filled_ratio"],
         "evidence_delta_mass": diagnostics["evidence_delta_mass"],
+        "evidence_update_alpha": diagnostics["evidence_update_alpha"],
         "evidence_strength": diagnostics["evidence_strength"],
         "evidence_uncertainty": diagnostics["evidence_uncertainty"],
     }
@@ -583,6 +587,7 @@ def brc_act_loss_and_metrics(
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
         "evidence_delta_mass": diagnostics["evidence_delta_mass"],
+        "evidence_update_alpha": diagnostics["evidence_update_alpha"],
         "evidence_strength": diagnostics["evidence_strength"],
         "evidence_uncertainty": diagnostics["evidence_uncertainty"],
     }

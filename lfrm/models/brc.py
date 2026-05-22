@@ -217,6 +217,15 @@ class BRCModel(nnx.Module):
             bias_init=nnx.initializers.constant(-5.0),
             rngs=rngs,
         )
+        self.evidence_update_head = nnx.Linear(
+            self.hidden_dim,
+            1,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=nnx.initializers.zeros,
+            bias_init=nnx.initializers.constant(-2.0),
+            rngs=rngs,
+        )
         self.halt_head = nnx.Linear(
             self.hidden_dim,
             1,
@@ -315,15 +324,20 @@ class BRCModel(nnx.Module):
         del step_index
         return self._evidence_to_output_logits(evidence, tokens)
 
-    def _evidence_update(self, tokens: Array, evidence: Array, read_state: Array, step_index: Array) -> tuple[Array, Array]:
+    def _evidence_update(self, tokens: Array, evidence: Array, read_state: Array, step_index: Array) -> tuple[Array, Array, Array]:
         del tokens, step_index
         class_logits = self.evidence_class_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
-        delta_distribution = jax.nn.softmax(class_logits, axis=-1)
-        delta_mass = jax.nn.sigmoid(
+        proposal_distribution = jax.nn.softmax(class_logits, axis=-1)
+        max_proposal_mass = float(self.belief_vocab_size * self.evidence_steps * self.h_cycles)
+        proposal_mass = jax.nn.sigmoid(
             self.evidence_mass_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
-        ) * float(self.belief_vocab_size)
-        evidence_delta = delta_mass * delta_distribution
-        return self._evidence_alpha(evidence) + evidence_delta, delta_mass
+        ) * max_proposal_mass
+        proposal = 1.0 + proposal_mass * proposal_distribution
+        update_alpha = jax.nn.sigmoid(
+            self.evidence_update_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
+        )
+        next_evidence = (1.0 - update_alpha) * self._evidence_alpha(evidence) + update_alpha * proposal
+        return next_evidence, proposal_mass, update_alpha
 
     def _halt_logits(self, read_state: Array) -> Array:
         pooled = jnp.mean(read_state.astype(jnp.float32), axis=1)
@@ -355,9 +369,10 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None,
-    ) -> tuple[Array, Array, Array]:
+    ) -> tuple[Array, Array, Array, Array, Array]:
         halt_logits = jnp.zeros((tokens.shape[0],), dtype=jnp.float32)
         evidence_delta_mass = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
+        evidence_update_alpha = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
         for h_index in range(self.h_cycles):
             cell_input = self._cell_embeddings(
                 tokens,
@@ -370,11 +385,16 @@ class BRCModel(nnx.Module):
             hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
             hidden_state = self._hidden_l_cycle(hidden_state, hidden_input)
             read_state = self._readout_fuse(hidden_state, cell_input)
-            evidence, evidence_delta_mass = self._evidence_update(tokens, evidence, read_state, step_index)
+            evidence, evidence_delta_mass, evidence_update_alpha = self._evidence_update(
+                tokens,
+                evidence,
+                read_state,
+                step_index,
+            )
             halt_logits = self._halt_logits(read_state)
             if h_index < self.h_cycles - 1:
                 hidden_state = jax.lax.stop_gradient(hidden_state)
-        return evidence, jax.lax.stop_gradient(hidden_state), halt_logits, evidence_delta_mass
+        return evidence, jax.lax.stop_gradient(hidden_state), halt_logits, evidence_delta_mass, evidence_update_alpha
 
     def initial_hidden_state(
         self,
@@ -456,7 +476,7 @@ class BRCModel(nnx.Module):
             dropout_key=dropout_key,
         )
         hidden = jnp.where(reset_state, reset_hidden, carry["hidden"])
-        next_evidence, next_hidden, halt_logits, evidence_delta_mass = self._evidence_step(
+        next_evidence, next_hidden, halt_logits, evidence_delta_mass, evidence_update_alpha = self._evidence_step(
             inputs,
             evidence,
             hidden,
@@ -499,6 +519,7 @@ class BRCModel(nnx.Module):
             "halted_rate": jnp.mean(halted.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
             "evidence_delta_mass": jnp.mean(evidence_delta_mass.astype(jnp.float32)),
+            "evidence_update_alpha": jnp.mean(evidence_update_alpha.astype(jnp.float32)),
             "evidence_strength": jnp.mean(jnp.sum(self._evidence_alpha(next_evidence), axis=-1)),
             "evidence_uncertainty": jnp.mean(self._evidence_probabilities(next_evidence)[2]),
         }
@@ -522,7 +543,7 @@ class BRCModel(nnx.Module):
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key, time_embedding = scan_inputs
             evidence, hidden_state = carry
-            next_evidence, next_hidden, halt_logits, evidence_delta_mass = self._evidence_step(
+            next_evidence, next_hidden, halt_logits, evidence_delta_mass, evidence_update_alpha = self._evidence_step(
                 tokens,
                 evidence,
                 hidden_state,
@@ -544,6 +565,7 @@ class BRCModel(nnx.Module):
                 filled_ratio,
                 halt_logits,
                 jnp.mean(evidence_delta_mass.astype(jnp.float32)),
+                jnp.mean(evidence_update_alpha.astype(jnp.float32)),
                 jnp.mean(jnp.sum(self._evidence_alpha(next_evidence), axis=-1)),
                 jnp.mean(self._evidence_probabilities(next_evidence)[2]),
             )
@@ -577,16 +599,26 @@ class BRCModel(nnx.Module):
                 "unroll_steps": jnp.asarray(self.evidence_steps, dtype=jnp.float32),
                 "halt_logits": jnp.zeros((self.evidence_steps, tokens.shape[0]), dtype=jnp.float32),
                 "evidence_delta_mass": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
+                "evidence_update_alpha": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
                 "evidence_strength": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
                 "evidence_uncertainty": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
             }
             return logits, diagnostics
-        step_logits, filled_ratio, halt_logits, evidence_delta_mass, evidence_strength, evidence_uncertainty = scan_outputs
+        (
+            step_logits,
+            filled_ratio,
+            halt_logits,
+            evidence_delta_mass,
+            evidence_update_alpha,
+            evidence_strength,
+            evidence_uncertainty,
+        ) = scan_outputs
         diagnostics = {
             "diffusion_filled_ratio": filled_ratio,
             "halt_logits": halt_logits,
             "unroll_steps": jnp.asarray(self.evidence_steps, dtype=jnp.float32),
             "evidence_delta_mass": evidence_delta_mass,
+            "evidence_update_alpha": evidence_update_alpha,
             "evidence_strength": evidence_strength,
             "evidence_uncertainty": evidence_uncertainty,
         }
