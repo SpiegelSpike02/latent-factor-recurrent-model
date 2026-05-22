@@ -11,7 +11,7 @@ grid_height = 9
 grid_width = 9
 d_model = 512
 dropout_rate = 0.0
-loss_type = "stablemax"
+loss_type = "softmax"
 
 [model.brc]
 evidence_steps = 16

@@ -12,7 +12,7 @@ grid_width = 30
 d_model = 512
 rollout_steps = 16
 dropout_rate = 0.0
-loss_type = "stablemax"
+loss_type = "softmax"
 
 [model.brc]
 evidence_steps = 16

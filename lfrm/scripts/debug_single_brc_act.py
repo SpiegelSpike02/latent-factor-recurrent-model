@@ -89,6 +89,8 @@ def _probe(
     query_acc = float(np.mean(pred[query_mask] == labels[query_mask])) if np.any(query_mask) else 0.0
     exact = bool(np.all(pred[loss_mask] == labels[loss_mask])) if np.any(loss_mask) else True
     probs = _evidence_probs_np(evidence)
+    strength = np.sum(np.maximum(evidence, 1e-12), axis=-1, keepdims=True)
+    uncertainty = np.minimum(evidence.shape[-1] / np.maximum(strength, 1e-12), 1.0)
     entropy = float(-np.mean(np.sum(probs[loss_mask] * np.log(np.maximum(probs[loss_mask], 1e-12)), axis=-1)))
     confidence = float(np.mean(np.max(probs[loss_mask], axis=-1)))
     query_changed = 0.0
@@ -105,6 +107,8 @@ def _probe(
         "probe_exact": exact,
         "probe_entropy": entropy,
         "probe_confidence": confidence,
+        "probe_evidence_strength": float(np.mean(strength[loss_mask])),
+        "probe_evidence_uncertainty": float(np.mean(uncertainty[loss_mask])),
         "probe_changed": all_changed,
         "probe_query_changed": query_changed,
         "probe_evidence_delta_rms": evidence_delta,
@@ -152,7 +156,7 @@ def main() -> None:
     prev_pred = None
     prev_evidence = None
     print(
-        "step loss cur_q probe_q cur_ctx probe_ctx exact halt reset act entropy conf dE qchg",
+        "step loss cur_q probe_q cur_ctx probe_ctx exact halt reset act entropy conf strength uncert dE qchg",
         flush=True,
     )
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -208,6 +212,8 @@ def main() -> None:
                     f"{row['act_step']:.1f} "
                     f"{row['probe_entropy']:.2f} "
                     f"{row['probe_confidence']:.2f} "
+                    f"{row['probe_evidence_strength']:.2f} "
+                    f"{row['probe_evidence_uncertainty']:.2f} "
                     f"{row['probe_evidence_delta_rms']:.3e} "
                     f"{row['probe_query_changed']:.3f}",
                     flush=True,
