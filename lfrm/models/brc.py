@@ -452,15 +452,16 @@ class BRCModel(nnx.Module):
         if train:
             halted = is_last_step | (halt_logits > 0.0)
             if self.belief_steps > 1 and self.brc.halt_exploration_prob > 0.0:
-                exploration_key = jax.random.fold_in(dropout_key, 1)
-                explore = jax.random.uniform(exploration_key, halt_logits.shape) < self.brc.halt_exploration_prob
+                explore_key, min_step_key = jax.random.split(dropout_key)
+                explore = jax.random.uniform(explore_key, halt_logits.shape) < self.brc.halt_exploration_prob
                 random_step = jax.random.randint(
-                    exploration_key,
+                    min_step_key,
                     halt_logits.shape,
                     2,
                     self.belief_steps + 1,
                 )
-                halted = halted | (explore & (new_steps >= random_step))
+                min_steps = jnp.where(explore, random_step, 1)
+                halted = halted & (new_steps >= min_steps)
         else:
             halted = is_last_step
         new_carry = {
