@@ -231,7 +231,7 @@ def _brc_compact_training_rollout(
             evidence_gamma,
         ) = model._evidence_metric_values(next_evidence, step_index)
         return (
-            jax.lax.stop_gradient(next_evidence),
+            next_evidence,
             next_hidden,
             early_candidate,
             mid_candidate,
