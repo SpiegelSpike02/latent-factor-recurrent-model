@@ -129,10 +129,10 @@ def _normalized_step_loss_weights(configured: tuple[float, ...] | None, rollout_
     return weights / jnp.maximum(jnp.sum(weights), 1e-6)
 
 
-def _refine_evidence_step(
+def _refine_direction_step(
     model: BRCModel,
     inputs: jax.Array,
-    evidence: jax.Array,
+    direction: jax.Array,
     hidden_state: jax.Array,
     base_embeddings: jax.Array,
     time_embedding: jax.Array,
@@ -140,18 +140,20 @@ def _refine_evidence_step(
     *,
     train: bool,
     dropout_key: jax.Array | None,
+    stop_hidden_between_steps: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    next_evidence, next_hidden, halt_logits, evidence_proposal_budget, evidence_update_alpha = model._evidence_step(
+    next_direction, next_hidden, halt_logits, direction_scheduled_budget, direction_update_alpha = model._direction_step(
         inputs,
-        evidence,
+        direction,
         hidden_state,
         base_embeddings,
         time_embedding,
         step_index,
         train=train,
         dropout_key=dropout_key,
+        stop_hidden_between_steps=stop_hidden_between_steps,
     )
-    return next_evidence, next_hidden, halt_logits, evidence_proposal_budget, evidence_update_alpha
+    return next_direction, next_hidden, halt_logits, direction_scheduled_budget, direction_update_alpha
 
 
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
@@ -167,7 +169,7 @@ def _brc_compact_training_rollout(
     inputs: jax.Array,
     targets: jax.Array,
     loss_mask: jax.Array,
-    initial_evidence: jax.Array,
+    initial_direction: jax.Array,
     dropout_key: jax.Array,
 ) -> tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
     """Run BRC training without materializing [steps, batch, cells, vocab] logits."""
@@ -179,11 +181,11 @@ def _brc_compact_training_rollout(
     supervised_cells_per_example = jnp.sum(loss_mask_f32, axis=-1)
     candidate_init = jnp.zeros_like(inputs)
     early_index = jnp.asarray(0, dtype=jnp.int32)
-    mid_index = jnp.asarray(model.evidence_steps // 2, dtype=jnp.int32)
+    mid_index = jnp.asarray(model.direction_steps // 2, dtype=jnp.int32)
 
     def scan_step(carry, scan_inputs):
         (
-            evidence,
+            direction,
             hidden_state,
             early_candidate,
             mid_candidate,
@@ -192,18 +194,19 @@ def _brc_compact_training_rollout(
             has_selected,
         ) = carry
         step_index, step_dropout_key, time_embedding = scan_inputs
-        next_evidence, next_hidden, halt_logits, evidence_proposal_budget, evidence_update_alpha = _refine_evidence_step(
+        next_direction, next_hidden, halt_logits, direction_scheduled_budget, direction_update_alpha = _refine_direction_step(
             model,
             inputs,
-            evidence,
+            direction,
             hidden_state,
             base_embeddings,
             time_embedding,
             step_index,
             train=True,
             dropout_key=step_dropout_key,
+            stop_hidden_between_steps=False,
         )
-        logits = model._evidence_to_token_logits(next_evidence, inputs, step_index)
+        logits = model._direction_to_token_logits(next_direction, inputs, step_index)
         token_loss = token_cross_entropy(model, logits, targets)
         per_step_loss = jnp.sum(token_loss * loss_mask_f32) / loss_normalizer
         predictions = jnp.argmax(logits, axis=-1).astype(jnp.int32)
@@ -216,22 +219,17 @@ def _brc_compact_training_rollout(
             True,
         )
         step_halted = halt_logits > 0.0
-        step_halted = jnp.where(step_index == model.evidence_steps - 1, True, step_halted)
+        step_halted = jnp.where(step_index == model.direction_steps - 1, True, step_halted)
         take_selected = step_halted & (~has_selected)
         selected_candidate = jnp.where(take_selected[:, None], predictions, selected_candidate)
         selected_step = jnp.where(take_selected, step_index, selected_step)
         has_selected = has_selected | take_selected
 
-        _excess, _mass, direction, _gamma, _uncertainty, _strength = model._evidence_stats(next_evidence)
-        confidence = jnp.max(direction, axis=-1)
+        confidence = jnp.max(model._normalize_direction(next_direction), axis=-1)
         filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
-        (
-            evidence_strength,
-            evidence_uncertainty,
-            evidence_gamma,
-        ) = model._evidence_metric_values(next_evidence, step_index)
+        trust_gamma, trust_uncertainty = model._trust_metric_values(step_index)
         return (
-            next_evidence,
+            next_direction,
             next_hidden,
             early_candidate,
             mid_candidate,
@@ -243,35 +241,34 @@ def _brc_compact_training_rollout(
             filled_ratio,
             halt_logits,
             step_exact.astype(jnp.float32),
-            jnp.mean(evidence_proposal_budget.astype(jnp.float32)),
-            jnp.mean(evidence_update_alpha.astype(jnp.float32)),
-            evidence_strength,
-            evidence_uncertainty,
-            evidence_gamma,
+            jnp.mean(direction_scheduled_budget.astype(jnp.float32)),
+            jnp.mean(direction_update_alpha.astype(jnp.float32)),
+            trust_gamma,
+            trust_uncertainty,
         )
 
-    step_indices = jnp.arange(model.evidence_steps, dtype=jnp.int32)
-    step_dropout_keys = jax.random.split(dropout_key, model.evidence_steps)
+    step_indices = jnp.arange(model.direction_steps, dtype=jnp.int32)
+    step_dropout_keys = jax.random.split(dropout_key, model.direction_steps)
     time_embeddings = model.time_embed(step_indices)
     initial_hidden = model.initial_hidden_state(
         inputs,
-        initial_evidence,
+        initial_direction,
         base_embeddings,
         time_embeddings[0],
         train=True,
         dropout_key=step_dropout_keys[0],
     )
     initial_carry = (
-        initial_evidence.astype(jnp.float32),
+        initial_direction.astype(jnp.float32),
         initial_hidden,
         candidate_init,
         candidate_init,
         candidate_init,
-        jnp.full((inputs.shape[0],), model.evidence_steps - 1, dtype=jnp.int32),
+        jnp.full((inputs.shape[0],), model.direction_steps - 1, dtype=jnp.int32),
         jnp.zeros((inputs.shape[0],), dtype=bool),
     )
     (
-        evidence_final,
+        direction_final,
         _hidden_final,
         early_candidate,
         mid_candidate,
@@ -288,28 +285,26 @@ def _brc_compact_training_rollout(
         filled_ratio,
         halt_logits,
         per_step_exact,
-        evidence_proposal_budget,
-        evidence_update_alpha,
-        evidence_strength,
-        evidence_uncertainty,
-        evidence_gamma,
+        direction_scheduled_budget,
+        direction_update_alpha,
+        trust_gamma,
+        trust_uncertainty,
     ) = scan_outputs
-    final_step = jnp.asarray(model.evidence_steps - 1, dtype=jnp.int32)
-    final_logits = model._evidence_to_token_logits(evidence_final, inputs, final_step)
+    final_step = jnp.asarray(model.direction_steps - 1, dtype=jnp.int32)
+    final_logits = model._direction_to_token_logits(direction_final, inputs, final_step)
     final_candidate = jnp.argmax(final_logits, axis=-1).astype(jnp.int32)
     diagnostics = {
         "diffusion_filled_ratio": filled_ratio,
-        "unroll_steps": jnp.asarray(model.evidence_steps, dtype=jnp.float32),
+        "unroll_steps": jnp.asarray(model.direction_steps, dtype=jnp.float32),
         "early_candidate": early_candidate,
         "mid_candidate": mid_candidate,
         "final_candidate": final_candidate,
         "halt_logits": halt_logits,
         "per_step_exact": per_step_exact,
-        "evidence_proposal_budget": evidence_proposal_budget,
-        "evidence_update_alpha": evidence_update_alpha,
-        "evidence_strength": evidence_strength,
-        "evidence_uncertainty": evidence_uncertainty,
-        "evidence_gamma": evidence_gamma,
+        "direction_scheduled_budget": direction_scheduled_budget,
+        "direction_update_alpha": direction_update_alpha,
+        "trust_gamma": trust_gamma,
+        "trust_uncertainty": trust_uncertainty,
         "selected_candidate": selected_candidate,
         "selected_step": selected_step,
     }
@@ -352,7 +347,7 @@ def brc_loss_and_metrics(
     context_mask, query_mask = _brc_region_masks(model, inputs, loss_mask)
     metric_loss_mask = loss_mask
 
-    initial_evidence = model.initial_evidence(inputs)
+    initial_direction = model.initial_direction(inputs)
     normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32)), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32), axis=-1), 1.0)
     if train:
@@ -361,13 +356,13 @@ def brc_loss_and_metrics(
             inputs,
             targets,
             loss_mask,
-            initial_evidence,
+            initial_direction,
             solve_key,
         )
     else:
         step_logits, diagnostics = model.run_diffusion(
             inputs,
-            initial_evidence=initial_evidence,
+            initial_direction=initial_direction,
             train=train,
             dropout_key=solve_key,
         )
@@ -379,20 +374,21 @@ def brc_loss_and_metrics(
         step_predictions = jnp.argmax(step_logits, axis=-1)
         step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask.astype(jnp.float32)
         supervised_cells_per_example_for_steps = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
-        diagnostics["per_step_exact"] = jnp.where(
-            supervised_cells_per_example_for_steps[None, :] > 0,
-            jnp.sum(step_correct, axis=-1) == supervised_cells_per_example_for_steps[None, :],
-            True,
-        ).astype(jnp.float32)
-        selected_step = _trm_selected_step(diagnostics["halt_logits"])
-        gather_index = selected_step[None, :, None, None]
-        selected_logits = jnp.take_along_axis(
-            step_logits,
-            jnp.broadcast_to(gather_index, (1, inputs.shape[0], step_logits.shape[2], step_logits.shape[3])),
-            axis=0,
-        ).squeeze(0)
-        diagnostics["selected_candidate"] = jnp.argmax(selected_logits, axis=-1).astype(jnp.int32)
-        diagnostics["selected_step"] = selected_step
+        if halt_loss_weight != 0.0:
+            diagnostics["per_step_exact"] = jnp.where(
+                supervised_cells_per_example_for_steps[None, :] > 0,
+                jnp.sum(step_correct, axis=-1) == supervised_cells_per_example_for_steps[None, :],
+                True,
+            ).astype(jnp.float32)
+            selected_step = _trm_selected_step(diagnostics["halt_logits"])
+            gather_index = selected_step[None, :, None, None]
+            selected_logits = jnp.take_along_axis(
+                step_logits,
+                jnp.broadcast_to(gather_index, (1, inputs.shape[0], step_logits.shape[2], step_logits.shape[3])),
+                axis=0,
+            ).squeeze(0)
+            diagnostics["selected_candidate"] = jnp.argmax(selected_logits, axis=-1).astype(jnp.int32)
+            diagnostics["selected_step"] = selected_step
     step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
     step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
     solution_loss = per_step_loss[-1]
@@ -431,19 +427,11 @@ def brc_loss_and_metrics(
     else:
         per_step_example_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=-1) / per_example_normalizer[None, :]
         oracle_step = _masked_example_mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32), example_mask)
-    selected_predictions = diagnostics.get("selected_candidate", predictions)
-    selected_correct = (selected_predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
-    selected_accuracy = jnp.sum(selected_correct) / metric_normalizer
-    selected_correct_per_example = jnp.sum(selected_correct, axis=-1)
-    selected_exact_examples = jnp.where(
-        supervised_cells_per_example > 0,
-        selected_correct_per_example == supervised_cells_per_example,
-        True,
-    )
-    selected_exact_accuracy = _masked_example_mean(selected_exact_examples.astype(jnp.float32), example_mask)
-
     metrics = {
         "loss": loss,
+        "ce_loss": step_ce_loss,
+        "final_ce_loss": solution_loss,
+        "mean_ce_loss": jnp.mean(per_step_loss),
         "lm_loss": step_ce_loss,
         "final_lm_loss": solution_loss,
         "mean_lm_loss": jnp.mean(per_step_loss),
@@ -458,12 +446,16 @@ def brc_loss_and_metrics(
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_loss_weights,
-        "diffusion_filled_ratio": diagnostics["diffusion_filled_ratio"],
-        "evidence_proposal_budget": diagnostics["evidence_proposal_budget"],
-        "evidence_update_alpha": diagnostics["evidence_update_alpha"],
-        "evidence_strength": diagnostics["evidence_strength"],
-        "evidence_uncertainty": diagnostics["evidence_uncertainty"],
-        "evidence_gamma": diagnostics["evidence_gamma"],
+        "diffusion_filled_ratio": jnp.mean(diagnostics["diffusion_filled_ratio"]),
+        "direction_scheduled_budget": jnp.mean(diagnostics["direction_scheduled_budget"]),
+        "direction_update_alpha": jnp.mean(diagnostics["direction_update_alpha"]),
+        "trust_gamma": jnp.mean(diagnostics["trust_gamma"]),
+        "trust_uncertainty": jnp.mean(diagnostics["trust_uncertainty"]),
+        "per_step_diffusion_filled_ratio": diagnostics["diffusion_filled_ratio"],
+        "per_step_direction_scheduled_budget": diagnostics["direction_scheduled_budget"],
+        "per_step_direction_update_alpha": diagnostics["direction_update_alpha"],
+        "per_step_trust_gamma": diagnostics["trust_gamma"],
+        "per_step_trust_uncertainty": diagnostics["trust_uncertainty"],
     }
     if model.config.task_type == "sudoku":
         context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
@@ -475,6 +467,16 @@ def brc_loss_and_metrics(
             }
         )
     if halt_loss_weight != 0.0:
+        selected_predictions = diagnostics["selected_candidate"]
+        selected_correct = (selected_predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
+        selected_accuracy = jnp.sum(selected_correct) / metric_normalizer
+        selected_correct_per_example = jnp.sum(selected_correct, axis=-1)
+        selected_exact_examples = jnp.where(
+            supervised_cells_per_example > 0,
+            selected_correct_per_example == supervised_cells_per_example,
+            True,
+        )
+        selected_exact_accuracy = _masked_example_mean(selected_exact_examples.astype(jnp.float32), example_mask)
         metrics.update(
             {
                 "halt_loss": halt_loss,
@@ -594,6 +596,8 @@ def brc_act_loss_and_metrics(
     loss = lm_loss + halt_loss_weight * halt_loss
     metrics = {
         "loss": loss,
+        "ce_loss": lm_loss,
+        "active_ce_loss": lm_loss,
         "lm_loss": lm_loss,
         "active_lm_loss": lm_loss,
         "completed_accuracy": accuracy,
@@ -615,11 +619,10 @@ def brc_act_loss_and_metrics(
         "act_step": diagnostics["act_step"],
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
-        "evidence_proposal_budget": diagnostics["evidence_proposal_budget"],
-        "evidence_update_alpha": diagnostics["evidence_update_alpha"],
-        "evidence_strength": diagnostics["evidence_strength"],
-        "evidence_uncertainty": diagnostics["evidence_uncertainty"],
-        "evidence_gamma": diagnostics["evidence_gamma"],
+        "direction_scheduled_budget": diagnostics["direction_scheduled_budget"],
+        "direction_update_alpha": diagnostics["direction_update_alpha"],
+        "trust_gamma": diagnostics["trust_gamma"],
+        "trust_uncertainty": diagnostics["trust_uncertainty"],
     }
     if model.config.task_type == "sudoku":
         context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)

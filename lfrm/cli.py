@@ -29,7 +29,26 @@ from lfrm.runtime import (
 CONFIG_SECTIONS = ("data", "task", "model", "optimizer", "train", "eval", "runtime", "wandb")
 NESTED_SECTIONS = {
     "model": {"trm", "brc", "urm"},
-    "train": {"ema"},
+    "train": {"ema", "objective"},
+}
+GROUPED_NESTED_KEYS = {
+    "brc": {
+        "dynamics": {"direction_steps", "step_loss_schedule"},
+        "cycles": {"h_cycles", "l_cycles", "l_layers"},
+        "hidden": {
+            "hidden_state_dim",
+            "num_heads",
+            "mlp_ratio",
+            "local_kernel",
+            "input_scale",
+            "attn_scale",
+            "local_scale",
+            "rms_norm_eps",
+        },
+        "position": {"position_encoding", "rope_theta"},
+        "halt": {"halt_exploration_prob", "halt_min_steps"},
+    },
+    "objective": {"loss": {"halt_loss_weight", "terminal_residual_weight"}},
 }
 ALLOWED_SECTION_KEYS = {
     "data": {"dataset_path"},
@@ -70,6 +89,7 @@ ALLOWED_SECTION_KEYS = {
         "seed",
         "checkpoint_dir",
         "ema",
+        "objective",
     },
     "eval": {
         "batch_size",
@@ -111,19 +131,28 @@ ALLOWED_NESTED_KEYS = {
         "step_loss_weights",
     },
     "brc": {
-        "evidence_steps",
+        "direction_steps",
         "h_cycles",
         "l_cycles",
         "l_layers",
         "hidden_state_dim",
         "num_heads",
         "mlp_ratio",
+        "local_kernel",
+        "input_scale",
+        "attn_scale",
+        "local_scale",
         "position_encoding",
         "rms_norm_eps",
         "rope_theta",
         "halt_exploration_prob",
         "halt_min_steps",
         "step_loss_schedule",
+        "dynamics",
+        "cycles",
+        "hidden",
+        "position",
+        "halt",
     },
     "urm": {
         "recurrent_steps",
@@ -139,6 +168,11 @@ ALLOWED_NESTED_KEYS = {
         "rope_theta",
         "halt_exploration_prob",
         "step_loss_weights",
+    },
+    "objective": {
+        "halt_loss_weight",
+        "terminal_residual_weight",
+        "loss",
     },
 }
 
@@ -171,7 +205,21 @@ def load_toml_config(path: str | None) -> dict[str, object]:
                     normalized_nested_key = nested_key.replace("-", "_")
                     if normalized_nested_key not in ALLOWED_NESTED_KEYS[normalized_key]:
                         raise ValueError(f"Unsupported [{section}.{key}] field in grid reasoning config: {nested_key}")
-                    flat[f"{normalized_key}_{normalized_nested_key}"] = nested_value
+                    grouped_keys = GROUPED_NESTED_KEYS.get(normalized_key, {})
+                    if normalized_nested_key in grouped_keys:
+                        if not isinstance(nested_value, dict):
+                            raise ValueError(f"Section [{section}.{key}.{nested_key}] in {config_path} must be a table")
+                        for group_key, group_value in nested_value.items():
+                            normalized_group_key = group_key.replace("-", "_")
+                            if normalized_group_key not in grouped_keys[normalized_nested_key]:
+                                raise ValueError(
+                                    f"Unsupported [{section}.{key}.{nested_key}] field in grid reasoning config: {group_key}"
+                                )
+                            output_key = normalized_group_key if normalized_key == "objective" else f"{normalized_key}_{normalized_group_key}"
+                            flat[output_key] = group_value
+                        continue
+                    output_key = normalized_nested_key if normalized_key == "objective" else f"{normalized_key}_{normalized_nested_key}"
+                    flat[output_key] = nested_value
                 continue
             if section == "wandb":
                 normalized_key = f"wandb_{normalized_key}"
@@ -254,13 +302,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--brc-evidence-steps", type=int, default=6)
+    parser.add_argument("--brc-direction-steps", type=int, default=6)
     parser.add_argument("--brc-h-cycles", type=int, default=1)
     parser.add_argument("--brc-l-cycles", type=int, default=2)
     parser.add_argument("--brc-l-layers", type=int, default=1)
     parser.add_argument("--brc-hidden-state-dim", type=int, default=0)
     parser.add_argument("--brc-num-heads", type=int, default=4)
     parser.add_argument("--brc-mlp-ratio", type=int, default=2)
+    parser.add_argument("--brc-local-kernel", type=int, default=3)
+    parser.add_argument("--brc-input-scale", type=float, default=0.5)
+    parser.add_argument("--brc-attn-scale", type=float, default=0.2)
+    parser.add_argument("--brc-local-scale", type=float, default=0.2)
     parser.add_argument("--brc-position-encoding", choices=("rope", "learned", "none"), default="rope")
     parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
@@ -399,13 +451,17 @@ def build_config(
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
         brc=BRCConfig(
-            evidence_steps=args.brc_evidence_steps,
+            direction_steps=args.brc_direction_steps,
             h_cycles=args.brc_h_cycles,
             l_cycles=args.brc_l_cycles,
             l_layers=args.brc_l_layers,
             hidden_state_dim=args.brc_hidden_state_dim,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,
+            local_kernel=args.brc_local_kernel,
+            input_scale=args.brc_input_scale,
+            attn_scale=args.brc_attn_scale,
+            local_scale=args.brc_local_scale,
             position_encoding=args.brc_position_encoding,
             rms_norm_eps=args.brc_rms_norm_eps,
             rope_theta=args.brc_rope_theta,

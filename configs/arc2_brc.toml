@@ -15,13 +15,17 @@ dropout_rate = 0.0
 loss_type = "softmax"
 
 [model.brc]
-evidence_steps = 16
+direction_steps = 16
 h_cycles = 3
 l_cycles = 4
 hidden_state_dim = 256
 l_layers = 2
 num_heads = 8
 mlp_ratio = 4
+local_kernel = 3
+input_scale = 0.5
+attn_scale = 0.2
+local_scale = 0.2
 position_encoding = "rope"
 rms_norm_eps = 1e-5
 rope_theta = 10000.0
@@ -65,5 +69,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "arc2-brc-evidence-dualtime-16x3x4x2-b768"
+name = "arc2-brc-direction-dualtime-16x3x4x2-b768"
 mode = "online"

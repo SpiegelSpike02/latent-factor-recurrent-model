@@ -8,7 +8,75 @@ from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
 from .common import Array, casted_linear_init, compute_dtype, maybe_cast, trunc_normal_init
-from .recurrent.layers import SwiGLU, dot_product_attention, multi_head_attention_with_rope, unscaled_rms_norm
+from .recurrent.layers import (
+    dot_product_attention,
+    multi_head_attention_with_rope,
+    swiglu_intermediate_size,
+    unscaled_rms_norm,
+)
+
+
+class BRCLocalConvSwiGLU(nnx.Module):
+    def __init__(
+        self,
+        config: ModelConfig,
+        hidden_dim: int,
+        mlp_ratio: int,
+        dtype: jnp.dtype,
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        brc = config.brc_config
+        if brc.local_kernel < 1 or brc.local_kernel % 2 == 0:
+            raise ValueError("BRC local_kernel must be a positive odd integer")
+        self.config = config
+        self.hidden_dim = hidden_dim
+        self.dtype = dtype
+        intermediate_size = swiglu_intermediate_size(hidden_dim, mlp_ratio, min_size=hidden_dim)
+        self.gate_up = nnx.Linear(
+            hidden_dim,
+            2 * intermediate_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.depthwise = nnx.Conv(
+            intermediate_size,
+            intermediate_size,
+            kernel_size=(brc.local_kernel, brc.local_kernel),
+            padding="SAME",
+            feature_group_count=intermediate_size,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            preferred_element_type=dtype,
+            rngs=rngs,
+        )
+        self.down = nnx.Linear(
+            intermediate_size,
+            hidden_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+
+    def __call__(self, h: Array) -> Array:
+        batch_size = h.shape[0]
+        gate, up = jnp.split(self.gate_up(maybe_cast(h, self.dtype)), 2, axis=-1)
+        x = jax.nn.silu(gate) * up
+        x = x.reshape(
+            batch_size,
+            self.config.grid_height,
+            self.config.grid_width,
+            x.shape[-1],
+        )
+        x = self.depthwise(x)
+        x = x.reshape(batch_size, self.config.seq_len, x.shape[-1])
+        return self.down(jax.nn.silu(x))
 
 
 class BRCSolverBlock(nnx.Module):
@@ -38,11 +106,15 @@ class BRCSolverBlock(nnx.Module):
             out_kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.self_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
-        self.message_norm = unscaled_rms_norm(hidden_dim, config.brc_config.rms_norm_eps, dtype, rngs)
+        brc = config.brc_config
+        self.attn_norm = unscaled_rms_norm(hidden_dim, brc.rms_norm_eps, dtype, rngs)
+        self.local_norm = unscaled_rms_norm(hidden_dim, brc.rms_norm_eps, dtype, rngs)
+        self.attn_scale = float(brc.attn_scale)
+        self.local_scale = float(brc.local_scale)
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.channel_mlp = SwiGLU(
+        self.local_mlp = BRCLocalConvSwiGLU(
+            config,
             hidden_dim,
             mlp_ratio,
             dtype=dtype,
@@ -55,11 +127,12 @@ class BRCSolverBlock(nnx.Module):
         rope_cos: Array | None,
         rope_sin: Array | None,
     ) -> Array:
+        x = self.attn_norm(h.astype(jnp.float32)).astype(self.dtype)
         attn = multi_head_attention_with_rope(
             self.self_attention,
-            h,
-            h,
-            h,
+            x,
+            x,
+            x,
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             dtype=self.dtype,
@@ -67,13 +140,18 @@ class BRCSolverBlock(nnx.Module):
             rope_sin=rope_sin,
             name="BRC self attention",
         )
-        h = self.self_norm(h.astype(jnp.float32) + attn.astype(jnp.float32)).astype(self.dtype)
-        msg = self.channel_mlp(maybe_cast(h, self.dtype)).astype(jnp.float32)
-        return self.message_norm(h.astype(jnp.float32) + msg).astype(self.dtype)
+        h = (h.astype(jnp.float32) + self.attn_scale * attn.astype(jnp.float32)).astype(self.dtype)
+        local = self.local_mlp(self.local_norm(h.astype(jnp.float32)).astype(self.dtype)).astype(jnp.float32)
+        return (h.astype(jnp.float32) + self.local_scale * local).astype(self.dtype)
 
 
 class BRCModel(nnx.Module):
-    """Excess-evidence recurrent solver for fixed-size grid reasoning tasks."""
+    """Direction-state recurrent solver for fixed-size grid reasoning tasks.
+
+    The recurrent state stores a per-cell answer direction `q` on the class
+    simplex. Scheduled budget/gamma controls how strongly that direction is
+    read by the hidden workspace; it is not learned per-cell confidence.
+    """
 
     def __init__(
         self,
@@ -89,8 +167,8 @@ class BRCModel(nnx.Module):
         if config.task_type == "sudoku" and config.vocab_size < 11:
             raise ValueError("BRC Sudoku expects vocab_size >= 11")
         brc = config.brc_config
-        if brc.evidence_steps < 1:
-            raise ValueError("BRC evidence_steps must be at least 1")
+        if brc.direction_steps < 1:
+            raise ValueError("BRC direction_steps must be at least 1")
         if min(brc.h_cycles, brc.l_cycles, brc.l_layers) < 1:
             raise ValueError("BRC h_cycles, l_cycles, and l_layers must be at least 1")
         hidden_dim = int(brc.hidden_state_dim) if brc.hidden_state_dim > 0 else config.d_model
@@ -102,10 +180,12 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC hidden state dimension must be divisible by num_heads")
         if brc.mlp_ratio < 1:
             raise ValueError("BRC mlp_ratio must be at least 1")
+        if brc.local_kernel < 1 or brc.local_kernel % 2 == 0:
+            raise ValueError("BRC local_kernel must be a positive odd integer")
         if brc.position_encoding not in ("rope", "learned", "none"):
             raise ValueError("BRC position_encoding must be 'rope', 'learned', or 'none'")
-        if brc.position_encoding == "rope" and (hidden_dim // brc.num_heads) % 2 != 0:
-            raise ValueError("BRC RoPE head dimension must be even")
+        if brc.position_encoding == "rope" and (hidden_dim // brc.num_heads) % 4 != 0:
+            raise ValueError("BRC axial RoPE head dimension must be divisible by 4")
         if brc.step_loss_schedule not in ("uniform", "linear"):
             raise ValueError("BRC step_loss_schedule must be 'uniform' or 'linear'")
         if brc.halt_min_steps < 1:
@@ -114,15 +194,16 @@ class BRCModel(nnx.Module):
         self.config = config
         self.runtime = runtime
         self.brc = brc
-        self.evidence_steps = int(brc.evidence_steps)
+        self.direction_steps = int(brc.direction_steps)
         self.h_cycles = int(brc.h_cycles)
         self.l_cycles = int(brc.l_cycles)
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
-        self.evidence_vocab_size = config.vocab_size
-        self.evidence_eps = 1e-4
+        self.direction_vocab_size = config.vocab_size
+        self.direction_eps = 1e-6
         self.output_logit_eps = 1e-9
+        self.input_scale = float(brc.input_scale)
         self.box_height, self.box_width = self._box_shape(config.grid_height, config.grid_width)
 
         rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
@@ -145,7 +226,7 @@ class BRCModel(nnx.Module):
             rngs=rngs,
         )
         self.context_embed = nnx.Embed(2, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.evidence_embed = nnx.Embed(
+        self.direction_embed = nnx.Embed(
             max(10, config.vocab_size),
             config.d_model,
             dtype=self.dtype,
@@ -157,13 +238,15 @@ class BRCModel(nnx.Module):
             self.row_embed = nnx.Embed(config.grid_height, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
             self.col_embed = nnx.Embed(config.grid_width, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
             self.box_embed = nnx.Embed(self.num_boxes, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.time_embed = nnx.Embed(self.evidence_steps, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
+        self.time_embed = nnx.Embed(self.direction_steps, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
         if brc.position_encoding == "rope":
             head_dim = self.hidden_dim // brc.num_heads
-            inv_freq = 1.0 / (brc.rope_theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
-            positions = jnp.arange(config.seq_len, dtype=jnp.float32)
-            freqs = positions[:, None] * inv_freq[None, :]
+            axis_dim = head_dim // 2
+            inv_freq = 1.0 / (brc.rope_theta ** (jnp.arange(0, axis_dim, 2, dtype=jnp.float32) / axis_dim))
+            row_freqs = rows.astype(jnp.float32)[:, None] * inv_freq[None, :]
+            col_freqs = cols.astype(jnp.float32)[:, None] * inv_freq[None, :]
+            freqs = jnp.concatenate((row_freqs, col_freqs), axis=-1)
             rope = jnp.concatenate((freqs, freqs), axis=-1)
             self.rope_cos = nnx.data(jnp.cos(rope))
             self.rope_sin = nnx.data(jnp.sin(rope))
@@ -179,7 +262,6 @@ class BRCModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.hidden_anchor_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
         self.readout_hidden_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
         self.readout_condition_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
         self.readout_output_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
@@ -204,7 +286,7 @@ class BRCModel(nnx.Module):
                 for _ in range(brc.l_layers)
             ]
         )
-        self.evidence_class_head = nnx.Linear(
+        self.direction_class_head = nnx.Linear(
             self.hidden_dim,
             config.vocab_size,
             dtype=self.dtype,
@@ -212,7 +294,7 @@ class BRCModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.evidence_update_head = nnx.Linear(
+        self.direction_update_head = nnx.Linear(
             self.hidden_dim,
             1,
             dtype=self.dtype,
@@ -257,31 +339,24 @@ class BRCModel(nnx.Module):
             return tokens > 1
         return tokens != 0
 
-    def _evidence_alpha(self, evidence: Array) -> Array:
-        return jnp.maximum(evidence.astype(jnp.float32), self.evidence_eps)
+    def _normalize_direction(self, direction: Array) -> Array:
+        direction = jnp.maximum(direction.astype(jnp.float32), self.direction_eps)
+        return direction / jnp.sum(direction, axis=-1, keepdims=True)
 
-    def _evidence_stats(self, evidence: Array) -> tuple[Array, Array, Array, Array, Array, Array]:
-        alpha = self._evidence_alpha(evidence)
-        excess = jnp.maximum(alpha - 1.0, 0.0)
-        mass = jnp.sum(excess, axis=-1, keepdims=True)
-        uniform = jnp.full_like(alpha, 1.0 / float(self.evidence_vocab_size))
-        direction = jnp.where(
-            mass > self.evidence_eps,
-            excess / jnp.maximum(mass, self.evidence_eps),
-            uniform,
+    def _uniform_direction(self, tokens: Array) -> Array:
+        return jnp.full(
+            (*tokens.shape, self.direction_vocab_size),
+            1.0 / float(self.direction_vocab_size),
+            dtype=jnp.float32,
         )
-        gamma = mass / (float(self.evidence_vocab_size) + mass + self.evidence_eps)
-        uncertainty = 1.0 - gamma
-        strength = jnp.sum(alpha, axis=-1, keepdims=True)
-        return excess, mass, direction, gamma, uncertainty, strength
 
-    def _evidence_to_output_logits(self, evidence: Array, tokens: Array) -> Array:
+    def _direction_to_output_logits(self, direction: Array, tokens: Array) -> Array:
         del tokens
-        excess, _mass, _direction, _gamma, _uncertainty, _strength = self._evidence_stats(evidence)
-        return jnp.log(jnp.maximum(excess, self.output_logit_eps))
+        direction = self._normalize_direction(direction)
+        return jnp.log(jnp.maximum(direction, self.output_logit_eps))
 
-    def initial_evidence(self, tokens: Array) -> Array:
-        return jnp.ones((*tokens.shape, self.evidence_vocab_size), dtype=jnp.float32)
+    def initial_direction(self, tokens: Array) -> Array:
+        return self._uniform_direction(tokens)
 
     def _position_embeddings(self) -> Array:
         if self.brc.position_encoding != "learned":
@@ -292,79 +367,80 @@ class BRCModel(nnx.Module):
             + self.box_embed(self.box_ids)
         )
 
-    def _evidence_embedding(self, tokens: Array, evidence: Array) -> Array:
+    def _direction_embedding(self, tokens: Array, direction: Array, step_index: Array) -> Array:
         del tokens
-        excess, mass, _direction, _gamma, _uncertainty, _strength = self._evidence_stats(evidence)
-        trusted_direction = (excess - mass / float(self.evidence_vocab_size)) / (
-            float(self.evidence_vocab_size) + mass
-        )
-        embedding_table = maybe_cast(self.evidence_embed.embedding[: self.config.vocab_size], self.dtype)
-        evidence_embedding = jnp.einsum(
+        direction = self._normalize_direction(direction)
+        uniform = jnp.full_like(direction, 1.0 / float(self.direction_vocab_size))
+        gamma = self._trust_gamma(step_index)
+        if gamma.ndim == 0:
+            gamma = gamma[None, None, None]
+        elif gamma.ndim == 1:
+            gamma = gamma[:, None, None]
+        trusted_direction = gamma * (direction - uniform)
+        embedding_table = maybe_cast(self.direction_embed.embedding[: self.config.vocab_size], self.dtype)
+        direction_embedding = jnp.einsum(
             "bnd,dk->bnk",
             maybe_cast(trusted_direction, self.dtype),
             embedding_table,
             preferred_element_type=jnp.float32,
         )
-        return evidence_embedding
+        return direction_embedding
 
     def _cell_embeddings(
         self,
         tokens: Array,
-        evidence: Array,
+        direction: Array,
         base_embeddings: Array,
         time_embedding: Array,
+        step_index: Array,
         *,
         train: bool,
         dropout_key: Array | None,
     ) -> Array:
-        evidence_embedding = self._evidence_embedding(tokens, evidence)
+        direction_embedding = self._direction_embedding(tokens, direction, step_index)
         time = time_embedding[None, None, :] if time_embedding.ndim == 1 else time_embedding[:, None, :]
         x = (
             base_embeddings
-            + evidence_embedding
+            + direction_embedding
             + time
         ) * math.sqrt(1.0 / 3.0)
         return self.dropout(x, deterministic=not train, rngs=dropout_key).astype(self.dtype)
 
-    def _evidence_to_token_logits(self, evidence: Array, tokens: Array, step_index: Array) -> Array:
+    def _direction_to_token_logits(self, direction: Array, tokens: Array, step_index: Array) -> Array:
         del step_index
-        return self._evidence_to_output_logits(evidence, tokens)
+        return self._direction_to_output_logits(direction, tokens)
 
-    def _proposal_budget(self, step_index: Array) -> Array:
-        gamma = self._evidence_gamma(step_index)
-        return float(self.evidence_vocab_size) * gamma / jnp.maximum(1.0 - gamma, self.evidence_eps)
+    def _scheduled_budget(self, step_index: Array) -> Array:
+        gamma = self._trust_gamma(step_index)
+        return float(self.direction_vocab_size) * gamma / jnp.maximum(1.0 - gamma, self.direction_eps)
 
-    def _evidence_gamma(self, step_index: Array) -> Array:
-        final_budget = float(self.evidence_vocab_size * self.evidence_steps * self.h_cycles)
-        max_gamma = final_budget / (float(self.evidence_vocab_size) + final_budget)
-        progress = (step_index.astype(jnp.float32) + 1.0) / float(self.evidence_steps)
+    def _trust_gamma(self, step_index: Array) -> Array:
+        final_budget = float(self.direction_vocab_size * self.direction_steps * self.h_cycles)
+        max_gamma = final_budget / (float(self.direction_vocab_size) + final_budget)
+        progress = (step_index.astype(jnp.float32) + 1.0) / float(self.direction_steps)
         return max_gamma * jnp.square(progress)
 
-    def _evidence_update(self, tokens: Array, evidence: Array, read_state: Array, step_index: Array) -> tuple[Array, Array, Array]:
+    def _direction_update(self, tokens: Array, direction: Array, read_state: Array, step_index: Array) -> tuple[Array, Array, Array]:
         del tokens
-        _excess, _mass, current_direction, _gamma, _uncertainty, _strength = self._evidence_stats(evidence)
-        class_logits = self.evidence_class_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
+        current_direction = self._normalize_direction(direction)
+        class_logits = self.direction_class_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         proposal_distribution = jax.nn.softmax(class_logits, axis=-1)
-        proposal_mass = self._proposal_budget(step_index)
-        if proposal_mass.ndim == 0:
-            proposal_mass = proposal_mass[None, None, None]
-        elif proposal_mass.ndim == 1:
-            proposal_mass = proposal_mass[:, None, None]
-        proposal_mass = jnp.broadcast_to(proposal_mass, (*read_state.shape[:-1], 1))
+        scheduled_budget = self._scheduled_budget(step_index)
+        if scheduled_budget.ndim == 0:
+            scheduled_budget = scheduled_budget[None, None, None]
+        elif scheduled_budget.ndim == 1:
+            scheduled_budget = scheduled_budget[:, None, None]
+        scheduled_budget = jnp.broadcast_to(scheduled_budget, (*read_state.shape[:-1], 1))
         update_alpha = jax.nn.sigmoid(
-            self.evidence_update_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
+            self.direction_update_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         )
         next_direction = (1.0 - update_alpha) * current_direction + update_alpha * proposal_distribution
-        next_evidence = 1.0 + proposal_mass * next_direction
-        return next_evidence, proposal_mass, update_alpha
+        next_direction = self._normalize_direction(next_direction)
+        return next_direction, scheduled_budget, update_alpha
 
-    def _evidence_metric_values(self, evidence: Array, step_index: Array) -> tuple[Array, Array, Array]:
-        _excess, _mass, _direction, _gamma, uncertainty, strength = self._evidence_stats(evidence)
-        return (
-            jnp.mean(strength),
-            jnp.mean(uncertainty),
-            jnp.mean(self._evidence_gamma(step_index).astype(jnp.float32)),
-        )
+    def _trust_metric_values(self, step_index: Array) -> tuple[Array, Array]:
+        gamma = self._trust_gamma(step_index).astype(jnp.float32)
+        return jnp.mean(gamma), jnp.mean(1.0 - gamma)
 
     def _halt_logits(self, read_state: Array) -> Array:
         pooled = jnp.mean(read_state.astype(jnp.float32), axis=1)
@@ -373,7 +449,7 @@ class BRCModel(nnx.Module):
     def _hidden_l_cycle(self, hidden_state: Array, hidden_input: Array) -> Array:
         hidden = hidden_state.astype(self.dtype)
         for _ in range(self.l_cycles):
-            hidden = self.hidden_anchor_norm(hidden.astype(jnp.float32) + hidden_input.astype(jnp.float32)).astype(self.dtype)
+            hidden = (hidden.astype(jnp.float32) + self.input_scale * hidden_input.astype(jnp.float32)).astype(self.dtype)
             for block in self.solver_blocks:
                 hidden = block(hidden, self.rope_cos, self.rope_sin)
         return hidden
@@ -385,10 +461,10 @@ class BRCModel(nnx.Module):
         fused = hidden.astype(jnp.float32) + condition.astype(jnp.float32)
         return self.readout_output_norm(fused).astype(self.dtype)
 
-    def _evidence_step(
+    def _direction_step(
         self,
         tokens: Array,
-        evidence: Array,
+        direction: Array,
         hidden_state: Array,
         base_embeddings: Array,
         time_embedding: Array,
@@ -396,55 +472,58 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None,
+        stop_hidden_between_steps: bool = True,
     ) -> tuple[Array, Array, Array, Array, Array]:
         halt_logits = jnp.zeros((tokens.shape[0],), dtype=jnp.float32)
-        evidence_proposal_budget = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
-        evidence_update_alpha = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
-        evidence_proposal_budget_sum = jnp.zeros_like(evidence_proposal_budget)
-        evidence_update_alpha_sum = jnp.zeros_like(evidence_update_alpha)
+        scheduled_budget = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
+        direction_update_alpha = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
+        scheduled_budget_sum = jnp.zeros_like(scheduled_budget)
+        direction_update_alpha_sum = jnp.zeros_like(direction_update_alpha)
         for h_index in range(self.h_cycles):
             cell_input = self._cell_embeddings(
                 tokens,
-                evidence,
+                direction,
                 base_embeddings,
                 time_embedding,
+                step_index,
                 train=train,
                 dropout_key=dropout_key,
             )
             hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
             hidden_state = self._hidden_l_cycle(hidden_state, hidden_input)
             read_state = self._readout_fuse(hidden_state, cell_input)
-            evidence, evidence_proposal_budget, evidence_update_alpha = self._evidence_update(
+            direction, scheduled_budget, direction_update_alpha = self._direction_update(
                 tokens,
-                evidence,
+                direction,
                 read_state,
                 step_index,
             )
-            evidence_proposal_budget_sum = evidence_proposal_budget_sum + evidence_proposal_budget
-            evidence_update_alpha_sum = evidence_update_alpha_sum + evidence_update_alpha
+            scheduled_budget_sum = scheduled_budget_sum + scheduled_budget
+            direction_update_alpha_sum = direction_update_alpha_sum + direction_update_alpha
             halt_logits = self._halt_logits(read_state)
             if h_index < self.h_cycles - 1:
                 hidden_state = jax.lax.stop_gradient(hidden_state)
         h_cycles = jnp.asarray(self.h_cycles, dtype=jnp.float32)
+        next_hidden = jax.lax.stop_gradient(hidden_state) if stop_hidden_between_steps else hidden_state
         return (
-            evidence,
-            jax.lax.stop_gradient(hidden_state),
+            direction,
+            next_hidden,
             halt_logits,
-            evidence_proposal_budget_sum / h_cycles,
-            evidence_update_alpha_sum / h_cycles,
+            scheduled_budget_sum / h_cycles,
+            direction_update_alpha_sum / h_cycles,
         )
 
     def initial_hidden_state(
         self,
         tokens: Array,
-        evidence: Array,
+        direction: Array,
         base_embeddings: Array,
         time_embedding: Array,
         *,
         train: bool,
         dropout_key: Array | None,
     ) -> Array:
-        del evidence, base_embeddings, time_embedding, train, dropout_key
+        del direction, base_embeddings, time_embedding, train, dropout_key
         return jnp.zeros((tokens.shape[0], self.config.seq_len, self.hidden_dim), dtype=self.dtype)
 
     def context_memory(
@@ -463,10 +542,7 @@ class BRCModel(nnx.Module):
     def initial_carry(self, batch: dict[str, Array]) -> dict[str, Array]:
         batch_size = batch["inputs"].shape[0]
         return {
-            "evidence": jnp.ones(
-                (batch_size, self.config.seq_len, self.evidence_vocab_size),
-                dtype=jnp.float32,
-            ),
+            "direction": self._uniform_direction(batch["inputs"]),
             "hidden": jnp.zeros(
                 (batch_size, self.config.seq_len, self.hidden_dim),
                 dtype=self.dtype,
@@ -501,51 +577,52 @@ class BRCModel(nnx.Module):
         steps = jnp.where(reset, 0, carry["steps"])
 
         base_embeddings, _context = self.context_memory(inputs)
-        step_index = jnp.minimum(steps, self.evidence_steps - 1)
+        step_index = jnp.minimum(steps, self.direction_steps - 1)
         time_embedding = self.time_embed(step_index)
-        reset_evidence = self.initial_evidence(inputs)
-        evidence = jnp.where(reset_state, reset_evidence, carry["evidence"])
+        reset_direction = self.initial_direction(inputs)
+        direction = jnp.where(reset_state, reset_direction, carry["direction"])
         reset_hidden = self.initial_hidden_state(
             inputs,
-            reset_evidence,
+            reset_direction,
             base_embeddings,
             time_embedding,
             train=train,
             dropout_key=dropout_key,
         )
         hidden = jnp.where(reset_state, reset_hidden, carry["hidden"])
-        next_evidence, next_hidden, halt_logits, evidence_proposal_budget, evidence_update_alpha = self._evidence_step(
+        next_direction, next_hidden, halt_logits, scheduled_budget, direction_update_alpha = self._direction_step(
             inputs,
-            evidence,
+            direction,
             hidden,
             base_embeddings,
             time_embedding,
             step_index,
             train=train,
             dropout_key=dropout_key,
+            stop_hidden_between_steps=True,
         )
-        logits = self._evidence_to_token_logits(next_evidence, inputs, step_index)
+        logits = self._direction_to_token_logits(next_direction, inputs, step_index)
         new_steps = steps + 1
-        is_last_step = new_steps >= self.evidence_steps
+        is_last_step = new_steps >= self.direction_steps
         if train:
             halted = is_last_step | (halt_logits > 0.0)
-            min_halt_steps = min(int(self.brc.halt_min_steps), self.evidence_steps)
+            min_halt_steps = min(int(self.brc.halt_min_steps), self.direction_steps)
             min_steps = jnp.full_like(new_steps, min_halt_steps)
-            if self.evidence_steps > 1 and self.brc.halt_exploration_prob > 0.0:
+            if self.direction_steps > 1 and self.brc.halt_exploration_prob > 0.0:
                 explore_key, min_step_key = jax.random.split(dropout_key)
                 explore = jax.random.uniform(explore_key, halt_logits.shape) < self.brc.halt_exploration_prob
                 random_step = jax.random.randint(
                     min_step_key,
                     halt_logits.shape,
                     min_halt_steps,
-                    self.evidence_steps + 1,
+                    self.direction_steps + 1,
                 )
                 min_steps = jnp.where(explore, random_step, min_steps)
             halted = halted & (new_steps >= min_steps)
         else:
             halted = is_last_step
         new_carry = {
-            "evidence": jax.lax.stop_gradient(next_evidence),
+            "direction": jax.lax.stop_gradient(next_direction),
             "hidden": jax.lax.stop_gradient(next_hidden),
             "steps": jax.lax.stop_gradient(new_steps),
             "halted": jax.lax.stop_gradient(halted),
@@ -558,119 +635,109 @@ class BRCModel(nnx.Module):
             "act_step": jnp.mean(new_steps.astype(jnp.float32)),
             "halted_rate": jnp.mean(halted.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
-            "evidence_proposal_budget": jnp.mean(evidence_proposal_budget.astype(jnp.float32)),
-            "evidence_update_alpha": jnp.mean(evidence_update_alpha.astype(jnp.float32)),
+            "direction_scheduled_budget": jnp.mean(scheduled_budget.astype(jnp.float32)),
+            "direction_update_alpha": jnp.mean(direction_update_alpha.astype(jnp.float32)),
         }
-        (
-            diagnostics["evidence_strength"],
-            diagnostics["evidence_uncertainty"],
-            diagnostics["evidence_gamma"],
-        ) = self._evidence_metric_values(next_evidence, step_index)
+        diagnostics["trust_gamma"], diagnostics["trust_uncertainty"] = self._trust_metric_values(step_index)
         return new_carry, logits, diagnostics
 
     def run_diffusion(
         self,
         tokens: Array,
         *,
-        initial_evidence: Array | None = None,
+        initial_direction: Array | None = None,
         train: bool,
         dropout_key: Array | None = None,
         return_final_only: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
-        if initial_evidence is None:
-            initial_evidence = self.initial_evidence(tokens)
+        if initial_direction is None:
+            initial_direction = self.initial_direction(tokens)
         base_embeddings, context = self.context_memory(tokens)
         query_mask = (~context).astype(jnp.float32)
         query_normalizer = jnp.maximum(jnp.sum(query_mask), 1.0)
 
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key, time_embedding = scan_inputs
-            evidence, hidden_state = carry
-            next_evidence, next_hidden, halt_logits, evidence_proposal_budget, evidence_update_alpha = self._evidence_step(
+            direction, hidden_state = carry
+            next_direction, next_hidden, halt_logits, scheduled_budget, direction_update_alpha = self._direction_step(
                 tokens,
-                evidence,
+                direction,
                 hidden_state,
                 base_embeddings,
                 time_embedding,
                 step_index,
                 train=train,
                 dropout_key=step_dropout_key,
+                stop_hidden_between_steps=False,
             )
-            next_carry = (next_evidence, next_hidden)
+            next_carry = (next_direction, next_hidden)
             if return_final_only:
                 return next_carry, None
-            logits = self._evidence_to_token_logits(next_evidence, tokens, step_index)
-            _excess, _mass, direction, _gamma, _uncertainty, _strength = self._evidence_stats(next_evidence)
-            confidence = jnp.max(direction, axis=-1)
+            logits = self._direction_to_token_logits(next_direction, tokens, step_index)
+            confidence = jnp.max(self._normalize_direction(next_direction), axis=-1)
             filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
-            evidence_strength, evidence_uncertainty, evidence_gamma = (
-                self._evidence_metric_values(next_evidence, step_index)
-            )
+            trust_gamma, trust_uncertainty = self._trust_metric_values(step_index)
             return next_carry, (
                 logits,
                 filled_ratio,
                 halt_logits,
-                jnp.mean(evidence_proposal_budget.astype(jnp.float32)),
-                jnp.mean(evidence_update_alpha.astype(jnp.float32)),
-                evidence_strength,
-                evidence_uncertainty,
-                evidence_gamma,
+                jnp.mean(scheduled_budget.astype(jnp.float32)),
+                jnp.mean(direction_update_alpha.astype(jnp.float32)),
+                trust_gamma,
+                trust_uncertainty,
             )
 
-        step_indices = jnp.arange(self.evidence_steps, dtype=jnp.int32)
+        step_indices = jnp.arange(self.direction_steps, dtype=jnp.int32)
         if dropout_key is None:
-            step_dropout_keys = jax.random.split(jax.random.key(0), self.evidence_steps)
+            step_dropout_keys = jax.random.split(jax.random.key(0), self.direction_steps)
         else:
-            step_dropout_keys = jax.random.split(dropout_key, self.evidence_steps)
+            step_dropout_keys = jax.random.split(dropout_key, self.direction_steps)
         time_embeddings = self.time_embed(step_indices)
         initial_hidden = self.initial_hidden_state(
             tokens,
-            initial_evidence,
+            initial_direction,
             base_embeddings,
             time_embeddings[0],
             train=train,
             dropout_key=step_dropout_keys[0],
         )
-        initial_carry = (initial_evidence.astype(jnp.float32), initial_hidden)
+        initial_carry = (initial_direction.astype(jnp.float32), initial_hidden)
         final_carry, scan_outputs = jax.lax.scan(
             scan_step,
             initial_carry,
             (step_indices, step_dropout_keys, time_embeddings),
         )
-        evidence_final, _hidden_final = final_carry
+        direction_final, _hidden_final = final_carry
         if return_final_only:
-            final_step = jnp.asarray(self.evidence_steps - 1, dtype=jnp.int32)
-            logits = self._evidence_to_token_logits(evidence_final, tokens, final_step)
+            final_step = jnp.asarray(self.direction_steps - 1, dtype=jnp.int32)
+            logits = self._direction_to_token_logits(direction_final, tokens, final_step)
             diagnostics = {
-                "diffusion_filled_ratio": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
-                "unroll_steps": jnp.asarray(self.evidence_steps, dtype=jnp.float32),
-                "halt_logits": jnp.zeros((self.evidence_steps, tokens.shape[0]), dtype=jnp.float32),
-                "evidence_proposal_budget": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
-                "evidence_update_alpha": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
-                "evidence_strength": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
-                "evidence_uncertainty": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
-                "evidence_gamma": jnp.zeros((self.evidence_steps,), dtype=jnp.float32),
+                "diffusion_filled_ratio": jnp.zeros((self.direction_steps,), dtype=jnp.float32),
+                "unroll_steps": jnp.asarray(self.direction_steps, dtype=jnp.float32),
+                "halt_logits": jnp.zeros((self.direction_steps, tokens.shape[0]), dtype=jnp.float32),
+                "direction_scheduled_budget": jnp.zeros((self.direction_steps,), dtype=jnp.float32),
+                "direction_update_alpha": jnp.zeros((self.direction_steps,), dtype=jnp.float32),
+                "trust_gamma": jnp.zeros((self.direction_steps,), dtype=jnp.float32),
+                "trust_uncertainty": jnp.zeros((self.direction_steps,), dtype=jnp.float32),
             }
             return logits, diagnostics
         (
             step_logits,
             filled_ratio,
             halt_logits,
-            evidence_proposal_budget,
-            evidence_update_alpha,
-            evidence_strength,
-            evidence_uncertainty,
-            evidence_gamma,
+            direction_scheduled_budget,
+            direction_update_alpha,
+            trust_gamma,
+            trust_uncertainty,
         ) = scan_outputs
         diagnostics = {
             "diffusion_filled_ratio": filled_ratio,
             "halt_logits": halt_logits,
-            "unroll_steps": jnp.asarray(self.evidence_steps, dtype=jnp.float32),
-            "evidence_proposal_budget": evidence_proposal_budget,
-            "evidence_update_alpha": evidence_update_alpha,
-            "evidence_strength": evidence_strength,
-            "evidence_uncertainty": evidence_uncertainty,
-            "evidence_gamma": evidence_gamma,
+            "unroll_steps": jnp.asarray(self.direction_steps, dtype=jnp.float32),
+            "direction_scheduled_budget": direction_scheduled_budget,
+            "direction_update_alpha": direction_update_alpha,
+            "trust_gamma": trust_gamma,
+            "trust_uncertainty": trust_uncertainty,
         }
         return step_logits, diagnostics
 
@@ -680,11 +747,11 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
-        initial_evidence: Array | None = None,
+        initial_direction: Array | None = None,
     ) -> tuple[Array, dict[str, Array]]:
         return self.run_diffusion(
             tokens,
-            initial_evidence=initial_evidence,
+            initial_direction=initial_direction,
             train=train,
             dropout_key=dropout_key,
         )
@@ -695,13 +762,13 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
-        initial_evidence: Array | None = None,
+        initial_direction: Array | None = None,
     ) -> tuple[Array, dict[str, Array]]:
         return self.forward_all_steps_with_diagnostics(
             tokens,
             train=train,
             dropout_key=dropout_key,
-            initial_evidence=initial_evidence,
+            initial_direction=initial_direction,
         )
 
     def forward_all_steps(

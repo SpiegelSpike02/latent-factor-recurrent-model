@@ -31,13 +31,17 @@ class TRMConfig:
 
 @dataclass(frozen=True)
 class BRCConfig:
-    evidence_steps: int = 6
+    direction_steps: int = 6
     h_cycles: int = 1
     l_cycles: int = 2
     l_layers: int = 1
     hidden_state_dim: int = 0
     num_heads: int = 4
     mlp_ratio: int = 2
+    local_kernel: int = 3
+    input_scale: float = 0.5
+    attn_scale: float = 0.2
+    local_scale: float = 0.2
     position_encoding: str = "rope"
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0

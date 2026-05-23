@@ -61,6 +61,17 @@ from lfrm.training.metrics import (
 )
 
 
+PER_STEP_SCALAR_SERIES = (
+    ("per_step_loss", "loss_by_step"),
+    ("per_step_accuracy", "accuracy_by_step"),
+    ("per_step_diffusion_filled_ratio", "diffusion_filled_ratio_by_step"),
+    ("per_step_direction_scheduled_budget", "direction_scheduled_budget_by_step"),
+    ("per_step_direction_update_alpha", "direction_update_alpha_by_step"),
+    ("per_step_trust_gamma", "trust_gamma_by_step"),
+    ("per_step_trust_uncertainty", "trust_uncertainty_by_step"),
+)
+
+
 def validate_runtime_config(config: ExperimentConfig) -> None:
     if config.train.batch_size < 1:
         raise ValueError("batch_size must be at least 1")
@@ -110,6 +121,12 @@ def training_uses_carry(config: ExperimentConfig) -> bool:
     return config.model.model_type in ("brc", "trm", "urm") and config.train.trm_train_mode == "act"
 
 
+def halt_loss_weight_for_mode(config: ExperimentConfig) -> float:
+    if config.model.model_type == "brc" and config.train.trm_train_mode == "dense_unroll":
+        return 0.0
+    return config.train.halt_loss_weight
+
+
 def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size: int) -> int:
     if config.train.batch_size % data_parallel_size != 0:
         raise ValueError(
@@ -124,13 +141,14 @@ def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size
 
 
 def build_step_runners(config: ExperimentConfig):
+    halt_loss_weight = halt_loss_weight_for_mode(config)
     if config.model.model_type == "brc":
         if config.train.trm_train_mode == "dense_unroll":
-            train_step_fn = build_brc_dense_unroll_train_step_runner(config.train.halt_loss_weight)
+            train_step_fn = build_brc_dense_unroll_train_step_runner(halt_loss_weight)
         else:
-            train_step_fn = build_brc_act_train_step_runner(config.train.halt_loss_weight)
+            train_step_fn = build_brc_act_train_step_runner(halt_loss_weight)
         eval_step_fn = build_eval_step_runner(
-            config.train.halt_loss_weight,
+            halt_loss_weight,
             config.train.terminal_residual_weight,
         )
     elif config.model.model_type in ("trm", "urm"):
@@ -236,20 +254,9 @@ def log_train_metrics(
         )
     )
     train_summary = optional_summary_log("train", host_metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
-    if "per_step_loss" in host_metrics:
-        train_log.update(
-            flatten_step_metrics(
-                "train/loss_by_step",
-                list(host_metrics["per_step_loss"]),
-            )
-        )
-    if "per_step_accuracy" in host_metrics:
-        train_log.update(
-            flatten_step_metrics(
-                "train/accuracy_by_step",
-                list(host_metrics["per_step_accuracy"]),
-            )
-        )
+    for metric_name, log_name in PER_STEP_SCALAR_SERIES:
+        if metric_name in host_metrics:
+            train_log.update(flatten_step_metrics(f"train/{log_name}", list(host_metrics[metric_name])))
     if wandb_run is not None:
         wandb_run.log(train_log, step=step, commit=not is_eval_step)
         for key, value in train_summary.items():
@@ -285,12 +292,9 @@ def log_eval_metrics(
             )
         )
         eval_summary = optional_summary_log(prefix, eval_metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
-        if "per_step_loss" in eval_metrics:
-            eval_log.update(flatten_step_metrics(f"{prefix}/loss_by_step", eval_metrics["per_step_loss"]))
-        if "per_step_accuracy" in eval_metrics:
-            eval_log.update(
-                flatten_step_metrics(f"{prefix}/accuracy_by_step", eval_metrics["per_step_accuracy"])
-            )
+        for metric_name, log_name in PER_STEP_SCALAR_SERIES:
+            if metric_name in eval_metrics:
+                eval_log.update(flatten_step_metrics(f"{prefix}/{log_name}", eval_metrics[metric_name]))
         if "per_step_hidden_delta" in eval_metrics:
             eval_log.update(
                 flatten_step_metrics(
