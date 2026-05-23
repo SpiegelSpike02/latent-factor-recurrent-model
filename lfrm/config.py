@@ -31,7 +31,7 @@ class TRMConfig:
 
 @dataclass(frozen=True)
 class BRCConfig:
-    direction_steps: int = 6
+    q_steps: int = 6
     h_cycles: int = 1
     l_cycles: int = 2
     l_layers: int = 1

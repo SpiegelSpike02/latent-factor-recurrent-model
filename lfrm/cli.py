@@ -33,7 +33,7 @@ NESTED_SECTIONS = {
 }
 GROUPED_NESTED_KEYS = {
     "brc": {
-        "dynamics": {"direction_steps", "step_loss_schedule"},
+        "dynamics": {"q_steps", "step_loss_schedule"},
         "cycles": {"h_cycles", "l_cycles", "l_layers"},
         "hidden": {
             "hidden_state_dim",
@@ -131,7 +131,7 @@ ALLOWED_NESTED_KEYS = {
         "step_loss_weights",
     },
     "brc": {
-        "direction_steps",
+        "q_steps",
         "h_cycles",
         "l_cycles",
         "l_layers",
@@ -302,7 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--brc-direction-steps", type=int, default=6)
+    parser.add_argument("--brc-q-steps", type=int, default=6)
     parser.add_argument("--brc-h-cycles", type=int, default=1)
     parser.add_argument("--brc-l-cycles", type=int, default=2)
     parser.add_argument("--brc-l-layers", type=int, default=1)
@@ -318,7 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
     parser.add_argument("--brc-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--brc-halt-min-steps", type=int, default=1)
-    parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear"), default="uniform")
+    parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "quadratic"), default="uniform")
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
     parser.add_argument("--urm-l-cycles", type=int, default=6)
@@ -451,7 +451,7 @@ def build_config(
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
         brc=BRCConfig(
-            direction_steps=args.brc_direction_steps,
+            q_steps=args.brc_q_steps,
             h_cycles=args.brc_h_cycles,
             l_cycles=args.brc_l_cycles,
             l_layers=args.brc_l_layers,

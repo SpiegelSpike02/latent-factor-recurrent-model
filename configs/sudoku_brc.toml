@@ -16,8 +16,8 @@ loss_type = "softmax"
 [model.brc]
 
 [model.brc.dynamics]
-direction_steps = 16
-step_loss_schedule = "linear"
+q_steps = 16
+step_loss_schedule = "quadratic"
 
 [model.brc.cycles]
 h_cycles = 3
@@ -85,5 +85,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-direction-dualtime-16x3x4x2-b768"
+name = "sudoku-brc-q-dualtime-16x3x4x2-b768"
 mode = "online"

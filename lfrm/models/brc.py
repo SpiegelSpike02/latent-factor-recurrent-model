@@ -146,11 +146,11 @@ class BRCSolverBlock(nnx.Module):
 
 
 class BRCModel(nnx.Module):
-    """Direction-state recurrent solver for fixed-size grid reasoning tasks.
+    """Q-state recurrent solver for fixed-size grid reasoning tasks.
 
-    The recurrent state stores a per-cell answer direction `q` on the class
-    simplex. Scheduled budget/gamma controls how strongly that direction is
-    read by the hidden workspace; it is not learned per-cell confidence.
+    The recurrent state is the per-cell answer q on the class simplex.
+    Scheduled gamma controls how strongly q is read by the hidden workspace;
+    BRC does not learn a separate per-cell confidence state.
     """
 
     def __init__(
@@ -167,8 +167,8 @@ class BRCModel(nnx.Module):
         if config.task_type == "sudoku" and config.vocab_size < 11:
             raise ValueError("BRC Sudoku expects vocab_size >= 11")
         brc = config.brc_config
-        if brc.direction_steps < 1:
-            raise ValueError("BRC direction_steps must be at least 1")
+        if brc.q_steps < 1:
+            raise ValueError("BRC q_steps must be at least 1")
         if min(brc.h_cycles, brc.l_cycles, brc.l_layers) < 1:
             raise ValueError("BRC h_cycles, l_cycles, and l_layers must be at least 1")
         hidden_dim = int(brc.hidden_state_dim) if brc.hidden_state_dim > 0 else config.d_model
@@ -186,22 +186,22 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC position_encoding must be 'rope', 'learned', or 'none'")
         if brc.position_encoding == "rope" and (hidden_dim // brc.num_heads) % 4 != 0:
             raise ValueError("BRC axial RoPE head dimension must be divisible by 4")
-        if brc.step_loss_schedule not in ("uniform", "linear"):
-            raise ValueError("BRC step_loss_schedule must be 'uniform' or 'linear'")
+        if brc.step_loss_schedule not in ("uniform", "quadratic"):
+            raise ValueError("BRC step_loss_schedule must be 'uniform' or 'quadratic'")
         if brc.halt_min_steps < 1:
             raise ValueError("BRC halt_min_steps must be at least 1")
 
         self.config = config
         self.runtime = runtime
         self.brc = brc
-        self.direction_steps = int(brc.direction_steps)
+        self.q_steps = int(brc.q_steps)
         self.h_cycles = int(brc.h_cycles)
         self.l_cycles = int(brc.l_cycles)
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
-        self.direction_vocab_size = config.vocab_size
-        self.direction_eps = 1e-6
+        self.q_vocab_size = config.vocab_size
+        self.q_eps = 1e-6
         self.output_logit_eps = 1e-9
         self.input_scale = float(brc.input_scale)
         self.box_height, self.box_width = self._box_shape(config.grid_height, config.grid_width)
@@ -226,7 +226,7 @@ class BRCModel(nnx.Module):
             rngs=rngs,
         )
         self.context_embed = nnx.Embed(2, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.direction_embed = nnx.Embed(
+        self.q_embed = nnx.Embed(
             max(10, config.vocab_size),
             config.d_model,
             dtype=self.dtype,
@@ -238,7 +238,7 @@ class BRCModel(nnx.Module):
             self.row_embed = nnx.Embed(config.grid_height, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
             self.col_embed = nnx.Embed(config.grid_width, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
             self.box_embed = nnx.Embed(self.num_boxes, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.time_embed = nnx.Embed(self.direction_steps, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
+        self.time_embed = nnx.Embed(self.q_steps, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
         if brc.position_encoding == "rope":
             head_dim = self.hidden_dim // brc.num_heads
@@ -286,7 +286,7 @@ class BRCModel(nnx.Module):
                 for _ in range(brc.l_layers)
             ]
         )
-        self.direction_class_head = nnx.Linear(
+        self.q_proposal_head = nnx.Linear(
             self.hidden_dim,
             config.vocab_size,
             dtype=self.dtype,
@@ -294,7 +294,7 @@ class BRCModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.direction_update_head = nnx.Linear(
+        self.q_update_head = nnx.Linear(
             self.hidden_dim,
             1,
             dtype=self.dtype,
@@ -339,24 +339,24 @@ class BRCModel(nnx.Module):
             return tokens > 1
         return tokens != 0
 
-    def _normalize_direction(self, direction: Array) -> Array:
-        direction = jnp.maximum(direction.astype(jnp.float32), self.direction_eps)
-        return direction / jnp.sum(direction, axis=-1, keepdims=True)
+    def _normalize_q(self, q: Array) -> Array:
+        q = jnp.maximum(q.astype(jnp.float32), self.q_eps)
+        return q / jnp.sum(q, axis=-1, keepdims=True)
 
-    def _uniform_direction(self, tokens: Array) -> Array:
+    def _uniform_q(self, tokens: Array) -> Array:
         return jnp.full(
-            (*tokens.shape, self.direction_vocab_size),
-            1.0 / float(self.direction_vocab_size),
+            (*tokens.shape, self.q_vocab_size),
+            1.0 / float(self.q_vocab_size),
             dtype=jnp.float32,
         )
 
-    def _direction_to_output_logits(self, direction: Array, tokens: Array) -> Array:
+    def _q_to_output_logits(self, q: Array, tokens: Array) -> Array:
         del tokens
-        direction = self._normalize_direction(direction)
-        return jnp.log(jnp.maximum(direction, self.output_logit_eps))
+        q = self._normalize_q(q)
+        return jnp.log(jnp.maximum(q, self.output_logit_eps))
 
-    def initial_direction(self, tokens: Array) -> Array:
-        return self._uniform_direction(tokens)
+    def initial_q(self, tokens: Array) -> Array:
+        return self._uniform_q(tokens)
 
     def _position_embeddings(self) -> Array:
         if self.brc.position_encoding != "learned":
@@ -367,29 +367,29 @@ class BRCModel(nnx.Module):
             + self.box_embed(self.box_ids)
         )
 
-    def _direction_embedding(self, tokens: Array, direction: Array, step_index: Array) -> Array:
+    def _q_embedding(self, tokens: Array, q: Array, step_index: Array) -> Array:
         del tokens
-        direction = self._normalize_direction(direction)
-        uniform = jnp.full_like(direction, 1.0 / float(self.direction_vocab_size))
+        q = self._normalize_q(q)
+        uniform = jnp.full_like(q, 1.0 / float(self.q_vocab_size))
         gamma = self._trust_gamma(step_index)
         if gamma.ndim == 0:
             gamma = gamma[None, None, None]
         elif gamma.ndim == 1:
             gamma = gamma[:, None, None]
-        trusted_direction = gamma * (direction - uniform)
-        embedding_table = maybe_cast(self.direction_embed.embedding[: self.config.vocab_size], self.dtype)
-        direction_embedding = jnp.einsum(
+        trusted_q = gamma * (q - uniform)
+        embedding_table = maybe_cast(self.q_embed.embedding[: self.config.vocab_size], self.dtype)
+        q_embedding = jnp.einsum(
             "bnd,dk->bnk",
-            maybe_cast(trusted_direction, self.dtype),
+            maybe_cast(trusted_q, self.dtype),
             embedding_table,
             preferred_element_type=jnp.float32,
         )
-        return direction_embedding
+        return q_embedding
 
     def _cell_embeddings(
         self,
         tokens: Array,
-        direction: Array,
+        q: Array,
         base_embeddings: Array,
         time_embedding: Array,
         step_index: Array,
@@ -397,34 +397,34 @@ class BRCModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
     ) -> Array:
-        direction_embedding = self._direction_embedding(tokens, direction, step_index)
+        q_embedding = self._q_embedding(tokens, q, step_index)
         time = time_embedding[None, None, :] if time_embedding.ndim == 1 else time_embedding[:, None, :]
         x = (
             base_embeddings
-            + direction_embedding
+            + q_embedding
             + time
         ) * math.sqrt(1.0 / 3.0)
         return self.dropout(x, deterministic=not train, rngs=dropout_key).astype(self.dtype)
 
-    def _direction_to_token_logits(self, direction: Array, tokens: Array, step_index: Array) -> Array:
+    def _q_to_token_logits(self, q: Array, tokens: Array, step_index: Array) -> Array:
         del step_index
-        return self._direction_to_output_logits(direction, tokens)
+        return self._q_to_output_logits(q, tokens)
 
     def _scheduled_budget(self, step_index: Array) -> Array:
         gamma = self._trust_gamma(step_index)
-        return float(self.direction_vocab_size) * gamma / jnp.maximum(1.0 - gamma, self.direction_eps)
+        return float(self.q_vocab_size) * gamma / jnp.maximum(1.0 - gamma, self.q_eps)
 
     def _trust_gamma(self, step_index: Array) -> Array:
-        final_budget = float(self.direction_vocab_size * self.direction_steps * self.h_cycles)
-        max_gamma = final_budget / (float(self.direction_vocab_size) + final_budget)
-        progress = (step_index.astype(jnp.float32) + 1.0) / float(self.direction_steps)
+        final_budget = float(self.q_vocab_size * self.q_steps * self.h_cycles)
+        max_gamma = final_budget / (float(self.q_vocab_size) + final_budget)
+        progress = (step_index.astype(jnp.float32) + 1.0) / float(self.q_steps)
         return max_gamma * jnp.square(progress)
 
-    def _direction_update(self, tokens: Array, direction: Array, read_state: Array, step_index: Array) -> tuple[Array, Array, Array]:
+    def _q_update(self, tokens: Array, q: Array, read_state: Array, step_index: Array) -> tuple[Array, Array, Array]:
         del tokens
-        current_direction = self._normalize_direction(direction)
-        class_logits = self.direction_class_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
-        proposal_distribution = jax.nn.softmax(class_logits, axis=-1)
+        current_q = self._normalize_q(q)
+        class_logits = self.q_proposal_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
+        proposal_q = jax.nn.softmax(class_logits, axis=-1)
         scheduled_budget = self._scheduled_budget(step_index)
         if scheduled_budget.ndim == 0:
             scheduled_budget = scheduled_budget[None, None, None]
@@ -432,11 +432,11 @@ class BRCModel(nnx.Module):
             scheduled_budget = scheduled_budget[:, None, None]
         scheduled_budget = jnp.broadcast_to(scheduled_budget, (*read_state.shape[:-1], 1))
         update_alpha = jax.nn.sigmoid(
-            self.direction_update_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
+            self.q_update_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         )
-        next_direction = (1.0 - update_alpha) * current_direction + update_alpha * proposal_distribution
-        next_direction = self._normalize_direction(next_direction)
-        return next_direction, scheduled_budget, update_alpha
+        next_q = (1.0 - update_alpha) * current_q + update_alpha * proposal_q
+        next_q = self._normalize_q(next_q)
+        return next_q, scheduled_budget, update_alpha
 
     def _trust_metric_values(self, step_index: Array) -> tuple[Array, Array]:
         gamma = self._trust_gamma(step_index).astype(jnp.float32)
@@ -461,10 +461,10 @@ class BRCModel(nnx.Module):
         fused = hidden.astype(jnp.float32) + condition.astype(jnp.float32)
         return self.readout_output_norm(fused).astype(self.dtype)
 
-    def _direction_step(
+    def _q_step(
         self,
         tokens: Array,
-        direction: Array,
+        q: Array,
         hidden_state: Array,
         base_embeddings: Array,
         time_embedding: Array,
@@ -476,13 +476,13 @@ class BRCModel(nnx.Module):
     ) -> tuple[Array, Array, Array, Array, Array]:
         halt_logits = jnp.zeros((tokens.shape[0],), dtype=jnp.float32)
         scheduled_budget = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
-        direction_update_alpha = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
+        q_update_alpha = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
         scheduled_budget_sum = jnp.zeros_like(scheduled_budget)
-        direction_update_alpha_sum = jnp.zeros_like(direction_update_alpha)
+        q_update_alpha_sum = jnp.zeros_like(q_update_alpha)
         for h_index in range(self.h_cycles):
             cell_input = self._cell_embeddings(
                 tokens,
-                direction,
+                q,
                 base_embeddings,
                 time_embedding,
                 step_index,
@@ -492,38 +492,38 @@ class BRCModel(nnx.Module):
             hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
             hidden_state = self._hidden_l_cycle(hidden_state, hidden_input)
             read_state = self._readout_fuse(hidden_state, cell_input)
-            direction, scheduled_budget, direction_update_alpha = self._direction_update(
+            q, scheduled_budget, q_update_alpha = self._q_update(
                 tokens,
-                direction,
+                q,
                 read_state,
                 step_index,
             )
             scheduled_budget_sum = scheduled_budget_sum + scheduled_budget
-            direction_update_alpha_sum = direction_update_alpha_sum + direction_update_alpha
+            q_update_alpha_sum = q_update_alpha_sum + q_update_alpha
             halt_logits = self._halt_logits(read_state)
             if h_index < self.h_cycles - 1:
                 hidden_state = jax.lax.stop_gradient(hidden_state)
         h_cycles = jnp.asarray(self.h_cycles, dtype=jnp.float32)
         next_hidden = jax.lax.stop_gradient(hidden_state) if stop_hidden_between_steps else hidden_state
         return (
-            direction,
+            q,
             next_hidden,
             halt_logits,
             scheduled_budget_sum / h_cycles,
-            direction_update_alpha_sum / h_cycles,
+            q_update_alpha_sum / h_cycles,
         )
 
     def initial_hidden_state(
         self,
         tokens: Array,
-        direction: Array,
+        q: Array,
         base_embeddings: Array,
         time_embedding: Array,
         *,
         train: bool,
         dropout_key: Array | None,
     ) -> Array:
-        del direction, base_embeddings, time_embedding, train, dropout_key
+        del q, base_embeddings, time_embedding, train, dropout_key
         return jnp.zeros((tokens.shape[0], self.config.seq_len, self.hidden_dim), dtype=self.dtype)
 
     def context_memory(
@@ -542,7 +542,7 @@ class BRCModel(nnx.Module):
     def initial_carry(self, batch: dict[str, Array]) -> dict[str, Array]:
         batch_size = batch["inputs"].shape[0]
         return {
-            "direction": self._uniform_direction(batch["inputs"]),
+            "q": self._uniform_q(batch["inputs"]),
             "hidden": jnp.zeros(
                 (batch_size, self.config.seq_len, self.hidden_dim),
                 dtype=self.dtype,
@@ -577,22 +577,22 @@ class BRCModel(nnx.Module):
         steps = jnp.where(reset, 0, carry["steps"])
 
         base_embeddings, _context = self.context_memory(inputs)
-        step_index = jnp.minimum(steps, self.direction_steps - 1)
+        step_index = jnp.minimum(steps, self.q_steps - 1)
         time_embedding = self.time_embed(step_index)
-        reset_direction = self.initial_direction(inputs)
-        direction = jnp.where(reset_state, reset_direction, carry["direction"])
+        reset_q = self.initial_q(inputs)
+        q = jnp.where(reset_state, reset_q, carry["q"])
         reset_hidden = self.initial_hidden_state(
             inputs,
-            reset_direction,
+            reset_q,
             base_embeddings,
             time_embedding,
             train=train,
             dropout_key=dropout_key,
         )
         hidden = jnp.where(reset_state, reset_hidden, carry["hidden"])
-        next_direction, next_hidden, halt_logits, scheduled_budget, direction_update_alpha = self._direction_step(
+        next_q, next_hidden, halt_logits, scheduled_budget, q_update_alpha = self._q_step(
             inputs,
-            direction,
+            q,
             hidden,
             base_embeddings,
             time_embedding,
@@ -601,28 +601,28 @@ class BRCModel(nnx.Module):
             dropout_key=dropout_key,
             stop_hidden_between_steps=True,
         )
-        logits = self._direction_to_token_logits(next_direction, inputs, step_index)
+        logits = self._q_to_token_logits(next_q, inputs, step_index)
         new_steps = steps + 1
-        is_last_step = new_steps >= self.direction_steps
+        is_last_step = new_steps >= self.q_steps
         if train:
             halted = is_last_step | (halt_logits > 0.0)
-            min_halt_steps = min(int(self.brc.halt_min_steps), self.direction_steps)
+            min_halt_steps = min(int(self.brc.halt_min_steps), self.q_steps)
             min_steps = jnp.full_like(new_steps, min_halt_steps)
-            if self.direction_steps > 1 and self.brc.halt_exploration_prob > 0.0:
+            if self.q_steps > 1 and self.brc.halt_exploration_prob > 0.0:
                 explore_key, min_step_key = jax.random.split(dropout_key)
                 explore = jax.random.uniform(explore_key, halt_logits.shape) < self.brc.halt_exploration_prob
                 random_step = jax.random.randint(
                     min_step_key,
                     halt_logits.shape,
                     min_halt_steps,
-                    self.direction_steps + 1,
+                    self.q_steps + 1,
                 )
                 min_steps = jnp.where(explore, random_step, min_steps)
             halted = halted & (new_steps >= min_steps)
         else:
             halted = is_last_step
         new_carry = {
-            "direction": jax.lax.stop_gradient(next_direction),
+            "q": jax.lax.stop_gradient(next_q),
             "hidden": jax.lax.stop_gradient(next_hidden),
             "steps": jax.lax.stop_gradient(new_steps),
             "halted": jax.lax.stop_gradient(halted),
@@ -635,8 +635,8 @@ class BRCModel(nnx.Module):
             "act_step": jnp.mean(new_steps.astype(jnp.float32)),
             "halted_rate": jnp.mean(halted.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
-            "direction_scheduled_budget": jnp.mean(scheduled_budget.astype(jnp.float32)),
-            "direction_update_alpha": jnp.mean(direction_update_alpha.astype(jnp.float32)),
+            "q_scheduled_budget": jnp.mean(scheduled_budget.astype(jnp.float32)),
+            "q_update_alpha": jnp.mean(q_update_alpha.astype(jnp.float32)),
         }
         diagnostics["trust_gamma"], diagnostics["trust_uncertainty"] = self._trust_metric_values(step_index)
         return new_carry, logits, diagnostics
@@ -645,23 +645,23 @@ class BRCModel(nnx.Module):
         self,
         tokens: Array,
         *,
-        initial_direction: Array | None = None,
+        initial_q: Array | None = None,
         train: bool,
         dropout_key: Array | None = None,
         return_final_only: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
-        if initial_direction is None:
-            initial_direction = self.initial_direction(tokens)
+        if initial_q is None:
+            initial_q = self.initial_q(tokens)
         base_embeddings, context = self.context_memory(tokens)
         query_mask = (~context).astype(jnp.float32)
         query_normalizer = jnp.maximum(jnp.sum(query_mask), 1.0)
 
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key, time_embedding = scan_inputs
-            direction, hidden_state = carry
-            next_direction, next_hidden, halt_logits, scheduled_budget, direction_update_alpha = self._direction_step(
+            q, hidden_state = carry
+            next_q, next_hidden, halt_logits, scheduled_budget, q_update_alpha = self._q_step(
                 tokens,
-                direction,
+                q,
                 hidden_state,
                 base_embeddings,
                 time_embedding,
@@ -670,11 +670,11 @@ class BRCModel(nnx.Module):
                 dropout_key=step_dropout_key,
                 stop_hidden_between_steps=False,
             )
-            next_carry = (next_direction, next_hidden)
+            next_carry = (next_q, next_hidden)
             if return_final_only:
                 return next_carry, None
-            logits = self._direction_to_token_logits(next_direction, tokens, step_index)
-            confidence = jnp.max(self._normalize_direction(next_direction), axis=-1)
+            logits = self._q_to_token_logits(next_q, tokens, step_index)
+            confidence = jnp.max(self._normalize_q(next_q), axis=-1)
             filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
             trust_gamma, trust_uncertainty = self._trust_metric_values(step_index)
             return next_carry, (
@@ -682,60 +682,60 @@ class BRCModel(nnx.Module):
                 filled_ratio,
                 halt_logits,
                 jnp.mean(scheduled_budget.astype(jnp.float32)),
-                jnp.mean(direction_update_alpha.astype(jnp.float32)),
+                jnp.mean(q_update_alpha.astype(jnp.float32)),
                 trust_gamma,
                 trust_uncertainty,
             )
 
-        step_indices = jnp.arange(self.direction_steps, dtype=jnp.int32)
+        step_indices = jnp.arange(self.q_steps, dtype=jnp.int32)
         if dropout_key is None:
-            step_dropout_keys = jax.random.split(jax.random.key(0), self.direction_steps)
+            step_dropout_keys = jax.random.split(jax.random.key(0), self.q_steps)
         else:
-            step_dropout_keys = jax.random.split(dropout_key, self.direction_steps)
+            step_dropout_keys = jax.random.split(dropout_key, self.q_steps)
         time_embeddings = self.time_embed(step_indices)
         initial_hidden = self.initial_hidden_state(
             tokens,
-            initial_direction,
+            initial_q,
             base_embeddings,
             time_embeddings[0],
             train=train,
             dropout_key=step_dropout_keys[0],
         )
-        initial_carry = (initial_direction.astype(jnp.float32), initial_hidden)
+        initial_carry = (initial_q.astype(jnp.float32), initial_hidden)
         final_carry, scan_outputs = jax.lax.scan(
             scan_step,
             initial_carry,
             (step_indices, step_dropout_keys, time_embeddings),
         )
-        direction_final, _hidden_final = final_carry
+        q_final, _hidden_final = final_carry
         if return_final_only:
-            final_step = jnp.asarray(self.direction_steps - 1, dtype=jnp.int32)
-            logits = self._direction_to_token_logits(direction_final, tokens, final_step)
+            final_step = jnp.asarray(self.q_steps - 1, dtype=jnp.int32)
+            logits = self._q_to_token_logits(q_final, tokens, final_step)
             diagnostics = {
-                "diffusion_filled_ratio": jnp.zeros((self.direction_steps,), dtype=jnp.float32),
-                "unroll_steps": jnp.asarray(self.direction_steps, dtype=jnp.float32),
-                "halt_logits": jnp.zeros((self.direction_steps, tokens.shape[0]), dtype=jnp.float32),
-                "direction_scheduled_budget": jnp.zeros((self.direction_steps,), dtype=jnp.float32),
-                "direction_update_alpha": jnp.zeros((self.direction_steps,), dtype=jnp.float32),
-                "trust_gamma": jnp.zeros((self.direction_steps,), dtype=jnp.float32),
-                "trust_uncertainty": jnp.zeros((self.direction_steps,), dtype=jnp.float32),
+                "diffusion_filled_ratio": jnp.zeros((self.q_steps,), dtype=jnp.float32),
+                "unroll_steps": jnp.asarray(self.q_steps, dtype=jnp.float32),
+                "halt_logits": jnp.zeros((self.q_steps, tokens.shape[0]), dtype=jnp.float32),
+                "q_scheduled_budget": jnp.zeros((self.q_steps,), dtype=jnp.float32),
+                "q_update_alpha": jnp.zeros((self.q_steps,), dtype=jnp.float32),
+                "trust_gamma": jnp.zeros((self.q_steps,), dtype=jnp.float32),
+                "trust_uncertainty": jnp.zeros((self.q_steps,), dtype=jnp.float32),
             }
             return logits, diagnostics
         (
             step_logits,
             filled_ratio,
             halt_logits,
-            direction_scheduled_budget,
-            direction_update_alpha,
+            q_scheduled_budget,
+            q_update_alpha,
             trust_gamma,
             trust_uncertainty,
         ) = scan_outputs
         diagnostics = {
             "diffusion_filled_ratio": filled_ratio,
             "halt_logits": halt_logits,
-            "unroll_steps": jnp.asarray(self.direction_steps, dtype=jnp.float32),
-            "direction_scheduled_budget": direction_scheduled_budget,
-            "direction_update_alpha": direction_update_alpha,
+            "unroll_steps": jnp.asarray(self.q_steps, dtype=jnp.float32),
+            "q_scheduled_budget": q_scheduled_budget,
+            "q_update_alpha": q_update_alpha,
             "trust_gamma": trust_gamma,
             "trust_uncertainty": trust_uncertainty,
         }
@@ -747,11 +747,11 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
-        initial_direction: Array | None = None,
+        initial_q: Array | None = None,
     ) -> tuple[Array, dict[str, Array]]:
         return self.run_diffusion(
             tokens,
-            initial_direction=initial_direction,
+            initial_q=initial_q,
             train=train,
             dropout_key=dropout_key,
         )
@@ -762,13 +762,13 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
-        initial_direction: Array | None = None,
+        initial_q: Array | None = None,
     ) -> tuple[Array, dict[str, Array]]:
         return self.forward_all_steps_with_diagnostics(
             tokens,
             train=train,
             dropout_key=dropout_key,
-            initial_direction=initial_direction,
+            initial_q=initial_q,
         )
 
     def forward_all_steps(

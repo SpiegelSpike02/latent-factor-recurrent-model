@@ -65,8 +65,8 @@ PER_STEP_SCALAR_SERIES = (
     ("per_step_loss", "loss_by_step"),
     ("per_step_accuracy", "accuracy_by_step"),
     ("per_step_diffusion_filled_ratio", "diffusion_filled_ratio_by_step"),
-    ("per_step_direction_scheduled_budget", "direction_scheduled_budget_by_step"),
-    ("per_step_direction_update_alpha", "direction_update_alpha_by_step"),
+    ("per_step_q_scheduled_budget", "q_scheduled_budget_by_step"),
+    ("per_step_q_update_alpha", "q_update_alpha_by_step"),
     ("per_step_trust_gamma", "trust_gamma_by_step"),
     ("per_step_trust_uncertainty", "trust_uncertainty_by_step"),
 )

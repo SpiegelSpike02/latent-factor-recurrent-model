@@ -148,7 +148,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=9,
                 d_model=16,
                 rollout_steps=1,
-                brc=BRCConfig(direction_steps=1, num_heads=4),
+                brc=BRCConfig(q_steps=1, num_heads=4),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),
@@ -274,7 +274,7 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 rollout_steps=2,
                 brc=BRCConfig(
-                    direction_steps=2,
+                    q_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
                 ),
@@ -296,15 +296,15 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(logits.shape, (2, 1, 81, 11))
         self.assertEqual(final_only_logits.shape, (1, 81, 11))
         self.assertTrue(bool(jnp.allclose(final_only_logits, logits[-1], rtol=1e-5, atol=1e-5)))
-        direction = jax.nn.softmax(
+        q = jax.nn.softmax(
             jnp.arange(2 * 81 * 11, dtype=jnp.float32).reshape(2, 81, 11) / 100.0,
             axis=-1,
         )
         self.assertTrue(
             bool(
                 jnp.allclose(
-                    model._direction_to_token_logits(direction, tokens, jnp.asarray(0, dtype=jnp.int32)),
-                    model._direction_to_token_logits(direction, tokens, jnp.asarray(1, dtype=jnp.int32)),
+                    model._q_to_token_logits(q, tokens, jnp.asarray(0, dtype=jnp.int32)),
+                    model._q_to_token_logits(q, tokens, jnp.asarray(1, dtype=jnp.int32)),
                 )
             )
         )
@@ -322,7 +322,7 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 rollout_steps=2,
                 brc=BRCConfig(
-                    direction_steps=2,
+                    q_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
                 ),
@@ -387,7 +387,7 @@ class GridModelTests(unittest.TestCase):
                 rollout_steps=2,
                 loss_type="stablemax",
                 brc=BRCConfig(
-                    direction_steps=2,
+                    q_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
                 ),
@@ -421,7 +421,7 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 rollout_steps=1,
                 brc=BRCConfig(
-                    direction_steps=1,
+                    q_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
                 ),
@@ -762,7 +762,7 @@ class GridModelTests(unittest.TestCase):
                     grid_width=9,
                     d_model=10,
                     rollout_steps=1,
-                    brc=BRCConfig(direction_steps=1, num_heads=4),
+                    brc=BRCConfig(q_steps=1, num_heads=4),
                 ),
                 RuntimeConfig(compute_dtype="float32"),
                 rngs=nnx.Rngs(0),
@@ -801,7 +801,7 @@ class GridModelTests(unittest.TestCase):
                 "d_model = 16\n"
                 "\n"
                 "[model.brc]\n"
-                "direction_steps = 2\n"
+                "q_steps = 2\n"
                 "h_cycles = 2\n"
                 "l_cycles = 2\n"
                 "hidden_state_dim = 16\n"
@@ -809,13 +809,13 @@ class GridModelTests(unittest.TestCase):
                 "num_heads = 4\n"
                 "halt_exploration_prob = 0.2\n"
                 "halt_min_steps = 2\n"
-                "step_loss_schedule = \"linear\"\n",
+                "step_loss_schedule = \"quadratic\"\n",
                 encoding="utf-8",
             )
             loaded = load_toml_config(str(config_path))
             self.assertEqual(loaded["model_type"], "brc")
             self.assertEqual(loaded["task_type"], "sudoku")
-            self.assertEqual(loaded["brc_direction_steps"], 2)
+            self.assertEqual(loaded["brc_q_steps"], 2)
             self.assertEqual(loaded["brc_h_cycles"], 2)
             self.assertEqual(loaded["brc_l_cycles"], 2)
             self.assertEqual(loaded["brc_hidden_state_dim"], 16)
@@ -823,7 +823,7 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_halt_exploration_prob"], 0.2)
             self.assertEqual(loaded["brc_halt_min_steps"], 2)
-            self.assertEqual(loaded["brc_step_loss_schedule"], "linear")
+            self.assertEqual(loaded["brc_step_loss_schedule"], "quadratic")
 
             eval_config_path = Path(tmpdir) / "eval.toml"
             eval_config_path.write_text(
