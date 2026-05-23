@@ -372,7 +372,8 @@ class GridModelTests(unittest.TestCase):
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
-        self.assertEqual(metrics["per_step_loss"].shape, (2,))
+        self.assertNotIn("per_step_loss", metrics)
+        self.assertNotIn("per_step_q_confidence", metrics)
         self.assertEqual(metrics["step_loss_weights"].shape, (2,))
     def test_brc_arc_canvas_belief_loss_is_finite(self) -> None:
         model = BRCModel(

@@ -442,19 +442,24 @@ def brc_loss_and_metrics(
         "context_target_probability": context_target_probability,
         "query_target_probability": query_target_probability,
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
-        "per_step_loss": per_step_loss,
         "step_loss_weights": step_loss_weights,
         "q_confidence": jnp.mean(diagnostics["q_confidence"]),
         "q_scheduled_budget": jnp.mean(diagnostics["q_scheduled_budget"]),
         "q_update_alpha": jnp.mean(diagnostics["q_update_alpha"]),
         "trust_gamma": jnp.mean(diagnostics["trust_gamma"]),
         "trust_uncertainty": jnp.mean(diagnostics["trust_uncertainty"]),
-        "per_step_q_confidence": diagnostics["q_confidence"],
-        "per_step_q_scheduled_budget": diagnostics["q_scheduled_budget"],
-        "per_step_q_update_alpha": diagnostics["q_update_alpha"],
-        "per_step_trust_gamma": diagnostics["trust_gamma"],
-        "per_step_trust_uncertainty": diagnostics["trust_uncertainty"],
     }
+    if not train:
+        metrics.update(
+            {
+                "per_step_loss": per_step_loss,
+                "per_step_q_confidence": diagnostics["q_confidence"],
+                "per_step_q_scheduled_budget": diagnostics["q_scheduled_budget"],
+                "per_step_q_update_alpha": diagnostics["q_update_alpha"],
+                "per_step_trust_gamma": diagnostics["trust_gamma"],
+                "per_step_trust_uncertainty": diagnostics["trust_uncertainty"],
+            }
+        )
     if halt_loss_weight != 0.0:
         metrics["per_step_halt_probability"] = (
             jnp.sum(jax.nn.sigmoid(diagnostics["halt_logits"]) * example_mask[None, :], axis=1)
