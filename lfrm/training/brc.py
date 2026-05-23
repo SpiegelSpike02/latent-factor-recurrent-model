@@ -5,7 +5,7 @@ from flax import nnx
 
 from lfrm.models import BRCModel
 from lfrm.training.factory import GridReasoningModel
-from lfrm.training.steps import brc_act_loss_and_metrics, loss_and_metrics
+from lfrm.training.steps import brc_act_loss_and_metrics, brc_loss_and_metrics, loss_and_metrics
 
 
 def build_train_step_runner(
@@ -68,6 +68,34 @@ def build_brc_act_train_step_runner(halt_loss_weight: float = 0.0):
         return metrics, new_carry
 
     return nnx.jit(train_step, donate_argnums=(2,))
+
+
+def build_brc_dense_unroll_train_step_runner(halt_loss_weight: float = 0.0):
+    def train_step(
+        model: BRCModel,
+        optimizer: nnx.Optimizer,
+        batch: dict[str, jax.Array],
+        dropout_key: jax.Array,
+    ) -> dict[str, jax.Array]:
+        def objective(model, batch, train, dropout_key):
+            return brc_loss_and_metrics(
+                model,
+                batch,
+                train,
+                dropout_key,
+                halt_loss_weight,
+            )
+
+        (_, metrics), grads = nnx.value_and_grad(objective, has_aux=True)(
+            model,
+            batch,
+            True,
+            dropout_key,
+        )
+        optimizer.update(model, grads)
+        return metrics
+
+    return nnx.jit(train_step)
 
 
 def build_eval_step_runner(

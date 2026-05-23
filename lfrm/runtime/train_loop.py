@@ -35,6 +35,7 @@ from lfrm.runtime.sharding import (
 from lfrm.training import (
     build_ema_update_runner,
     build_brc_act_train_step_runner,
+    build_brc_dense_unroll_train_step_runner,
     build_state_copy_runner,
     build_eval_step_runner,
     build_train_step_runner,
@@ -103,6 +104,10 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("trm_train_mode is only supported for recurrent model types")
 
 
+def training_uses_carry(config: ExperimentConfig) -> bool:
+    return config.model.model_type in ("brc", "trm", "urm") and config.train.trm_train_mode == "act"
+
+
 def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size: int) -> int:
     if config.train.batch_size % data_parallel_size != 0:
         raise ValueError(
@@ -119,10 +124,7 @@ def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size
 def build_step_runners(config: ExperimentConfig):
     if config.model.model_type == "brc":
         if config.train.trm_train_mode == "dense_unroll":
-            train_step_fn = build_train_step_runner(
-                config.train.halt_loss_weight,
-                config.train.terminal_residual_weight,
-            )
+            train_step_fn = build_brc_dense_unroll_train_step_runner(config.train.halt_loss_weight)
         else:
             train_step_fn = build_brc_act_train_step_runner(config.train.halt_loss_weight)
         eval_step_fn = build_eval_step_runner(
@@ -409,12 +411,9 @@ def run_training(
     )
 
     current_batch = prefetcher.next()
-    use_recurrent_act = (
-        (config.model.model_type == "brc" and config.train.trm_train_mode == "act")
-        or (config.model.model_type in ("trm", "urm") and config.train.trm_train_mode == "act")
-    )
+    use_step_carry = training_uses_carry(config)
     console_model_label = "brc" if config.model.model_type == "brc" else config.model.model_type
-    train_carry = place_tree(model.initial_carry(current_batch), data_sharding) if use_recurrent_act else None
+    train_carry = place_tree(model.initial_carry(current_batch), data_sharding) if use_step_carry else None
     eval_interval = eval_interval_updates(config)
     profile_active = False
     profile_finished = False
@@ -436,7 +435,7 @@ def run_training(
                     jax.profiler.start_trace(str(profile_dir))
                     profile_active = True
                 is_eval_step = step % eval_interval == 0 or step == config.train.optimizer_updates
-                if use_recurrent_act:
+                if use_step_carry:
                     assert train_carry is not None
                     train_key, step_key = jax.random.split(train_key)
                     metrics, train_carry = train_step_fn(
