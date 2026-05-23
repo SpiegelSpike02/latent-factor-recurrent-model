@@ -558,8 +558,28 @@ def brc_act_loss_and_metrics(
         / jnp.maximum(supervised_cells_per_example, 1.0)
     )
     target_probability = jnp.sum(per_example_target_probability * valid_halted_f32) / valid_halted_normalizer
-    context_target_probability = _masked_probability(target_probability_cells, context_mask)
-    query_target_probability = _masked_probability(target_probability_cells, query_mask)
+    context_target_probability_per_example = (
+        jnp.sum(target_probability_cells * context_mask.astype(jnp.float32), axis=-1)
+        / jnp.maximum(context_cells_per_example, 1.0)
+    )
+    query_target_probability_per_example = (
+        jnp.sum(target_probability_cells * query_mask.astype(jnp.float32), axis=-1)
+        / jnp.maximum(query_cells_per_example, 1.0)
+    )
+    context_target_probability = _masked_example_mean(
+        context_target_probability_per_example,
+        valid_context_halted.astype(jnp.float32),
+    )
+    query_target_probability = _masked_example_mean(
+        query_target_probability_per_example,
+        valid_query_halted.astype(jnp.float32),
+    )
+    active_target_probability = jnp.sum(per_example_target_probability * example_mask) / jnp.maximum(
+        jnp.sum(example_mask),
+        1.0,
+    )
+    active_context_target_probability = _masked_probability(target_probability_cells, context_mask)
+    active_query_target_probability = _masked_probability(target_probability_cells, query_mask)
     halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
     if halt_loss_weight != 0.0:
         halt_targets = jax.lax.stop_gradient(exact_f32)
@@ -575,21 +595,23 @@ def brc_act_loss_and_metrics(
     metrics = {
         "loss": loss,
         "lm_loss": lm_loss,
-        "final_lm_loss": lm_loss,
-        "mean_lm_loss": lm_loss,
-        "accuracy": accuracy,
-        "context_accuracy": context_accuracy,
-        "query_accuracy": query_accuracy,
-        "exact_accuracy": exact_accuracy,
-        "exact_count": exact_count,
-        "final_target_probability": target_probability,
-        "context_target_probability": context_target_probability,
-        "query_target_probability": query_target_probability,
-        "count": valid_halted_count,
-        "current_accuracy": current_accuracy,
-        "current_context_accuracy": current_context_accuracy,
-        "current_query_accuracy": current_query_accuracy,
-        "current_exact_accuracy": _masked_example_mean(exact_f32, example_mask),
+        "active_lm_loss": lm_loss,
+        "completed_accuracy": accuracy,
+        "completed_context_accuracy": context_accuracy,
+        "completed_query_accuracy": query_accuracy,
+        "completed_exact_accuracy": exact_accuracy,
+        "completed_exact_count": exact_count,
+        "completed_target_probability": target_probability,
+        "completed_context_target_probability": context_target_probability,
+        "completed_query_target_probability": query_target_probability,
+        "completed_count": valid_halted_count,
+        "active_accuracy": current_accuracy,
+        "active_context_accuracy": current_context_accuracy,
+        "active_query_accuracy": current_query_accuracy,
+        "active_exact_accuracy": _masked_example_mean(exact_f32, example_mask),
+        "active_target_probability": active_target_probability,
+        "active_context_target_probability": active_context_target_probability,
+        "active_query_target_probability": active_query_target_probability,
         "act_step": diagnostics["act_step"],
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
@@ -603,12 +625,17 @@ def brc_act_loss_and_metrics(
         context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
         metrics.update(
             {
-                "context_consistency": context_consistency,
-                "invalid_rate": invalid_rate,
-                "conflicts": conflicts,
+                "active_context_consistency": context_consistency,
+                "active_invalid_rate": invalid_rate,
+                "active_conflicts": conflicts,
             }
         )
-    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
+    metrics.update(
+        {
+            f"active_{key}": value
+            for key, value in _maybe_path_metrics(model, predictions, targets, loss_mask).items()
+        }
+    )
     if halt_loss_weight != 0.0:
         metrics["halt_loss"] = halt_loss
     return loss, (metrics, new_carry)
