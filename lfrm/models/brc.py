@@ -675,11 +675,11 @@ class BRCModel(nnx.Module):
                 return next_carry, None
             logits = self._q_to_token_logits(next_q, tokens, step_index)
             confidence = jnp.max(self._normalize_q(next_q), axis=-1)
-            filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
+            q_confidence = jnp.sum(confidence * query_mask) / query_normalizer
             trust_gamma, trust_uncertainty = self._trust_metric_values(step_index)
             return next_carry, (
                 logits,
-                filled_ratio,
+                q_confidence,
                 halt_logits,
                 jnp.mean(scheduled_budget.astype(jnp.float32)),
                 jnp.mean(q_update_alpha.astype(jnp.float32)),
@@ -712,7 +712,7 @@ class BRCModel(nnx.Module):
             final_step = jnp.asarray(self.q_steps - 1, dtype=jnp.int32)
             logits = self._q_to_token_logits(q_final, tokens, final_step)
             diagnostics = {
-                "diffusion_filled_ratio": jnp.zeros((self.q_steps,), dtype=jnp.float32),
+                "q_confidence": jnp.zeros((self.q_steps,), dtype=jnp.float32),
                 "unroll_steps": jnp.asarray(self.q_steps, dtype=jnp.float32),
                 "halt_logits": jnp.zeros((self.q_steps, tokens.shape[0]), dtype=jnp.float32),
                 "q_scheduled_budget": jnp.zeros((self.q_steps,), dtype=jnp.float32),
@@ -723,7 +723,7 @@ class BRCModel(nnx.Module):
             return logits, diagnostics
         (
             step_logits,
-            filled_ratio,
+            q_confidence,
             halt_logits,
             q_scheduled_budget,
             q_update_alpha,
@@ -731,7 +731,7 @@ class BRCModel(nnx.Module):
             trust_uncertainty,
         ) = scan_outputs
         diagnostics = {
-            "diffusion_filled_ratio": filled_ratio,
+            "q_confidence": q_confidence,
             "halt_logits": halt_logits,
             "unroll_steps": jnp.asarray(self.q_steps, dtype=jnp.float32),
             "q_scheduled_budget": q_scheduled_budget,

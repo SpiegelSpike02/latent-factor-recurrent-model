@@ -227,7 +227,7 @@ def _brc_compact_training_rollout(
         has_selected = has_selected | take_selected
 
         confidence = jnp.max(model._normalize_q(next_q), axis=-1)
-        filled_ratio = jnp.sum(confidence * query_mask) / query_normalizer
+        q_confidence = jnp.sum(confidence * query_mask) / query_normalizer
         trust_gamma, trust_uncertainty = model._trust_metric_values(step_index)
         return (
             next_q,
@@ -239,7 +239,7 @@ def _brc_compact_training_rollout(
             has_selected,
         ), (
             per_step_loss,
-            filled_ratio,
+            q_confidence,
             halt_logits,
             step_exact.astype(jnp.float32),
             jnp.mean(q_scheduled_budget.astype(jnp.float32)),
@@ -283,7 +283,7 @@ def _brc_compact_training_rollout(
     )
     (
         per_step_loss,
-        filled_ratio,
+        q_confidence,
         halt_logits,
         per_step_exact,
         q_scheduled_budget,
@@ -295,7 +295,7 @@ def _brc_compact_training_rollout(
     final_logits = model._q_to_token_logits(q_final, inputs, final_step)
     final_candidate = jnp.argmax(final_logits, axis=-1).astype(jnp.int32)
     diagnostics = {
-        "diffusion_filled_ratio": filled_ratio,
+        "q_confidence": q_confidence,
         "unroll_steps": jnp.asarray(model.q_steps, dtype=jnp.float32),
         "early_candidate": early_candidate,
         "mid_candidate": mid_candidate,
@@ -444,17 +444,22 @@ def brc_loss_and_metrics(
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "per_step_loss": per_step_loss,
         "step_loss_weights": step_loss_weights,
-        "diffusion_filled_ratio": jnp.mean(diagnostics["diffusion_filled_ratio"]),
+        "q_confidence": jnp.mean(diagnostics["q_confidence"]),
         "q_scheduled_budget": jnp.mean(diagnostics["q_scheduled_budget"]),
         "q_update_alpha": jnp.mean(diagnostics["q_update_alpha"]),
         "trust_gamma": jnp.mean(diagnostics["trust_gamma"]),
         "trust_uncertainty": jnp.mean(diagnostics["trust_uncertainty"]),
-        "per_step_diffusion_filled_ratio": diagnostics["diffusion_filled_ratio"],
+        "per_step_q_confidence": diagnostics["q_confidence"],
         "per_step_q_scheduled_budget": diagnostics["q_scheduled_budget"],
         "per_step_q_update_alpha": diagnostics["q_update_alpha"],
         "per_step_trust_gamma": diagnostics["trust_gamma"],
         "per_step_trust_uncertainty": diagnostics["trust_uncertainty"],
     }
+    if halt_loss_weight != 0.0:
+        metrics["per_step_halt_probability"] = (
+            jnp.sum(jax.nn.sigmoid(diagnostics["halt_logits"]) * example_mask[None, :], axis=1)
+            / jnp.maximum(jnp.sum(example_mask), 1.0)
+        )
     if model.config.task_type == "sudoku":
         context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
         metrics.update(
@@ -483,10 +488,6 @@ def brc_loss_and_metrics(
                 "selected_step": _masked_example_mean(
                     diagnostics["selected_step"].astype(jnp.float32) + 1.0,
                     example_mask,
-                ),
-                "per_step_halt_probability": (
-                    jnp.sum(jax.nn.sigmoid(diagnostics["halt_logits"]) * example_mask[None, :], axis=1)
-                    / jnp.maximum(jnp.sum(example_mask), 1.0)
                 ),
             }
         )

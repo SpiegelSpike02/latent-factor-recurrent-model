@@ -112,7 +112,7 @@ CORE_SCALAR_METRICS = (
     "active_context_consistency",
     "active_invalid_rate",
     "active_conflicts",
-    "diffusion_filled_ratio",
+    "q_confidence",
     "q_scheduled_budget",
     "q_update_alpha",
     "trust_gamma",
@@ -148,6 +148,67 @@ CORE_SCALAR_METRICS = (
     "final_path_precision",
     "final_path_recall",
     "final_path_f1",
+)
+BRC_SCALAR_METRICS = (
+    "loss",
+    "ce_loss",
+    "final_ce_loss",
+    "mean_ce_loss",
+    "accuracy",
+    "context_accuracy",
+    "query_accuracy",
+    "exact_accuracy",
+    "final_target_probability",
+    "context_target_probability",
+    "query_target_probability",
+    "oracle_step",
+    "unroll_steps",
+    "exact_count",
+    "context_consistency",
+    "invalid_rate",
+    "conflicts",
+    "path_precision",
+    "path_recall",
+    "path_f1",
+    "path_positive_rate",
+    "target_path_rate",
+    "q_confidence",
+    "q_scheduled_budget",
+    "q_update_alpha",
+    "trust_gamma",
+    "trust_uncertainty",
+    "halt_loss",
+    "selected_accuracy",
+    "selected_exact_accuracy",
+    "selected_step",
+    "act_step",
+    "halted_rate",
+    "reset_rate",
+    "active_ce_loss",
+    "active_accuracy",
+    "active_context_accuracy",
+    "active_query_accuracy",
+    "active_exact_accuracy",
+    "active_target_probability",
+    "active_context_target_probability",
+    "active_query_target_probability",
+    "active_context_consistency",
+    "active_invalid_rate",
+    "active_conflicts",
+    "active_path_precision",
+    "active_path_recall",
+    "active_path_f1",
+    "active_path_positive_rate",
+    "active_target_path_rate",
+    "completed_count",
+    "completed_accuracy",
+    "completed_context_accuracy",
+    "completed_query_accuracy",
+    "completed_exact_accuracy",
+    "completed_target_probability",
+    "completed_context_target_probability",
+    "completed_query_target_probability",
+    "completed_exact_count",
 )
 WANDB_HISTORY_EXCLUDED_SCALAR_METRICS: set[str] = set()
 TERMINAL_DIAGNOSTIC_METRICS = (
@@ -198,7 +259,6 @@ BRC_CONSOLE_GROUPS = (
         (
             "loss",
             "ce_loss",
-            "active_ce_loss",
             "final_ce_loss",
             "mean_ce_loss",
         ),
@@ -212,7 +272,6 @@ BRC_CONSOLE_GROUPS = (
             "exact_accuracy",
             "final_target_probability",
             "query_target_probability",
-            "count",
             "exact_count",
         ),
     ),
@@ -277,16 +336,11 @@ BRC_CONSOLE_GROUPS = (
     (
         "dynamics",
         (
-            "diffusion_filled_ratio",
+            "q_confidence",
             "q_scheduled_budget",
             "q_update_alpha",
             "trust_gamma",
             "trust_uncertainty",
-            "halted_rate",
-            "halt_loss",
-            "selected_step",
-            "selected_accuracy",
-            "selected_exact_accuracy",
         ),
     ),
     (
@@ -353,7 +407,18 @@ def metric_display_name(name: str) -> str:
 
 
 def scalar_metric_names(config) -> tuple[str, ...]:
-    names = list(CORE_SCALAR_METRICS)
+    names = list(BRC_SCALAR_METRICS if config.model.model_type == "brc" else CORE_SCALAR_METRICS)
+    if config.model.model_type == "brc" and config.train.halt_loss_weight == 0.0:
+        names = [
+            name for name in names
+            if not (
+                name == "halt_loss"
+                or name.startswith("selected_")
+                or name in ("act_step", "halted_rate", "reset_rate")
+                or name.startswith("active_")
+                or name.startswith("completed_")
+            )
+        ]
     if config.train.terminal_residual_weight != 0.0:
         names.extend(TERMINAL_DIAGNOSTIC_METRICS)
     return tuple(names)

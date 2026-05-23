@@ -64,7 +64,7 @@ from lfrm.training.metrics import (
 PER_STEP_SCALAR_SERIES = (
     ("per_step_loss", "loss_by_step"),
     ("per_step_accuracy", "accuracy_by_step"),
-    ("per_step_diffusion_filled_ratio", "diffusion_filled_ratio_by_step"),
+    ("per_step_q_confidence", "q_confidence_by_step"),
     ("per_step_q_scheduled_budget", "q_scheduled_budget_by_step"),
     ("per_step_q_update_alpha", "q_update_alpha_by_step"),
     ("per_step_trust_gamma", "trust_gamma_by_step"),
@@ -254,9 +254,10 @@ def log_train_metrics(
         )
     )
     train_summary = optional_summary_log("train", host_metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
-    for metric_name, log_name in PER_STEP_SCALAR_SERIES:
-        if metric_name in host_metrics:
-            train_log.update(flatten_step_metrics(f"train/{log_name}", list(host_metrics[metric_name])))
+    if config.model.model_type != "brc":
+        for metric_name, log_name in PER_STEP_SCALAR_SERIES:
+            if metric_name in host_metrics:
+                train_log.update(flatten_step_metrics(f"train/{log_name}", list(host_metrics[metric_name])))
     if wandb_run is not None:
         wandb_run.log(train_log, step=step, commit=not is_eval_step)
         for key, value in train_summary.items():
