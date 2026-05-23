@@ -201,10 +201,6 @@ BRC_CONSOLE_GROUPS = (
             "active_ce_loss",
             "final_ce_loss",
             "mean_ce_loss",
-            "lm_loss",
-            "active_lm_loss",
-            "final_lm_loss",
-            "mean_lm_loss",
         ),
     ),
     (
@@ -237,7 +233,7 @@ BRC_CONSOLE_GROUPS = (
     (
         "active",
         (
-            "active_lm_loss",
+            "active_ce_loss",
             "active_accuracy",
             "active_query_accuracy",
             "active_context_accuracy",

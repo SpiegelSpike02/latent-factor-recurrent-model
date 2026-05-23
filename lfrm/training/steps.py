@@ -432,9 +432,6 @@ def brc_loss_and_metrics(
         "ce_loss": step_ce_loss,
         "final_ce_loss": solution_loss,
         "mean_ce_loss": jnp.mean(per_step_loss),
-        "lm_loss": step_ce_loss,
-        "final_lm_loss": solution_loss,
-        "mean_lm_loss": jnp.mean(per_step_loss),
         "final_target_probability": target_probability,
         "accuracy": cell_accuracy,
         "context_accuracy": context_accuracy,
@@ -520,7 +517,7 @@ def brc_act_loss_and_metrics(
     )
     normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32)), 1.0)
     token_loss = token_cross_entropy(model, logits, targets)
-    lm_loss = jnp.sum(token_loss * loss_mask.astype(jnp.float32)) / normalizer
+    ce_loss = jnp.sum(token_loss * loss_mask.astype(jnp.float32)) / normalizer
     predictions = jnp.argmax(logits, axis=-1).astype(jnp.int32)
     metric_correct = (predictions == targets).astype(jnp.float32) * loss_mask.astype(jnp.float32)
     context_mask, query_mask = _brc_region_masks(model, inputs, loss_mask)
@@ -593,13 +590,11 @@ def brc_act_loss_and_metrics(
             jnp.sum(example_mask),
             1.0,
         )
-    loss = lm_loss + halt_loss_weight * halt_loss
+    loss = ce_loss + halt_loss_weight * halt_loss
     metrics = {
         "loss": loss,
-        "ce_loss": lm_loss,
-        "active_ce_loss": lm_loss,
-        "lm_loss": lm_loss,
-        "active_lm_loss": lm_loss,
+        "ce_loss": ce_loss,
+        "active_ce_loss": ce_loss,
         "completed_accuracy": accuracy,
         "completed_context_accuracy": context_accuracy,
         "completed_query_accuracy": query_accuracy,

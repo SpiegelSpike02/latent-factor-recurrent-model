@@ -359,9 +359,9 @@ class GridModelTests(unittest.TestCase):
         self.assertFalse(legacy_keys & set(metrics))
         for key in (
             "loss",
-            "lm_loss",
-            "final_lm_loss",
-            "mean_lm_loss",
+            "ce_loss",
+            "final_ce_loss",
+            "mean_ce_loss",
             "context_accuracy",
             "query_accuracy",
             "context_target_probability",
@@ -406,7 +406,7 @@ class GridModelTests(unittest.TestCase):
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
         _, metrics = loss_and_metrics(model, batch, True, jax.random.key(37))
-        for key in ("loss", "lm_loss", "accuracy", "exact_accuracy"):
+        for key in ("loss", "ce_loss", "accuracy", "exact_accuracy"):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
 
