@@ -70,6 +70,8 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("epochs must be positive")
     if config.train.log_epochs <= 0:
         raise ValueError("log_epochs must be positive")
+    if config.train.trm_train_mode not in ("act", "dense_unroll"):
+        raise ValueError("trm_train_mode must be 'act' or 'dense_unroll'")
     if config.eval.epochs <= 0:
         raise ValueError("eval epochs must be positive")
     if not config.eval.full_dataset:
