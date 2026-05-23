@@ -42,6 +42,7 @@ class BRCConfig:
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     halt_exploration_prob: float = 0.1
+    halt_min_steps: int = 1
     step_loss_schedule: str = "uniform"
 
 

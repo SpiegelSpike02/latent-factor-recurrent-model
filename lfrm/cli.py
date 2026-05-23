@@ -122,6 +122,7 @@ ALLOWED_NESTED_KEYS = {
         "rms_norm_eps",
         "rope_theta",
         "halt_exploration_prob",
+        "halt_min_steps",
         "step_loss_schedule",
     },
     "urm": {
@@ -264,6 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
     parser.add_argument("--brc-halt-exploration-prob", type=float, default=0.1)
+    parser.add_argument("--brc-halt-min-steps", type=int, default=1)
     parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear"), default="uniform")
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
@@ -408,6 +410,7 @@ def build_config(
             rms_norm_eps=args.brc_rms_norm_eps,
             rope_theta=args.brc_rope_theta,
             halt_exploration_prob=args.brc_halt_exploration_prob,
+            halt_min_steps=args.brc_halt_min_steps,
             step_loss_schedule=args.brc_step_loss_schedule,
         ),
         urm=URMConfig(

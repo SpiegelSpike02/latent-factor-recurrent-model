@@ -108,6 +108,8 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC RoPE head dimension must be even")
         if brc.step_loss_schedule not in ("uniform", "linear"):
             raise ValueError("BRC step_loss_schedule must be 'uniform' or 'linear'")
+        if brc.halt_min_steps < 1:
+            raise ValueError("BRC halt_min_steps must be at least 1")
 
         self.config = config
         self.runtime = runtime
@@ -527,17 +529,19 @@ class BRCModel(nnx.Module):
         is_last_step = new_steps >= self.evidence_steps
         if train:
             halted = is_last_step | (halt_logits > 0.0)
+            min_halt_steps = min(int(self.brc.halt_min_steps), self.evidence_steps)
+            min_steps = jnp.full_like(new_steps, min_halt_steps)
             if self.evidence_steps > 1 and self.brc.halt_exploration_prob > 0.0:
                 explore_key, min_step_key = jax.random.split(dropout_key)
                 explore = jax.random.uniform(explore_key, halt_logits.shape) < self.brc.halt_exploration_prob
                 random_step = jax.random.randint(
                     min_step_key,
                     halt_logits.shape,
-                    2,
+                    min_halt_steps,
                     self.evidence_steps + 1,
                 )
-                min_steps = jnp.where(explore, random_step, 1)
-                halted = halted & (new_steps >= min_steps)
+                min_steps = jnp.where(explore, random_step, min_steps)
+            halted = halted & (new_steps >= min_steps)
         else:
             halted = is_last_step
         new_carry = {
