@@ -92,7 +92,7 @@ ALLOWED_SECTION_KEYS = {
     },
     "eval": {
         "batch_size",
-        "epochs",
+        "nums",
         "diagnostics",
         "full_dataset",
     },
@@ -259,10 +259,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Grouped dataset epochs. The training loop derives optimizer updates internally.",
     )
     parser.add_argument(
-        "--eval-epochs",
+        "--eval-nums",
         type=int,
-        default=100,
-        help="Eval interval in grouped dataset epochs. The loop derives optimizer-update intervals internally.",
+        default=10,
+        help="Number of eval/checkpoint points per training run. The loop derives optimizer-update intervals internally.",
     )
     parser.add_argument("--eval-diagnostics", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--eval-full-dataset", action=argparse.BooleanOptionalAction, default=True)
@@ -512,7 +512,7 @@ def build_config(
     )
     eval_config = EvalConfig(
         batch_size=args.eval_batch_size,
-        epochs=args.eval_epochs,
+        nums=args.eval_nums,
         diagnostics=args.eval_diagnostics,
         full_dataset=args.eval_full_dataset,
     )

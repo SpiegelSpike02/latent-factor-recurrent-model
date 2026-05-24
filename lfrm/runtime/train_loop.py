@@ -24,7 +24,7 @@ from lfrm.runtime.logging import (
     resolve_profile_dir,
     upload_wandb_profile,
 )
-from lfrm.runtime.schedules import eval_interval_updates, schedule_learning_rate
+from lfrm.runtime.schedules import eval_interval_updates, eval_update_steps, schedule_learning_rate
 from lfrm.runtime.sharding import (
     batch_sharding,
     data_parallel_mesh,
@@ -80,8 +80,8 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("log_epochs must be positive")
     if config.train.trm_train_mode not in ("act", "dense_unroll"):
         raise ValueError("trm_train_mode must be 'act' or 'dense_unroll'")
-    if config.eval.epochs <= 0:
-        raise ValueError("eval epochs must be positive")
+    if config.eval.nums <= 0:
+        raise ValueError("eval nums must be positive")
     if not config.eval.full_dataset:
         raise ValueError("eval.full_dataset=false is not supported; eval is always full-dataset")
     if config.optimizer.lr_warmup_steps <= 0:
@@ -203,7 +203,7 @@ def print_run_overview(
             ("optimizer_updates", config.train.optimizer_updates),
             ("log_epochs", config.train.log_epochs),
             ("log_interval", config.train.log_interval_updates),
-            ("eval_epochs", config.eval.epochs),
+            ("eval_nums", config.eval.nums),
             ("eval_interval", eval_interval_updates(config)),
             ("lr_warmup_steps", config.optimizer.lr_warmup_steps),
             ("trm_train_mode", config.train.trm_train_mode),
@@ -418,7 +418,7 @@ def run_training(
     use_step_carry = training_uses_carry(config)
     console_model_label = "brc" if config.model.model_type == "brc" else config.model.model_type
     train_carry = place_tree(model.initial_carry(current_batch), data_sharding) if use_step_carry else None
-    eval_interval = eval_interval_updates(config)
+    eval_steps = eval_update_steps(config)
     profile_active = False
     profile_finished = False
     profile_stop_step = config.runtime.profile_start_step + config.runtime.profile_steps - 1
@@ -438,7 +438,7 @@ def run_training(
                     print(f"[profile] start step={step} dir={profile_dir}", flush=True)
                     jax.profiler.start_trace(str(profile_dir))
                     profile_active = True
-                is_eval_step = step % eval_interval == 0 or step == config.train.optimizer_updates
+                is_eval_step = step in eval_steps
                 if use_step_carry:
                     assert train_carry is not None
                     train_key, step_key = jax.random.split(train_key)

@@ -830,14 +830,14 @@ class GridModelTests(unittest.TestCase):
             eval_config_path.write_text(
                 "[eval]\n"
                 "batch_size = 32\n"
-                "epochs = 10\n"
+                "nums = 10\n"
                 "diagnostics = true\n"
                 "full_dataset = true\n",
                 encoding="utf-8",
             )
             eval_loaded = load_toml_config(str(eval_config_path))
             self.assertEqual(eval_loaded["eval_batch_size"], 32)
-            self.assertEqual(eval_loaded["eval_epochs"], 10)
+            self.assertEqual(eval_loaded["eval_nums"], 10)
             self.assertTrue(eval_loaded["eval_diagnostics"])
             self.assertTrue(eval_loaded["eval_full_dataset"])
 

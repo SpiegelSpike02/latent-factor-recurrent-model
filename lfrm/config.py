@@ -148,7 +148,7 @@ class TrainConfig:
 @dataclass(frozen=True)
 class EvalConfig:
     batch_size: int = 0
-    epochs: int = 100
+    nums: int = 10
     interval_updates: int = 0
     diagnostics: bool = False
     full_dataset: bool = True

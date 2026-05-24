@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import math
 from typing import Any
 
 import numpy as np
@@ -24,6 +25,15 @@ def schedule_learning_rate(config: ExperimentConfig, step: int) -> float:
 
 def eval_interval_updates(config: ExperimentConfig) -> int:
     return max(1, config.eval.interval_updates)
+
+
+def eval_update_steps(config: ExperimentConfig) -> frozenset[int]:
+    total_updates = max(1, config.train.optimizer_updates)
+    eval_nums = max(1, min(config.eval.nums, total_updates))
+    return frozenset(
+        max(1, math.ceil(total_updates * eval_index / eval_nums))
+        for eval_index in range(1, eval_nums + 1)
+    )
 
 
 def updates_from_epochs(dataset, batch_size: int, epochs: int) -> int:
@@ -50,7 +60,7 @@ def apply_epoch_budget(config: ExperimentConfig, dataset) -> ExperimentConfig:
     )
     eval_config = replace(
         config.eval,
-        interval_updates=updates_from_epochs(dataset, config.train.batch_size, config.eval.epochs),
+        interval_updates=max(1, math.ceil(train.optimizer_updates / max(1, config.eval.nums))),
     )
     return ExperimentConfig(
         task=config.task,

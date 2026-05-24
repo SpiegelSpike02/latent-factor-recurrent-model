@@ -61,7 +61,7 @@ decay = 0.999
 
 [eval]
 batch_size = 2048
-epochs = 5000
+nums = 10
 diagnostics = false
 full_dataset = true
 

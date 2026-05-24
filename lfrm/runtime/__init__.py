@@ -18,6 +18,7 @@ from lfrm.runtime.schedules import (
     apply_epoch_budget,
     config_to_dict,
     eval_interval_updates,
+    eval_update_steps,
     schedule_learning_rate,
     updates_from_epochs,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "data_parallel_mesh",
     "eval_device_batch",
     "eval_interval_updates",
+    "eval_update_steps",
     "evaluate",
     "init_wandb",
     "patch_wandb_tensorboard",
