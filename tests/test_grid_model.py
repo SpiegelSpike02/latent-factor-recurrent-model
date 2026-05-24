@@ -288,7 +288,7 @@ class GridModelTests(unittest.TestCase):
         labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
         self.assertTrue(bool(jnp.all(model.context_mask(tokens) == (tokens > 1))))
         logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
-        final_only_logits, final_only_diagnostics = model.run_diffusion(
+        final_only_logits, final_only_diagnostics = model.run_q_steps(
             tokens,
             train=False,
             return_final_only=True,
@@ -446,10 +446,10 @@ class GridModelTests(unittest.TestCase):
             "labels": labels,
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
-        before = model.input_to_hidden.kernel[...]
+        before = model.context_to_hidden.kernel[...]
         metrics = train_step(model, optimizer, batch, jax.random.key(34))
         metrics = train_step(model, optimizer, batch, jax.random.key(35))
-        after = model.input_to_hidden.kernel[...]
+        after = model.context_to_hidden.kernel[...]
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
         self.assertGreater(float(jnp.sum(jnp.abs(after - before))), 0.0)
 

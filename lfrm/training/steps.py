@@ -129,33 +129,6 @@ def _normalized_step_loss_weights(configured: tuple[float, ...] | None, rollout_
     return weights / jnp.maximum(jnp.sum(weights), 1e-6)
 
 
-def _refine_q_step(
-    model: BRCModel,
-    inputs: jax.Array,
-    q: jax.Array,
-    hidden_state: jax.Array,
-    base_embeddings: jax.Array,
-    time_embedding: jax.Array,
-    step_index: jax.Array,
-    *,
-    train: bool,
-    dropout_key: jax.Array | None,
-    stop_hidden_between_steps: bool = True,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    next_q, next_hidden, halt_logits, q_update_alpha = model._q_step(
-        inputs,
-        q,
-        hidden_state,
-        base_embeddings,
-        time_embedding,
-        step_index,
-        train=train,
-        dropout_key=dropout_key,
-        stop_hidden_between_steps=stop_hidden_between_steps,
-    )
-    return next_q, next_hidden, halt_logits, q_update_alpha
-
-
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
     progress = jnp.arange(1, rollout_steps + 1, dtype=jnp.float32) / float(rollout_steps)
     if model.brc.step_loss_schedule == "quadratic":
@@ -196,14 +169,12 @@ def _brc_compact_training_rollout(
             selected_step,
             has_selected,
         ) = carry
-        step_index, step_dropout_key, time_embedding = scan_inputs
-        next_q, next_hidden, halt_logits, q_update_alpha = _refine_q_step(
-            model,
+        step_index, step_dropout_key = scan_inputs
+        next_q, next_hidden, halt_logits, q_update_alpha = model._q_step(
             inputs,
             q,
             hidden_state,
             base_embeddings,
-            time_embedding,
             step_index,
             train=True,
             dropout_key=step_dropout_key,
@@ -248,12 +219,10 @@ def _brc_compact_training_rollout(
 
     step_indices = jnp.arange(model.q_steps, dtype=jnp.int32)
     step_dropout_keys = jax.random.split(dropout_key, model.q_steps)
-    time_embeddings = model.time_embed(step_indices)
     initial_hidden = model.initial_hidden_state(
         inputs,
         initial_q,
         base_embeddings,
-        time_embeddings[0],
         train=True,
         dropout_key=step_dropout_keys[0],
     )
@@ -277,7 +246,7 @@ def _brc_compact_training_rollout(
     ), scan_outputs = jax.lax.scan(
         scan_step,
         initial_carry,
-        (step_indices, step_dropout_keys, time_embeddings),
+        (step_indices, step_dropout_keys),
     )
     (
         per_step_loss,
@@ -353,7 +322,7 @@ def brc_loss_and_metrics(
             solve_key,
         )
     else:
-        step_logits, diagnostics = model.run_diffusion(
+        step_logits, diagnostics = model.run_q_steps(
             inputs,
             initial_q=initial_q,
             train=train,
