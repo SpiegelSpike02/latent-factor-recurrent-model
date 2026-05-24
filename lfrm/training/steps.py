@@ -66,7 +66,7 @@ def _sudoku_board_metrics(
     model: BRCModel,
     predictions: jax.Array,
     inputs: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array]:
     context_mask = inputs > 1 if model.config.task_type == "sudoku" else inputs != 0
     context_f32 = context_mask.astype(jnp.float32)
     context_consistency = (
@@ -75,30 +75,22 @@ def _sudoku_board_metrics(
     )
     if model.config.task_type != "sudoku":
         zero = jnp.asarray(0.0, dtype=jnp.float32)
-        return context_consistency, zero, zero
+        return context_consistency, zero
     if model.config.grid_height != 9 or model.config.grid_width != 9 or model.config.vocab_size < 11:
         zero = jnp.asarray(0.0, dtype=jnp.float32)
-        return context_consistency, zero, zero
+        return context_consistency, zero
 
-    valid_digits = (predictions >= 2) & (predictions <= 10)
     one_hot = jax.nn.one_hot(jnp.clip(predictions - 2, 0, 8), 9)
     grid = one_hot.reshape(predictions.shape[0], 9, 9, 9)
     row_counts = jnp.sum(grid, axis=2)
     col_counts = jnp.sum(grid, axis=1)
     box_values = jnp.take(one_hot, model.box_indices, axis=1)
     box_counts = jnp.sum(box_values, axis=2)
-    unit_valid = (
-        jnp.all(row_counts == 1.0, axis=(1, 2))
-        & jnp.all(col_counts == 1.0, axis=(1, 2))
-        & jnp.all(box_counts == 1.0, axis=(1, 2))
-        & jnp.all(valid_digits, axis=1)
-    )
     row_conflicts = jnp.sum(jnp.maximum(row_counts - 1.0, 0.0), axis=(1, 2))
     col_conflicts = jnp.sum(jnp.maximum(col_counts - 1.0, 0.0), axis=(1, 2))
     box_conflicts = jnp.sum(jnp.maximum(box_counts - 1.0, 0.0), axis=(1, 2))
     conflicts = jnp.mean(row_conflicts + col_conflicts + box_conflicts)
-    invalid_rate = 1.0 - jnp.mean(unit_valid.astype(jnp.float32))
-    return context_consistency, invalid_rate, conflicts
+    return context_consistency, conflicts
 
 
 def _brc_region_masks(model: BRCModel, inputs: jax.Array, loss_mask: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -421,11 +413,10 @@ def brc_loss_and_metrics(
             / jnp.maximum(jnp.sum(example_mask), 1.0)
         )
     if model.config.task_type == "sudoku":
-        context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
+        context_consistency, conflicts = _sudoku_board_metrics(model, predictions, inputs)
         metrics.update(
             {
                 "context_consistency": context_consistency,
-                "invalid_rate": invalid_rate,
                 "conflicts": conflicts,
             }
         )
@@ -579,11 +570,10 @@ def brc_act_loss_and_metrics(
         "q_update_alpha": diagnostics["q_update_alpha"],
     }
     if model.config.task_type == "sudoku":
-        context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)
+        context_consistency, conflicts = _sudoku_board_metrics(model, predictions, inputs)
         metrics.update(
             {
                 "active_context_consistency": context_consistency,
-                "active_invalid_rate": invalid_rate,
                 "active_conflicts": conflicts,
             }
         )

@@ -367,7 +367,6 @@ class GridModelTests(unittest.TestCase):
             "context_target_probability",
             "query_target_probability",
             "context_consistency",
-            "invalid_rate",
             "conflicts",
         ):
             self.assertIn(key, metrics)
