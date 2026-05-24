@@ -157,9 +157,11 @@ def _refine_q_step(
 
 
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
+    progress = jnp.arange(1, rollout_steps + 1, dtype=jnp.float32) / float(rollout_steps)
     if model.brc.step_loss_schedule == "quadratic":
-        progress = jnp.arange(1, rollout_steps + 1, dtype=jnp.float32) / float(rollout_steps)
         weights = jnp.square(progress)
+    elif model.brc.step_loss_schedule == "linear":
+        weights = progress
     else:
         weights = jnp.ones((rollout_steps,), dtype=jnp.float32)
     return weights / jnp.maximum(jnp.sum(weights), 1e-6)

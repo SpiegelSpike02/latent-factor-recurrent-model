@@ -318,7 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
     parser.add_argument("--brc-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--brc-halt-min-steps", type=int, default=1)
-    parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "quadratic"), default="uniform")
+    parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
     parser.add_argument("--urm-l-cycles", type=int, default=6)

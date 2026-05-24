@@ -17,7 +17,7 @@ loss_type = "softmax"
 
 [model.brc.dynamics]
 q_steps = 16
-step_loss_schedule = "quadratic"
+step_loss_schedule = "uniform"
 
 [model.brc.cycles]
 h_cycles = 3

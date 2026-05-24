@@ -186,8 +186,8 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC position_encoding must be 'rope', 'learned', or 'none'")
         if brc.position_encoding == "rope" and (hidden_dim // brc.num_heads) % 4 != 0:
             raise ValueError("BRC axial RoPE head dimension must be divisible by 4")
-        if brc.step_loss_schedule not in ("uniform", "quadratic"):
-            raise ValueError("BRC step_loss_schedule must be 'uniform' or 'quadratic'")
+        if brc.step_loss_schedule not in ("uniform", "linear", "quadratic"):
+            raise ValueError("BRC step_loss_schedule must be 'uniform', 'linear', or 'quadratic'")
         if brc.halt_min_steps < 1:
             raise ValueError("BRC halt_min_steps must be at least 1")
 
