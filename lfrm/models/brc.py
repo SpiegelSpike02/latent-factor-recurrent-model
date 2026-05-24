@@ -183,8 +183,10 @@ class BRCModel(nnx.Module):
         brc = config.brc_config
         if brc.q_steps < 1:
             raise ValueError("BRC q_steps must be at least 1")
-        if min(brc.h_cycles, brc.l_cycles, brc.l_layers) < 1:
-            raise ValueError("BRC h_cycles, l_cycles, and l_layers must be at least 1")
+        if min(brc.h_steps, brc.block_depth) < 1:
+            raise ValueError("BRC h_steps and block_depth must be at least 1")
+        if not 0.0 <= brc.gamma < 1.0:
+            raise ValueError("BRC gamma must be in [0, 1)")
         hidden_dim = int(brc.hidden_state_dim) if brc.hidden_state_dim > 0 else config.d_model
         if hidden_dim < 1:
             raise ValueError("BRC hidden_state_dim must be positive or 0 for d_model")
@@ -209,8 +211,7 @@ class BRCModel(nnx.Module):
         self.runtime = runtime
         self.brc = brc
         self.q_steps = int(brc.q_steps)
-        self.h_cycles = int(brc.h_cycles)
-        self.l_cycles = int(brc.l_cycles)
+        self.h_steps = int(brc.h_steps)
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
@@ -296,7 +297,7 @@ class BRCModel(nnx.Module):
                     self.dtype,
                     rngs=rngs,
                 )
-                for _ in range(brc.l_layers)
+                for _ in range(brc.block_depth)
             ]
         )
         self.q_proposal_head = nnx.Linear(
@@ -421,10 +422,8 @@ class BRCModel(nnx.Module):
         return self._q_to_output_logits(q, tokens)
 
     def _trust_gamma(self, step_index: Array) -> Array:
-        trust_capacity = float(self.q_vocab_size * self.q_steps * self.h_cycles)
-        max_gamma = trust_capacity / (float(self.q_vocab_size) + trust_capacity)
         progress = (step_index.astype(jnp.float32) + 1.0) / float(self.q_steps)
-        return max_gamma * jnp.square(progress)
+        return float(self.brc.gamma) * jnp.square(progress)
 
     def _q_update(self, tokens: Array, q: Array, read_state: Array, step_index: Array) -> tuple[Array, Array]:
         del tokens
@@ -449,7 +448,7 @@ class BRCModel(nnx.Module):
         q_condition: Array,
     ) -> Array:
         hidden = hidden_state.astype(self.dtype)
-        for _ in range(self.l_cycles):
+        for _ in range(self.h_steps):
             for block in self.solver_blocks:
                 hidden = block(
                     hidden,
@@ -490,43 +489,37 @@ class BRCModel(nnx.Module):
     ) -> tuple[Array, Array, Array, Array]:
         halt_logits = jnp.zeros((tokens.shape[0],), dtype=jnp.float32)
         q_update_alpha = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
-        q_update_alpha_sum = jnp.zeros_like(q_update_alpha)
-        for h_index in range(self.h_cycles):
-            context_condition, q_condition = self._typed_conditions(
-                tokens,
-                q,
-                base_embeddings,
-                step_index,
-                train=train,
-                dropout_key=dropout_key,
-            )
-            hidden_state = self._hidden_l_cycle(
-                hidden_state,
-                context_condition,
-                q_condition,
-            )
-            read_state = self._readout_fuse(
-                hidden_state,
-                context_condition,
-                q_condition,
-            )
-            q, q_update_alpha = self._q_update(
-                tokens,
-                q,
-                read_state,
-                step_index,
-            )
-            q_update_alpha_sum = q_update_alpha_sum + q_update_alpha
-            halt_logits = self._halt_logits(read_state)
-            if h_index < self.h_cycles - 1:
-                hidden_state = jax.lax.stop_gradient(hidden_state)
-        h_cycles = jnp.asarray(self.h_cycles, dtype=jnp.float32)
-        next_hidden = jax.lax.stop_gradient(hidden_state) if stop_hidden_between_steps else hidden_state
+        context_condition, q_condition = self._typed_conditions(
+            tokens,
+            jax.lax.stop_gradient(q),
+            base_embeddings,
+            step_index,
+            train=train,
+            dropout_key=dropout_key,
+        )
+        hidden_state = jax.lax.stop_gradient(hidden_state) if stop_hidden_between_steps else hidden_state
+        hidden_state = self._hidden_l_cycle(
+            hidden_state,
+            context_condition,
+            q_condition,
+        )
+        read_state = self._readout_fuse(
+            hidden_state,
+            context_condition,
+            q_condition,
+        )
+        q, q_update_alpha = self._q_update(
+            tokens,
+            q,
+            read_state,
+            step_index,
+        )
+        halt_logits = self._halt_logits(read_state)
         return (
             q,
-            next_hidden,
+            hidden_state,
             halt_logits,
-            q_update_alpha_sum / h_cycles,
+            q_update_alpha,
         )
 
     def initial_hidden_state(
@@ -677,7 +670,7 @@ class BRCModel(nnx.Module):
                 step_index,
                 train=train,
                 dropout_key=step_dropout_key,
-                stop_hidden_between_steps=False,
+                stop_hidden_between_steps=True,
             )
             next_carry = (next_q, next_hidden)
             if return_final_only:

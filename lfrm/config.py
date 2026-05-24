@@ -32,9 +32,9 @@ class TRMConfig:
 @dataclass(frozen=True)
 class BRCConfig:
     q_steps: int = 6
-    h_cycles: int = 1
-    l_cycles: int = 2
-    l_layers: int = 1
+    h_steps: int = 2
+    block_depth: int = 1
+    gamma: float = 0.98
     hidden_state_dim: int = 0
     num_heads: int = 4
     mlp_ratio: int = 2

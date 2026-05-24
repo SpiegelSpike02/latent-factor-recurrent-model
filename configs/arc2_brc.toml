@@ -16,10 +16,10 @@ loss_type = "softmax"
 
 [model.brc]
 q_steps = 16
-h_cycles = 3
-l_cycles = 4
+h_steps = 12
+block_depth = 2
+gamma = 0.98
 hidden_state_dim = 256
-l_layers = 2
 num_heads = 8
 mlp_ratio = 4
 local_kernel = 3
@@ -69,5 +69,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "arc2-brc-q-dualtime-16x3x4x2-b768"
+name = "arc2-brc-q-dualtime-16x12x2-b768"
 mode = "online"

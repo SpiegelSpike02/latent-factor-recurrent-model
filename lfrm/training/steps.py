@@ -178,7 +178,7 @@ def _brc_compact_training_rollout(
             step_index,
             train=True,
             dropout_key=step_dropout_key,
-            stop_hidden_between_steps=False,
+            stop_hidden_between_steps=True,
         )
         logits = model._q_to_token_logits(next_q, inputs, step_index)
         token_loss = token_cross_entropy(model, logits, targets)

@@ -33,8 +33,7 @@ NESTED_SECTIONS = {
 }
 GROUPED_NESTED_KEYS = {
     "brc": {
-        "dynamics": {"q_steps", "step_loss_schedule"},
-        "cycles": {"h_cycles", "l_cycles", "l_layers"},
+        "dynamics": {"q_steps", "h_steps", "block_depth", "gamma", "step_loss_schedule"},
         "hidden": {
             "hidden_state_dim",
             "num_heads",
@@ -132,9 +131,9 @@ ALLOWED_NESTED_KEYS = {
     },
     "brc": {
         "q_steps",
-        "h_cycles",
-        "l_cycles",
-        "l_layers",
+        "h_steps",
+        "block_depth",
+        "gamma",
         "hidden_state_dim",
         "num_heads",
         "mlp_ratio",
@@ -149,7 +148,6 @@ ALLOWED_NESTED_KEYS = {
         "halt_min_steps",
         "step_loss_schedule",
         "dynamics",
-        "cycles",
         "hidden",
         "position",
         "halt",
@@ -303,9 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-q-steps", type=int, default=6)
-    parser.add_argument("--brc-h-cycles", type=int, default=1)
-    parser.add_argument("--brc-l-cycles", type=int, default=2)
-    parser.add_argument("--brc-l-layers", type=int, default=1)
+    parser.add_argument("--brc-h-steps", type=int, default=2)
+    parser.add_argument("--brc-block-depth", type=int, default=1)
+    parser.add_argument("--brc-gamma", type=float, default=0.98)
     parser.add_argument("--brc-hidden-state-dim", type=int, default=0)
     parser.add_argument("--brc-num-heads", type=int, default=4)
     parser.add_argument("--brc-mlp-ratio", type=int, default=2)
@@ -452,9 +450,9 @@ def build_config(
         ),
         brc=BRCConfig(
             q_steps=args.brc_q_steps,
-            h_cycles=args.brc_h_cycles,
-            l_cycles=args.brc_l_cycles,
-            l_layers=args.brc_l_layers,
+            h_steps=args.brc_h_steps,
+            block_depth=args.brc_block_depth,
+            gamma=args.brc_gamma,
             hidden_state_dim=args.brc_hidden_state_dim,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,
