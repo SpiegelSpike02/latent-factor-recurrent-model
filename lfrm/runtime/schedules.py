@@ -15,10 +15,20 @@ def schedule_learning_rate(config: ExperimentConfig, step: int) -> float:
     warmup_steps = max(1, config.optimizer.lr_warmup_steps)
     peak = config.optimizer.learning_rate
     end = peak * config.optimizer.lr_min_ratio
+    mid = peak * config.optimizer.lr_mid_ratio
+    mid_fraction = config.optimizer.lr_mid_fraction
     decay_updates = max(optimizer_updates, warmup_steps + 1)
     if optimizer_step <= warmup_steps:
         return peak * optimizer_step / max(warmup_steps, 1)
     progress = min(max((optimizer_step - warmup_steps) / max(decay_updates - warmup_steps, 1), 0.0), 1.0)
+    if config.optimizer.lr_mid_ratio > 0.0 and 0.0 < mid_fraction < 1.0:
+        if progress <= mid_fraction:
+            fast_progress = progress / mid_fraction
+            cosine = 0.5 * (1.0 + np.cos(np.pi * fast_progress))
+            return float(mid + (peak - mid) * cosine)
+        slow_progress = (progress - mid_fraction) / max(1.0 - mid_fraction, 1e-12)
+        cosine = 0.5 * (1.0 + np.cos(np.pi * slow_progress))
+        return float(end + (mid - end) * cosine)
     cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
     return float(end + (peak - end) * cosine)
 

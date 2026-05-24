@@ -86,6 +86,12 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("eval.full_dataset=false is not supported; eval is always full-dataset")
     if config.optimizer.lr_warmup_steps <= 0:
         raise ValueError("lr_warmup_steps must be positive")
+    if not 0.0 <= config.optimizer.lr_min_ratio <= 1.0:
+        raise ValueError("lr_min_ratio must be in [0, 1]")
+    if config.optimizer.lr_mid_ratio < 0.0:
+        raise ValueError("lr_mid_ratio must be non-negative")
+    if config.optimizer.lr_mid_ratio > 0.0 and not 0.0 < config.optimizer.lr_mid_fraction < 1.0:
+        raise ValueError("lr_mid_fraction must be in (0, 1) when lr_mid_ratio is enabled")
     if config.runtime.prefetch_depth <= 0:
         raise ValueError("prefetch_depth must be positive")
     if config.runtime.prefetch_workers <= 0:

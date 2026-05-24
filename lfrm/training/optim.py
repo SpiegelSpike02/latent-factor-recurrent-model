@@ -44,9 +44,36 @@ def scheduled_lr(
     *,
     peak_value: float,
     min_ratio: float,
+    mid_ratio: float,
+    mid_fraction: float,
     warmup_steps: int,
     optimizer_updates: int,
 ):
+    if mid_ratio > 0.0 and 0.0 < mid_fraction < 1.0:
+        decay_steps = max(optimizer_updates, warmup_steps + 1)
+        decay_span = max(decay_steps - warmup_steps, 1)
+        mid_value = peak_value * mid_ratio
+        end_value = peak_value * min_ratio
+
+        def schedule(count):
+            count = jnp.asarray(count)
+            warmup = peak_value * count / max(warmup_steps, 1)
+            progress = jnp.clip(
+                (count - warmup_steps) / decay_span,
+                0.0,
+                1.0,
+            )
+            fast_progress = jnp.clip(progress / mid_fraction, 0.0, 1.0)
+            fast_cosine = 0.5 * (1.0 + jnp.cos(jnp.pi * fast_progress))
+            fast_value = mid_value + (peak_value - mid_value) * fast_cosine
+            slow_progress = jnp.clip((progress - mid_fraction) / (1.0 - mid_fraction), 0.0, 1.0)
+            slow_cosine = 0.5 * (1.0 + jnp.cos(jnp.pi * slow_progress))
+            slow_value = end_value + (mid_value - end_value) * slow_cosine
+            decay_value = jnp.where(progress <= mid_fraction, fast_value, slow_value)
+            return jnp.where(count <= warmup_steps, warmup, decay_value)
+
+        return schedule
+
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_value,
@@ -178,6 +205,8 @@ def build_optimizer(config: ExperimentConfig, model: object | None = None) -> op
     schedule = scheduled_lr(
         peak_value=config.optimizer.learning_rate,
         min_ratio=config.optimizer.lr_min_ratio,
+        mid_ratio=config.optimizer.lr_mid_ratio,
+        mid_fraction=config.optimizer.lr_mid_fraction,
         warmup_steps=warmup_steps,
         optimizer_updates=optimizer_updates,
     )
@@ -191,6 +220,8 @@ def build_optimizer(config: ExperimentConfig, model: object | None = None) -> op
         puzzle_schedule = scheduled_lr(
             peak_value=config.optimizer.puzzle_embed_learning_rate,
             min_ratio=config.optimizer.lr_min_ratio,
+            mid_ratio=config.optimizer.lr_mid_ratio,
+            mid_fraction=config.optimizer.lr_mid_fraction,
             warmup_steps=warmup_steps,
             optimizer_updates=optimizer_updates,
         )

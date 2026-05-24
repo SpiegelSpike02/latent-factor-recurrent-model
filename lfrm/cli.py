@@ -70,6 +70,8 @@ ALLOWED_SECTION_KEYS = {
         "learning_rate",
         "puzzle_embed_learning_rate",
         "lr_min_ratio",
+        "lr_mid_ratio",
+        "lr_mid_fraction",
         "beta1",
         "beta2",
         "weight_decay",
@@ -334,6 +336,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--puzzle-embed-learning-rate", type=float, default=0.0)
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
+    parser.add_argument("--lr-mid-ratio", type=float, default=0.0)
+    parser.add_argument("--lr-mid-fraction", type=float, default=0.0)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -488,6 +492,8 @@ def build_config(
         learning_rate=args.learning_rate,
         puzzle_embed_learning_rate=args.puzzle_embed_learning_rate,
         lr_min_ratio=args.lr_min_ratio,
+        lr_mid_ratio=args.lr_mid_ratio,
+        lr_mid_fraction=args.lr_mid_fraction,
         beta1=args.beta1,
         beta2=args.beta2,
         weight_decay=args.weight_decay,

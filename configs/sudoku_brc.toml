@@ -44,7 +44,9 @@ halt_min_steps = 16
 [optimizer]
 optimizer_type = "adam_atan2"
 learning_rate = 1e-4
-lr_min_ratio = 1.0
+lr_min_ratio = 0.1
+lr_mid_ratio = 0.2
+lr_mid_fraction = 0.2
 beta1 = 0.9
 beta2 = 0.95
 weight_decay = 1.0

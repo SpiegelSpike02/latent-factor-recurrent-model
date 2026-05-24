@@ -107,6 +107,8 @@ class OptimizerConfig:
     learning_rate: float = 3e-4
     puzzle_embed_learning_rate: float = 0.0
     lr_min_ratio: float = 0.1
+    lr_mid_ratio: float = 0.0
+    lr_mid_fraction: float = 0.0
     beta1: float = 0.9
     beta2: float = 0.999
     weight_decay: float = 0.1
