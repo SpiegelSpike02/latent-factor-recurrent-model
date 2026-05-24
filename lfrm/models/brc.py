@@ -131,12 +131,9 @@ class BRCSolverBlock(nnx.Module):
     ) -> Array:
         input_scale = float(self.config.brc_config.input_scale)
         route_condition = input_scale * context_condition.astype(jnp.float32)
-        value_condition = input_scale * (
-            context_condition.astype(jnp.float32)
-            + q_condition.astype(jnp.float32)
-        )
+        q_hint = q_condition.astype(jnp.float32)
         route = self.attn_norm(h.astype(jnp.float32) + route_condition).astype(self.dtype)
-        value = self.attn_norm(h.astype(jnp.float32) + value_condition).astype(self.dtype)
+        value = (route.astype(jnp.float32) + q_hint).astype(self.dtype)
         attn = multi_head_attention_with_rope(
             self.self_attention,
             route,
@@ -150,11 +147,8 @@ class BRCSolverBlock(nnx.Module):
             name="BRC self attention",
         )
         h = (h.astype(jnp.float32) + self.attn_scale * attn.astype(jnp.float32)).astype(self.dtype)
-        local_condition = input_scale * (
-            context_condition.astype(jnp.float32)
-            + q_condition.astype(jnp.float32)
-        )
-        local_input = self.local_norm(h.astype(jnp.float32) + local_condition).astype(self.dtype)
+        local_base = self.local_norm(h.astype(jnp.float32) + route_condition).astype(self.dtype)
+        local_input = (local_base.astype(jnp.float32) + q_hint).astype(self.dtype)
         local = self.local_mlp(local_input).astype(jnp.float32)
         return (h.astype(jnp.float32) + self.local_scale * local).astype(self.dtype)
 
@@ -465,15 +459,15 @@ class BRCModel(nnx.Module):
         context_condition: Array,
         q_condition: Array,
     ) -> Array:
-        hidden = self.readout_hidden_norm(hidden_state.astype(jnp.float32)).astype(self.dtype)
         input_scale = float(self.brc.input_scale)
-        condition = input_scale * (
-            context_condition.astype(jnp.float32)
-            + q_condition.astype(jnp.float32)
-        )
-        condition = self.readout_condition_norm(condition).astype(self.dtype)
-        fused = hidden.astype(jnp.float32) + condition.astype(jnp.float32)
-        return self.readout_output_norm(fused).astype(self.dtype)
+        hidden = self.readout_hidden_norm(hidden_state.astype(jnp.float32)).astype(self.dtype)
+        context_condition = self.readout_condition_norm(
+            input_scale * context_condition.astype(jnp.float32)
+        ).astype(self.dtype)
+        base = self.readout_output_norm(
+            hidden.astype(jnp.float32) + context_condition.astype(jnp.float32)
+        ).astype(self.dtype)
+        return (base.astype(jnp.float32) + q_condition.astype(jnp.float32)).astype(self.dtype)
 
     def _q_step(
         self,
