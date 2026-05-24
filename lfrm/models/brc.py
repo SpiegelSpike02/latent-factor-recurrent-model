@@ -410,10 +410,6 @@ class BRCModel(nnx.Module):
         del step_index
         return self._q_to_output_logits(q, tokens)
 
-    def _scheduled_budget(self, step_index: Array) -> Array:
-        gamma = self._trust_gamma(step_index)
-        return float(self.q_vocab_size) * gamma / jnp.maximum(1.0 - gamma, self.q_eps)
-
     def _trust_gamma(self, step_index: Array) -> Array:
         final_budget = float(self.q_vocab_size * self.q_steps * self.h_cycles)
         max_gamma = final_budget / (float(self.q_vocab_size) + final_budget)
@@ -425,22 +421,12 @@ class BRCModel(nnx.Module):
         current_q = self._normalize_q(q)
         class_logits = self.q_proposal_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         proposal_q = jax.nn.softmax(class_logits, axis=-1)
-        scheduled_budget = self._scheduled_budget(step_index)
-        if scheduled_budget.ndim == 0:
-            scheduled_budget = scheduled_budget[None, None, None]
-        elif scheduled_budget.ndim == 1:
-            scheduled_budget = scheduled_budget[:, None, None]
-        scheduled_budget = jnp.broadcast_to(scheduled_budget, (*read_state.shape[:-1], 1))
         update_alpha = jax.nn.sigmoid(
             self.q_update_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         )
         next_q = (1.0 - update_alpha) * current_q + update_alpha * proposal_q
         next_q = self._normalize_q(next_q)
-        return next_q, scheduled_budget, update_alpha
-
-    def _trust_metric_values(self, step_index: Array) -> tuple[Array, Array]:
-        gamma = self._trust_gamma(step_index).astype(jnp.float32)
-        return jnp.mean(gamma), jnp.mean(1.0 - gamma)
+        return next_q, update_alpha
 
     def _halt_logits(self, read_state: Array) -> Array:
         pooled = jnp.mean(read_state.astype(jnp.float32), axis=1)
@@ -473,11 +459,9 @@ class BRCModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
         stop_hidden_between_steps: bool = True,
-    ) -> tuple[Array, Array, Array, Array, Array]:
+    ) -> tuple[Array, Array, Array, Array]:
         halt_logits = jnp.zeros((tokens.shape[0],), dtype=jnp.float32)
-        scheduled_budget = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
         q_update_alpha = jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32)
-        scheduled_budget_sum = jnp.zeros_like(scheduled_budget)
         q_update_alpha_sum = jnp.zeros_like(q_update_alpha)
         for h_index in range(self.h_cycles):
             cell_input = self._cell_embeddings(
@@ -492,13 +476,12 @@ class BRCModel(nnx.Module):
             hidden_input = self.input_to_hidden(maybe_cast(cell_input, self.dtype)).astype(self.dtype)
             hidden_state = self._hidden_l_cycle(hidden_state, hidden_input)
             read_state = self._readout_fuse(hidden_state, cell_input)
-            q, scheduled_budget, q_update_alpha = self._q_update(
+            q, q_update_alpha = self._q_update(
                 tokens,
                 q,
                 read_state,
                 step_index,
             )
-            scheduled_budget_sum = scheduled_budget_sum + scheduled_budget
             q_update_alpha_sum = q_update_alpha_sum + q_update_alpha
             halt_logits = self._halt_logits(read_state)
             if h_index < self.h_cycles - 1:
@@ -509,7 +492,6 @@ class BRCModel(nnx.Module):
             q,
             next_hidden,
             halt_logits,
-            scheduled_budget_sum / h_cycles,
             q_update_alpha_sum / h_cycles,
         )
 
@@ -590,7 +572,7 @@ class BRCModel(nnx.Module):
             dropout_key=dropout_key,
         )
         hidden = jnp.where(reset_state, reset_hidden, carry["hidden"])
-        next_q, next_hidden, halt_logits, scheduled_budget, q_update_alpha = self._q_step(
+        next_q, next_hidden, halt_logits, q_update_alpha = self._q_step(
             inputs,
             q,
             hidden,
@@ -635,10 +617,8 @@ class BRCModel(nnx.Module):
             "act_step": jnp.mean(new_steps.astype(jnp.float32)),
             "halted_rate": jnp.mean(halted.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
-            "q_scheduled_budget": jnp.mean(scheduled_budget.astype(jnp.float32)),
             "q_update_alpha": jnp.mean(q_update_alpha.astype(jnp.float32)),
         }
-        diagnostics["trust_gamma"], diagnostics["trust_uncertainty"] = self._trust_metric_values(step_index)
         return new_carry, logits, diagnostics
 
     def run_diffusion(
@@ -659,7 +639,7 @@ class BRCModel(nnx.Module):
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key, time_embedding = scan_inputs
             q, hidden_state = carry
-            next_q, next_hidden, halt_logits, scheduled_budget, q_update_alpha = self._q_step(
+            next_q, next_hidden, halt_logits, q_update_alpha = self._q_step(
                 tokens,
                 q,
                 hidden_state,
@@ -676,15 +656,11 @@ class BRCModel(nnx.Module):
             logits = self._q_to_token_logits(next_q, tokens, step_index)
             confidence = jnp.max(self._normalize_q(next_q), axis=-1)
             q_confidence = jnp.sum(confidence * query_mask) / query_normalizer
-            trust_gamma, trust_uncertainty = self._trust_metric_values(step_index)
             return next_carry, (
                 logits,
                 q_confidence,
                 halt_logits,
-                jnp.mean(scheduled_budget.astype(jnp.float32)),
                 jnp.mean(q_update_alpha.astype(jnp.float32)),
-                trust_gamma,
-                trust_uncertainty,
             )
 
         step_indices = jnp.arange(self.q_steps, dtype=jnp.int32)
@@ -715,29 +691,20 @@ class BRCModel(nnx.Module):
                 "q_confidence": jnp.zeros((self.q_steps,), dtype=jnp.float32),
                 "unroll_steps": jnp.asarray(self.q_steps, dtype=jnp.float32),
                 "halt_logits": jnp.zeros((self.q_steps, tokens.shape[0]), dtype=jnp.float32),
-                "q_scheduled_budget": jnp.zeros((self.q_steps,), dtype=jnp.float32),
                 "q_update_alpha": jnp.zeros((self.q_steps,), dtype=jnp.float32),
-                "trust_gamma": jnp.zeros((self.q_steps,), dtype=jnp.float32),
-                "trust_uncertainty": jnp.zeros((self.q_steps,), dtype=jnp.float32),
             }
             return logits, diagnostics
         (
             step_logits,
             q_confidence,
             halt_logits,
-            q_scheduled_budget,
             q_update_alpha,
-            trust_gamma,
-            trust_uncertainty,
         ) = scan_outputs
         diagnostics = {
             "q_confidence": q_confidence,
             "halt_logits": halt_logits,
             "unroll_steps": jnp.asarray(self.q_steps, dtype=jnp.float32),
-            "q_scheduled_budget": q_scheduled_budget,
             "q_update_alpha": q_update_alpha,
-            "trust_gamma": trust_gamma,
-            "trust_uncertainty": trust_uncertainty,
         }
         return step_logits, diagnostics
 

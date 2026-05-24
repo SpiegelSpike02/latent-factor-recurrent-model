@@ -141,8 +141,8 @@ def _refine_q_step(
     train: bool,
     dropout_key: jax.Array | None,
     stop_hidden_between_steps: bool = True,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    next_q, next_hidden, halt_logits, q_scheduled_budget, q_update_alpha = model._q_step(
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    next_q, next_hidden, halt_logits, q_update_alpha = model._q_step(
         inputs,
         q,
         hidden_state,
@@ -153,7 +153,7 @@ def _refine_q_step(
         dropout_key=dropout_key,
         stop_hidden_between_steps=stop_hidden_between_steps,
     )
-    return next_q, next_hidden, halt_logits, q_scheduled_budget, q_update_alpha
+    return next_q, next_hidden, halt_logits, q_update_alpha
 
 
 def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
@@ -197,7 +197,7 @@ def _brc_compact_training_rollout(
             has_selected,
         ) = carry
         step_index, step_dropout_key, time_embedding = scan_inputs
-        next_q, next_hidden, halt_logits, q_scheduled_budget, q_update_alpha = _refine_q_step(
+        next_q, next_hidden, halt_logits, q_update_alpha = _refine_q_step(
             model,
             inputs,
             q,
@@ -230,7 +230,6 @@ def _brc_compact_training_rollout(
 
         confidence = jnp.max(model._normalize_q(next_q), axis=-1)
         q_confidence = jnp.sum(confidence * query_mask) / query_normalizer
-        trust_gamma, trust_uncertainty = model._trust_metric_values(step_index)
         return (
             next_q,
             next_hidden,
@@ -244,10 +243,7 @@ def _brc_compact_training_rollout(
             q_confidence,
             halt_logits,
             step_exact.astype(jnp.float32),
-            jnp.mean(q_scheduled_budget.astype(jnp.float32)),
             jnp.mean(q_update_alpha.astype(jnp.float32)),
-            trust_gamma,
-            trust_uncertainty,
         )
 
     step_indices = jnp.arange(model.q_steps, dtype=jnp.int32)
@@ -288,10 +284,7 @@ def _brc_compact_training_rollout(
         q_confidence,
         halt_logits,
         per_step_exact,
-        q_scheduled_budget,
         q_update_alpha,
-        trust_gamma,
-        trust_uncertainty,
     ) = scan_outputs
     final_step = jnp.asarray(model.q_steps - 1, dtype=jnp.int32)
     final_logits = model._q_to_token_logits(q_final, inputs, final_step)
@@ -304,10 +297,7 @@ def _brc_compact_training_rollout(
         "final_candidate": final_candidate,
         "halt_logits": halt_logits,
         "per_step_exact": per_step_exact,
-        "q_scheduled_budget": q_scheduled_budget,
         "q_update_alpha": q_update_alpha,
-        "trust_gamma": trust_gamma,
-        "trust_uncertainty": trust_uncertainty,
         "selected_candidate": selected_candidate,
         "selected_step": selected_step,
     }
@@ -446,20 +436,14 @@ def brc_loss_and_metrics(
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "step_loss_weights": step_loss_weights,
         "q_confidence": jnp.mean(diagnostics["q_confidence"]),
-        "q_scheduled_budget": jnp.mean(diagnostics["q_scheduled_budget"]),
         "q_update_alpha": jnp.mean(diagnostics["q_update_alpha"]),
-        "trust_gamma": jnp.mean(diagnostics["trust_gamma"]),
-        "trust_uncertainty": jnp.mean(diagnostics["trust_uncertainty"]),
     }
     if not train:
         metrics.update(
             {
                 "per_step_loss": per_step_loss,
                 "per_step_q_confidence": diagnostics["q_confidence"],
-                "per_step_q_scheduled_budget": diagnostics["q_scheduled_budget"],
                 "per_step_q_update_alpha": diagnostics["q_update_alpha"],
-                "per_step_trust_gamma": diagnostics["trust_gamma"],
-                "per_step_trust_uncertainty": diagnostics["trust_uncertainty"],
             }
         )
     if halt_loss_weight != 0.0:
@@ -623,10 +607,7 @@ def brc_act_loss_and_metrics(
         "act_step": diagnostics["act_step"],
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
-        "q_scheduled_budget": diagnostics["q_scheduled_budget"],
         "q_update_alpha": diagnostics["q_update_alpha"],
-        "trust_gamma": diagnostics["trust_gamma"],
-        "trust_uncertainty": diagnostics["trust_uncertainty"],
     }
     if model.config.task_type == "sudoku":
         context_consistency, invalid_rate, conflicts = _sudoku_board_metrics(model, predictions, inputs)

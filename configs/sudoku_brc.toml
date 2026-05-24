@@ -54,8 +54,8 @@ lr_warmup_steps = 2000
 grad_clip_norm = 1.0
 
 [train]
-batch_size = 768
-epochs = 50000
+batch_size = 64
+epochs = 10000
 log_epochs = 10
 trm_train_mode = "dense_unroll"
 seed = 0
@@ -70,7 +70,7 @@ enabled = true
 decay = 0.999
 
 [eval]
-batch_size = 768
+batch_size = 64
 epochs = 5000
 diagnostics = false
 full_dataset = true
@@ -85,5 +85,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-q-dualtime-16x3x4x2-b768"
+name = "sudoku-brc-q-dualtime-16x3x4x2-b64"
 mode = "online"
