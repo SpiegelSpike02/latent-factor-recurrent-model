@@ -420,6 +420,7 @@ def brc_loss_and_metrics(
                 "conflicts": conflicts,
             }
         )
+    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
     if halt_loss_weight != 0.0:
         selected_predictions = diagnostics["selected_candidate"]
         selected_correct = (selected_predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
