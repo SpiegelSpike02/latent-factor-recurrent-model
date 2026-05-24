@@ -17,7 +17,8 @@ loss_type = "softmax"
 
 [model.brc.dynamics]
 q_steps = 16
-h_steps = 12
+h_cycles = 3
+refine_steps = 4
 block_depth = 2
 gamma = 0.98
 step_loss_schedule = "uniform"
@@ -38,7 +39,7 @@ rope_theta = 10000.0
 
 [model.brc.halt]
 halt_exploration_prob = 0.1
-halt_min_steps = 16
+halt_min_steps = 1
 
 [optimizer]
 optimizer_type = "adamw"
@@ -56,13 +57,12 @@ grad_clip_norm = 1.0
 batch_size = 64
 epochs = 10000
 log_epochs = 10
-trm_train_mode = "dense_unroll"
+train_mode = "step_carry"
 seed = 0
 checkpoint_dir = "checkpoints"
 
 [train.objective]
-# Ignored by BRC dense_unroll.
-halt_loss_weight = 0.0
+halt_loss_weight = 0.5
 
 [train.ema]
 enabled = true

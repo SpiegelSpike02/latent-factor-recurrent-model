@@ -33,7 +33,7 @@ NESTED_SECTIONS = {
 }
 GROUPED_NESTED_KEYS = {
     "brc": {
-        "dynamics": {"q_steps", "h_steps", "block_depth", "gamma", "step_loss_schedule"},
+        "dynamics": {"q_steps", "h_cycles", "refine_steps", "block_depth", "gamma", "step_loss_schedule"},
         "hidden": {
             "hidden_state_dim",
             "num_heads",
@@ -84,7 +84,7 @@ ALLOWED_SECTION_KEYS = {
         "batch_size",
         "epochs",
         "log_epochs",
-        "trm_train_mode",
+        "train_mode",
         "halt_loss_weight",
         "terminal_residual_weight",
         "seed",
@@ -133,7 +133,8 @@ ALLOWED_NESTED_KEYS = {
     },
     "brc": {
         "q_steps",
-        "h_steps",
+        "h_cycles",
+        "refine_steps",
         "block_depth",
         "gamma",
         "hidden_state_dim",
@@ -270,10 +271,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-full-dataset", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-epochs", type=int, default=10)
     parser.add_argument(
-        "--trm-train-mode",
-        choices=("act", "dense_unroll"),
+        "--train-mode",
+        choices=("act", "dense_unroll", "step_carry"),
         default="act",
-        help="Recurrent training path: ACT single-step carry or full-unroll dense CE.",
+        help="Recurrent training path: ACT carry, BRC step-carry, or full-unroll dense CE.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--halt-loss-weight", type=float, default=0.0)
@@ -303,7 +304,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--brc-q-steps", type=int, default=6)
-    parser.add_argument("--brc-h-steps", type=int, default=2)
+    parser.add_argument("--brc-h-cycles", type=int, default=1)
+    parser.add_argument("--brc-refine-steps", type=int, default=2)
     parser.add_argument("--brc-block-depth", type=int, default=1)
     parser.add_argument("--brc-gamma", type=float, default=0.98)
     parser.add_argument("--brc-hidden-state-dim", type=int, default=0)
@@ -454,7 +456,8 @@ def build_config(
         ),
         brc=BRCConfig(
             q_steps=args.brc_q_steps,
-            h_steps=args.brc_h_steps,
+            h_cycles=args.brc_h_cycles,
+            refine_steps=args.brc_refine_steps,
             block_depth=args.brc_block_depth,
             gamma=args.brc_gamma,
             hidden_state_dim=args.brc_hidden_state_dim,
@@ -506,7 +509,7 @@ def build_config(
         batch_size=args.batch_size,
         epochs=args.epochs,
         log_epochs=args.log_epochs,
-        trm_train_mode=args.trm_train_mode,
+        train_mode=args.train_mode,
         halt_loss_weight=args.halt_loss_weight,
         terminal_residual_weight=args.terminal_residual_weight,
         seed=args.seed,

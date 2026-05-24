@@ -16,7 +16,8 @@ loss_type = "softmax"
 
 [model.brc]
 q_steps = 16
-h_steps = 12
+h_cycles = 3
+refine_steps = 4
 block_depth = 2
 gamma = 0.98
 hidden_state_dim = 256

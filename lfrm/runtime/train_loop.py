@@ -36,6 +36,7 @@ from lfrm.training import (
     build_ema_update_runner,
     build_brc_act_train_step_runner,
     build_brc_dense_unroll_train_step_runner,
+    build_brc_step_carry_train_step_runner,
     build_state_copy_runner,
     build_eval_step_runner,
     build_train_step_runner,
@@ -78,8 +79,8 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("epochs must be positive")
     if config.train.log_epochs <= 0:
         raise ValueError("log_epochs must be positive")
-    if config.train.trm_train_mode not in ("act", "dense_unroll"):
-        raise ValueError("trm_train_mode must be 'act' or 'dense_unroll'")
+    if config.train.train_mode not in ("act", "dense_unroll", "step_carry"):
+        raise ValueError("train_mode must be 'act', 'dense_unroll', or 'step_carry'")
     if config.eval.nums <= 0:
         raise ValueError("eval nums must be positive")
     if not config.eval.full_dataset:
@@ -116,16 +117,18 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
             raise ValueError("profile_start_step must be positive when profiling is enabled")
         if config.runtime.profile_steps <= 0:
             raise ValueError("profile_steps must be positive when profiling is enabled")
-    if config.model.model_type not in ("trm", "urm", "brc") and config.train.trm_train_mode != "act":
-        raise ValueError("trm_train_mode is only supported for recurrent model types")
+    if config.model.model_type not in ("trm", "urm", "brc") and config.train.train_mode != "act":
+        raise ValueError("train_mode is only supported for recurrent model types")
+    if config.train.train_mode == "step_carry" and config.model.model_type != "brc":
+        raise ValueError("train_mode='step_carry' is currently only implemented for model_type='brc'")
 
 
 def training_uses_carry(config: ExperimentConfig) -> bool:
-    return config.model.model_type in ("brc", "trm", "urm") and config.train.trm_train_mode == "act"
+    return config.model.model_type in ("brc", "trm", "urm") and config.train.train_mode in ("act", "step_carry")
 
 
 def halt_loss_weight_for_mode(config: ExperimentConfig) -> float:
-    if config.model.model_type == "brc" and config.train.trm_train_mode == "dense_unroll":
+    if config.model.model_type == "brc" and config.train.train_mode == "dense_unroll":
         return 0.0
     return config.train.halt_loss_weight
 
@@ -146,8 +149,10 @@ def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size
 def build_step_runners(config: ExperimentConfig):
     halt_loss_weight = halt_loss_weight_for_mode(config)
     if config.model.model_type == "brc":
-        if config.train.trm_train_mode == "dense_unroll":
+        if config.train.train_mode == "dense_unroll":
             train_step_fn = build_brc_dense_unroll_train_step_runner(halt_loss_weight)
+        elif config.train.train_mode == "step_carry":
+            train_step_fn = build_brc_step_carry_train_step_runner(halt_loss_weight)
         else:
             train_step_fn = build_brc_act_train_step_runner(halt_loss_weight)
         eval_step_fn = build_eval_step_runner(
@@ -155,7 +160,7 @@ def build_step_runners(config: ExperimentConfig):
             config.train.terminal_residual_weight,
         )
     elif config.model.model_type in ("trm", "urm"):
-        if config.train.trm_train_mode == "dense_unroll":
+        if config.train.train_mode == "dense_unroll":
             train_step_fn = build_trm_dense_unroll_train_step_runner(
                 halt_loss_weight=config.train.halt_loss_weight,
             )
@@ -212,7 +217,7 @@ def print_run_overview(
             ("eval_nums", config.eval.nums),
             ("eval_interval", eval_interval_updates(config)),
             ("lr_warmup_steps", config.optimizer.lr_warmup_steps),
-            ("trm_train_mode", config.train.trm_train_mode),
+            ("train_mode", config.train.train_mode),
             ("seq_len", config.model.seq_len),
             ("grid_height", config.model.grid_height),
             ("grid_width", config.model.grid_width),

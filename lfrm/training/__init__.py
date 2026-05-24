@@ -4,6 +4,7 @@ from lfrm.training.checkpointing import build_ema_update_runner, build_state_cop
 from lfrm.training.brc import (
     build_brc_act_train_step_runner,
     build_brc_dense_unroll_train_step_runner,
+    build_brc_step_carry_train_step_runner,
     build_eval_step_runner,
     build_train_step_runner,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "build_ema_update_runner",
     "build_brc_act_train_step_runner",
     "build_brc_dense_unroll_train_step_runner",
+    "build_brc_step_carry_train_step_runner",
     "build_state_copy_runner",
     "build_eval_step_runner",
     "build_optimizer",

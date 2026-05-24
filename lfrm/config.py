@@ -32,7 +32,8 @@ class TRMConfig:
 @dataclass(frozen=True)
 class BRCConfig:
     q_steps: int = 6
-    h_steps: int = 2
+    h_cycles: int = 1
+    refine_steps: int = 2
     block_depth: int = 1
     gamma: float = 0.98
     hidden_state_dim: int = 0
@@ -131,7 +132,7 @@ class TrainConfig:
     optimizer_updates: int = 0
     log_epochs: int = 10
     log_interval_updates: int = 0
-    trm_train_mode: str = "act"
+    train_mode: str = "act"
     halt_loss_weight: float = 0.0
     terminal_residual_weight: float = 0.0
     seed: int = 0

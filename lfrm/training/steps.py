@@ -453,6 +453,8 @@ def brc_act_loss_and_metrics(
     train: bool,
     dropout_key: jax.Array | None,
     halt_loss_weight: float = 0.0,
+    *,
+    enable_halt: bool = True,
 ) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
     if dropout_key is None:
         dropout_key = jax.random.key(0)
@@ -461,6 +463,7 @@ def brc_act_loss_and_metrics(
         batch,
         train=train,
         dropout_key=dropout_key,
+        enable_halt=enable_halt,
     )
     inputs = new_carry["current_inputs"]
     targets = new_carry["current_labels"]
@@ -534,6 +537,15 @@ def brc_act_loss_and_metrics(
     active_context_target_probability = _masked_probability(target_probability_cells, context_mask)
     active_query_target_probability = _masked_probability(target_probability_cells, query_mask)
     halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    halt_predictions = diagnostics["halt_logits"] > 0.0
+    halt_target_rate = jnp.sum(exact_f32 * example_mask) / jnp.maximum(jnp.sum(example_mask), 1.0)
+    halt_positive_rate = jnp.sum(halt_predictions.astype(jnp.float32) * example_mask) / jnp.maximum(
+        jnp.sum(example_mask),
+        1.0,
+    )
+    halt_accuracy = jnp.sum(
+        (halt_predictions == exact_examples).astype(jnp.float32) * example_mask
+    ) / jnp.maximum(jnp.sum(example_mask), 1.0)
     if halt_loss_weight != 0.0:
         halt_targets = jax.lax.stop_gradient(exact_f32)
         halt_loss_per_example = optax.sigmoid_binary_cross_entropy(
@@ -565,8 +577,13 @@ def brc_act_loss_and_metrics(
         "active_target_probability": active_target_probability,
         "active_context_target_probability": active_context_target_probability,
         "active_query_target_probability": active_query_target_probability,
+        "carry_step": diagnostics["act_step"],
         "act_step": diagnostics["act_step"],
+        "halt_accuracy": halt_accuracy,
+        "halt_positive_rate": halt_positive_rate,
+        "halt_target_rate": halt_target_rate,
         "halted_rate": diagnostics["halted_rate"],
+        "completed_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
         "q_update_alpha": diagnostics["q_update_alpha"],
     }

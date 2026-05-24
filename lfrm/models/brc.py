@@ -177,8 +177,8 @@ class BRCModel(nnx.Module):
         brc = config.brc_config
         if brc.q_steps < 1:
             raise ValueError("BRC q_steps must be at least 1")
-        if min(brc.h_steps, brc.block_depth) < 1:
-            raise ValueError("BRC h_steps and block_depth must be at least 1")
+        if min(brc.h_cycles, brc.refine_steps, brc.block_depth) < 1:
+            raise ValueError("BRC h_cycles, refine_steps, and block_depth must be at least 1")
         if not 0.0 <= brc.gamma < 1.0:
             raise ValueError("BRC gamma must be in [0, 1)")
         hidden_dim = int(brc.hidden_state_dim) if brc.hidden_state_dim > 0 else config.d_model
@@ -205,7 +205,8 @@ class BRCModel(nnx.Module):
         self.runtime = runtime
         self.brc = brc
         self.q_steps = int(brc.q_steps)
-        self.h_steps = int(brc.h_steps)
+        self.h_cycles = int(brc.h_cycles)
+        self.refine_steps = int(brc.refine_steps)
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
@@ -442,15 +443,22 @@ class BRCModel(nnx.Module):
         q_condition: Array,
     ) -> Array:
         hidden = hidden_state.astype(self.dtype)
-        for _ in range(self.h_steps):
-            for block in self.solver_blocks:
-                hidden = block(
-                    hidden,
-                    context_condition,
-                    q_condition,
-                    self.rope_cos,
-                    self.rope_sin,
-                )
+        def hidden_cycle(carry: Array) -> Array:
+            hidden_cycle_state = carry
+            for _ in range(self.refine_steps):
+                for block in self.solver_blocks:
+                    hidden_cycle_state = block(
+                        hidden_cycle_state,
+                        context_condition,
+                        q_condition,
+                        self.rope_cos,
+                        self.rope_sin,
+                    )
+            return hidden_cycle_state
+
+        for _ in range(self.h_cycles - 1):
+            hidden = jax.lax.stop_gradient(hidden_cycle(hidden))
+        hidden = hidden_cycle(hidden)
         return hidden
 
     def _readout_fuse(
@@ -563,6 +571,7 @@ class BRCModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
+        enable_halt: bool = True,
     ) -> tuple[dict[str, Array], Array, dict[str, Array]]:
         if dropout_key is None:
             dropout_key = jax.random.key(0)
@@ -603,7 +612,7 @@ class BRCModel(nnx.Module):
         logits = self._q_to_token_logits(next_q, inputs, step_index)
         new_steps = steps + 1
         is_last_step = new_steps >= self.q_steps
-        if train:
+        if train and enable_halt:
             halted = is_last_step | (halt_logits > 0.0)
             min_halt_steps = min(int(self.brc.halt_min_steps), self.q_steps)
             min_steps = jnp.full_like(new_steps, min_halt_steps)

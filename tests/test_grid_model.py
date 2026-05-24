@@ -802,7 +802,8 @@ class GridModelTests(unittest.TestCase):
                 "\n"
                 "[model.brc]\n"
                 "q_steps = 2\n"
-                "h_steps = 4\n"
+                "h_cycles = 2\n"
+                "refine_steps = 4\n"
                 "block_depth = 1\n"
                 "gamma = 0.95\n"
                 "hidden_state_dim = 16\n"
@@ -816,7 +817,8 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["model_type"], "brc")
             self.assertEqual(loaded["task_type"], "sudoku")
             self.assertEqual(loaded["brc_q_steps"], 2)
-            self.assertEqual(loaded["brc_h_steps"], 4)
+            self.assertEqual(loaded["brc_h_cycles"], 2)
+            self.assertEqual(loaded["brc_refine_steps"], 4)
             self.assertEqual(loaded["brc_block_depth"], 1)
             self.assertEqual(loaded["brc_gamma"], 0.95)
             self.assertEqual(loaded["brc_hidden_state_dim"], 16)

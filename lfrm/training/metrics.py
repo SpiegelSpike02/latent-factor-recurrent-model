@@ -169,11 +169,14 @@ BRC_SCALAR_METRICS = (
     "q_confidence",
     "q_update_alpha",
     "halt_loss",
+    "halt_accuracy",
+    "halt_positive_rate",
+    "halt_target_rate",
     "selected_accuracy",
     "selected_exact_accuracy",
     "selected_step",
-    "act_step",
-    "halted_rate",
+    "carry_step",
+    "completed_rate",
     "reset_rate",
     "active_ce_loss",
     "active_accuracy",
@@ -298,6 +301,17 @@ BRC_CONSOLE_GROUPS = (
         ),
     ),
     (
+        "halt",
+        (
+            "halt_loss",
+            "halt_accuracy",
+            "halt_positive_rate",
+            "halt_target_rate",
+            "carry_step",
+            "completed_rate",
+        ),
+    ),
+    (
         "sudoku",
         (
             "context_consistency",
@@ -383,13 +397,19 @@ def metric_display_name(name: str) -> str:
 
 def scalar_metric_names(config) -> tuple[str, ...]:
     names = list(BRC_SCALAR_METRICS if config.model.model_type == "brc" else CORE_SCALAR_METRICS)
-    if config.model.model_type == "brc" and config.train.halt_loss_weight == 0.0:
+    brc_halt_enabled = (
+        config.model.model_type == "brc"
+        and config.train.halt_loss_weight != 0.0
+        and config.train.train_mode != "dense_unroll"
+    )
+    if config.model.model_type == "brc" and not brc_halt_enabled:
         names = [
             name for name in names
             if not (
                 name == "halt_loss"
+                or name.startswith("halt_")
                 or name.startswith("selected_")
-                or name in ("act_step", "halted_rate", "reset_rate")
+                or name in ("act_step", "carry_step", "halted_rate", "completed_rate", "reset_rate")
                 or name.startswith("active_")
                 or name.startswith("completed_")
             )

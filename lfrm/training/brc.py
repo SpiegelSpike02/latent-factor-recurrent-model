@@ -70,6 +70,41 @@ def build_brc_act_train_step_runner(halt_loss_weight: float = 0.0):
     return nnx.jit(train_step, donate_argnums=(2,))
 
 
+def build_brc_step_carry_train_step_runner(halt_loss_weight: float = 0.0):
+    def train_step(
+        model: BRCModel,
+        optimizer: nnx.Optimizer,
+        carry: dict[str, jax.Array],
+        batch: dict[str, jax.Array],
+        dropout_key: jax.Array,
+        optimizer_step: jax.Array,
+    ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+        dropout_key = jax.random.fold_in(dropout_key, optimizer_step)
+
+        def objective(model, carry, batch, train, dropout_key):
+            return brc_act_loss_and_metrics(
+                model,
+                carry,
+                batch,
+                train,
+                dropout_key,
+                halt_loss_weight=halt_loss_weight,
+                enable_halt=True,
+            )
+
+        (_, (metrics, new_carry)), grads = nnx.value_and_grad(objective, has_aux=True)(
+            model,
+            carry,
+            batch,
+            True,
+            dropout_key,
+        )
+        optimizer.update(model, grads)
+        return metrics, new_carry
+
+    return nnx.jit(train_step, donate_argnums=(2,))
+
+
 def build_brc_dense_unroll_train_step_runner(halt_loss_weight: float = 0.0):
     def train_step(
         model: BRCModel,
