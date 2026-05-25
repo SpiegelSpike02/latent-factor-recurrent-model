@@ -34,6 +34,7 @@ NESTED_SECTIONS = {
 GROUPED_NESTED_KEYS = {
     "brc": {
         "dynamics": {"commit_steps", "refine_steps", "block_depth", "step_loss_schedule"},
+        "objective": {"flow_kl_energy_weight"},
         "hidden": {
             "hidden_state_dim",
             "num_heads",
@@ -146,7 +147,9 @@ ALLOWED_NESTED_KEYS = {
         "halt_exploration_prob",
         "halt_min_steps",
         "step_loss_schedule",
+        "flow_kl_energy_weight",
         "dynamics",
+        "objective",
         "hidden",
         "position",
         "halt",
@@ -314,6 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--brc-halt-min-steps", type=int, default=1)
     parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
+    parser.add_argument("--brc-flow-kl-energy-weight", type=float, default=1e-4)
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
     parser.add_argument("--urm-l-cycles", type=int, default=6)
@@ -463,6 +467,7 @@ def build_config(
             halt_exploration_prob=args.brc_halt_exploration_prob,
             halt_min_steps=args.brc_halt_min_steps,
             step_loss_schedule=args.brc_step_loss_schedule,
+            flow_kl_energy_weight=args.brc_flow_kl_energy_weight,
         ),
         urm=URMConfig(
             recurrent_steps=args.urm_recurrent_steps,

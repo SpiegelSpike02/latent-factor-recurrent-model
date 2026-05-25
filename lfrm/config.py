@@ -46,6 +46,7 @@ class BRCConfig:
     halt_exploration_prob: float = 0.1
     halt_min_steps: int = 1
     step_loss_schedule: str = "uniform"
+    flow_kl_energy_weight: float = 1e-4
 
 
 @dataclass(frozen=True)

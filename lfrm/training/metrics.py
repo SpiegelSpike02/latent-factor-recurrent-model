@@ -115,6 +115,7 @@ CORE_SCALAR_METRICS = (
     "proposal_tv_distance",
     "q_tv_delta",
     "flow_kl_energy",
+    "flow_kl_energy_loss",
     "step_loss_weights",
     "halt_loss",
     "selected_lm_loss",
@@ -174,6 +175,7 @@ BRC_SCALAR_METRICS = (
     "proposal_tv_distance",
     "q_tv_delta",
     "flow_kl_energy",
+    "flow_kl_energy_loss",
     "halt_loss",
     "halt_accuracy",
     "halt_positive_rate",
@@ -354,6 +356,7 @@ BRC_CONSOLE_GROUPS = (
             "proposal_tv_distance",
             "q_tv_delta",
             "flow_kl_energy",
+            "flow_kl_energy_loss",
         ),
     ),
 )

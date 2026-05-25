@@ -21,6 +21,9 @@ refine_steps = 4
 block_depth = 2
 step_loss_schedule = "uniform"
 
+[model.brc.objective]
+flow_kl_energy_weight = 1e-4
+
 [model.brc.hidden]
 hidden_state_dim = 512
 num_heads = 8

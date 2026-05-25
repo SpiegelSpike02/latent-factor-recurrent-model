@@ -368,6 +368,7 @@ class GridModelTests(unittest.TestCase):
             "query_target_probability",
             "context_consistency",
             "conflicts",
+            "flow_kl_energy_loss",
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
@@ -809,6 +810,7 @@ class GridModelTests(unittest.TestCase):
                 "halt_exploration_prob = 0.2\n"
                 "halt_min_steps = 2\n"
                 "step_loss_schedule = \"quadratic\"\n",
+                "flow_kl_energy_weight = 0.0001\n",
                 encoding="utf-8",
             )
             loaded = load_toml_config(str(config_path))
@@ -822,6 +824,7 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_halt_exploration_prob"], 0.2)
             self.assertEqual(loaded["brc_halt_min_steps"], 2)
             self.assertEqual(loaded["brc_step_loss_schedule"], "quadratic")
+            self.assertEqual(loaded["brc_flow_kl_energy_weight"], 0.0001)
 
             eval_config_path = Path(tmpdir) / "eval.toml"
             eval_config_path.write_text(

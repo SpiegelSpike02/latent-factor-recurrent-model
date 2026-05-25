@@ -360,6 +360,8 @@ def brc_loss_and_metrics(
             diagnostics["selected_step"] = selected_step
     step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
     step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
+    per_step_flow_kl_energy = diagnostics["flow_kl_energy"].astype(jnp.float32)
+    flow_kl_energy_loss = jnp.sum(step_loss_weights * per_step_flow_kl_energy)
     solution_loss = per_step_loss[-1]
     halt_loss = zero
     if halt_loss_weight != 0.0:
@@ -369,7 +371,11 @@ def brc_loss_and_metrics(
             jnp.sum(example_mask) * diagnostics["halt_logits"].shape[0],
             1.0,
         )
-    loss = step_ce_loss + halt_loss_weight * halt_loss
+    loss = (
+        step_ce_loss
+        + float(model.brc.flow_kl_energy_weight) * flow_kl_energy_loss
+        + halt_loss_weight * halt_loss
+    )
 
     predictions = jnp.argmax(final_logits, axis=-1)
     metric_correct = (predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
@@ -407,6 +413,7 @@ def brc_loss_and_metrics(
         "ce_loss": step_ce_loss,
         "final_ce_loss": solution_loss,
         "mean_ce_loss": jnp.mean(per_step_loss),
+        "flow_kl_energy_loss": flow_kl_energy_loss,
         "final_target_probability": target_probability,
         "accuracy": cell_accuracy,
         "query_accuracy": query_accuracy,
@@ -588,11 +595,17 @@ def brc_act_loss_and_metrics(
             jnp.sum(example_mask),
             1.0,
         )
-    loss = ce_loss + halt_loss_weight * halt_loss
+    flow_kl_energy_loss = diagnostics["flow_kl_energy"].astype(jnp.float32)
+    loss = (
+        ce_loss
+        + float(model.brc.flow_kl_energy_weight) * flow_kl_energy_loss
+        + halt_loss_weight * halt_loss
+    )
     metrics = {
         "loss": loss,
         "ce_loss": ce_loss,
         "active_ce_loss": ce_loss,
+        "flow_kl_energy_loss": flow_kl_energy_loss,
         "completed_accuracy": accuracy,
         "completed_query_accuracy": query_accuracy,
         "completed_exact_accuracy": exact_accuracy,
