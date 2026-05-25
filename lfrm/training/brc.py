@@ -67,7 +67,10 @@ def build_brc_act_train_step_runner(halt_loss_weight: float = 0.0):
         optimizer.update(model, grads)
         return metrics, new_carry
 
-    return nnx.jit(train_step, donate_argnums=(2,))
+    # The carry also contains raw int inputs/labels for reset bookkeeping. Donating
+    # the whole pytree asks JAX to donate those non-reusable buffers and produces
+    # noisy "donated buffers were not usable" warnings on newer JAX versions.
+    return nnx.jit(train_step)
 
 
 def build_brc_step_carry_train_step_runner(halt_loss_weight: float = 0.0):
@@ -102,7 +105,9 @@ def build_brc_step_carry_train_step_runner(halt_loss_weight: float = 0.0):
         optimizer.update(model, grads)
         return metrics, new_carry
 
-    return nnx.jit(train_step, donate_argnums=(2,))
+    # See build_brc_act_train_step_runner: BRC carry contains non-donatable raw
+    # batch leaves, so avoid donating the full pytree.
+    return nnx.jit(train_step)
 
 
 def build_brc_dense_unroll_train_step_runner(halt_loss_weight: float = 0.0):
@@ -151,4 +156,6 @@ def build_eval_step_runner(
         )
         return metrics
 
-    return nnx.jit(eval_step_with_weight, donate_argnums=(1,))
+    # Eval batches are raw input/label pytrees; donation is not useful enough to
+    # justify the unusable-buffer warnings on integer leaves.
+    return nnx.jit(eval_step_with_weight)
