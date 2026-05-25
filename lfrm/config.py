@@ -31,16 +31,13 @@ class TRMConfig:
 
 @dataclass(frozen=True)
 class BRCConfig:
-    q_steps: int = 6
-    h_cycles: int = 1
+    commit_steps: int = 6
     refine_steps: int = 2
     block_depth: int = 1
-    gamma: float = 0.98
     hidden_state_dim: int = 0
     num_heads: int = 4
     mlp_ratio: int = 2
     local_kernel: int = 3
-    input_scale: float = 0.5
     attn_scale: float = 0.2
     local_scale: float = 0.2
     position_encoding: str = "rope"

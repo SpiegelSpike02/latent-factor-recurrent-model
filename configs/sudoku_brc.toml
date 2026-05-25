@@ -16,11 +16,9 @@ loss_type = "softmax"
 [model.brc]
 
 [model.brc.dynamics]
-q_steps = 16
-h_cycles = 3
+commit_steps = 48
 refine_steps = 4
 block_depth = 2
-gamma = 0.98
 step_loss_schedule = "uniform"
 
 [model.brc.hidden]
@@ -28,7 +26,6 @@ hidden_state_dim = 512
 num_heads = 8
 mlp_ratio = 4
 local_kernel = 3
-input_scale = 1.0
 attn_scale = 1.0
 local_scale = 1.0
 rms_norm_eps = 1e-5
@@ -82,5 +79,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-q-3clock-16x3x4x2-b768"
+name = "sudoku-brc-core-c48-r4-d2-b768"
 mode = "online"

@@ -148,7 +148,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=9,
                 d_model=16,
                 rollout_steps=1,
-                brc=BRCConfig(q_steps=1, num_heads=4),
+                brc=BRCConfig(commit_steps=1, num_heads=4),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),
@@ -274,7 +274,7 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 rollout_steps=2,
                 brc=BRCConfig(
-                    q_steps=2,
+                    commit_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
                 ),
@@ -288,7 +288,7 @@ class GridModelTests(unittest.TestCase):
         labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
         self.assertTrue(bool(jnp.all(model.context_mask(tokens) == (tokens > 1))))
         logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
-        final_only_logits, final_only_diagnostics = model.run_q_steps(
+        final_only_logits, final_only_diagnostics = model.run_commit_steps(
             tokens,
             train=False,
             return_final_only=True,
@@ -322,7 +322,7 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 rollout_steps=2,
                 brc=BRCConfig(
-                    q_steps=2,
+                    commit_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
                 ),
@@ -387,7 +387,7 @@ class GridModelTests(unittest.TestCase):
                 rollout_steps=2,
                 loss_type="stablemax",
                 brc=BRCConfig(
-                    q_steps=2,
+                    commit_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
                 ),
@@ -421,7 +421,7 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 rollout_steps=1,
                 brc=BRCConfig(
-                    q_steps=1,
+                    commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
                 ),
@@ -762,7 +762,7 @@ class GridModelTests(unittest.TestCase):
                     grid_width=9,
                     d_model=10,
                     rollout_steps=1,
-                    brc=BRCConfig(q_steps=1, num_heads=4),
+                    brc=BRCConfig(commit_steps=1, num_heads=4),
                 ),
                 RuntimeConfig(compute_dtype="float32"),
                 rngs=nnx.Rngs(0),
@@ -801,11 +801,9 @@ class GridModelTests(unittest.TestCase):
                 "d_model = 16\n"
                 "\n"
                 "[model.brc]\n"
-                "q_steps = 2\n"
-                "h_cycles = 2\n"
+                "commit_steps = 4\n"
                 "refine_steps = 4\n"
                 "block_depth = 1\n"
-                "gamma = 0.95\n"
                 "hidden_state_dim = 16\n"
                 "num_heads = 4\n"
                 "halt_exploration_prob = 0.2\n"
@@ -816,11 +814,9 @@ class GridModelTests(unittest.TestCase):
             loaded = load_toml_config(str(config_path))
             self.assertEqual(loaded["model_type"], "brc")
             self.assertEqual(loaded["task_type"], "sudoku")
-            self.assertEqual(loaded["brc_q_steps"], 2)
-            self.assertEqual(loaded["brc_h_cycles"], 2)
+            self.assertEqual(loaded["brc_commit_steps"], 4)
             self.assertEqual(loaded["brc_refine_steps"], 4)
             self.assertEqual(loaded["brc_block_depth"], 1)
-            self.assertEqual(loaded["brc_gamma"], 0.95)
             self.assertEqual(loaded["brc_hidden_state_dim"], 16)
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_halt_exploration_prob"], 0.2)

@@ -33,13 +33,12 @@ NESTED_SECTIONS = {
 }
 GROUPED_NESTED_KEYS = {
     "brc": {
-        "dynamics": {"q_steps", "h_cycles", "refine_steps", "block_depth", "gamma", "step_loss_schedule"},
+        "dynamics": {"commit_steps", "refine_steps", "block_depth", "step_loss_schedule"},
         "hidden": {
             "hidden_state_dim",
             "num_heads",
             "mlp_ratio",
             "local_kernel",
-            "input_scale",
             "attn_scale",
             "local_scale",
             "rms_norm_eps",
@@ -132,16 +131,13 @@ ALLOWED_NESTED_KEYS = {
         "step_loss_weights",
     },
     "brc": {
-        "q_steps",
-        "h_cycles",
+        "commit_steps",
         "refine_steps",
         "block_depth",
-        "gamma",
         "hidden_state_dim",
         "num_heads",
         "mlp_ratio",
         "local_kernel",
-        "input_scale",
         "attn_scale",
         "local_scale",
         "position_encoding",
@@ -303,16 +299,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--brc-q-steps", type=int, default=6)
-    parser.add_argument("--brc-h-cycles", type=int, default=1)
+    parser.add_argument("--brc-commit-steps", type=int, default=6)
     parser.add_argument("--brc-refine-steps", type=int, default=2)
     parser.add_argument("--brc-block-depth", type=int, default=1)
-    parser.add_argument("--brc-gamma", type=float, default=0.98)
     parser.add_argument("--brc-hidden-state-dim", type=int, default=0)
     parser.add_argument("--brc-num-heads", type=int, default=4)
     parser.add_argument("--brc-mlp-ratio", type=int, default=2)
     parser.add_argument("--brc-local-kernel", type=int, default=3)
-    parser.add_argument("--brc-input-scale", type=float, default=0.5)
     parser.add_argument("--brc-attn-scale", type=float, default=0.2)
     parser.add_argument("--brc-local-scale", type=float, default=0.2)
     parser.add_argument("--brc-position-encoding", choices=("rope", "learned", "none"), default="rope")
@@ -455,16 +448,13 @@ def build_config(
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
         brc=BRCConfig(
-            q_steps=args.brc_q_steps,
-            h_cycles=args.brc_h_cycles,
+            commit_steps=args.brc_commit_steps,
             refine_steps=args.brc_refine_steps,
             block_depth=args.brc_block_depth,
-            gamma=args.brc_gamma,
             hidden_state_dim=args.brc_hidden_state_dim,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,
             local_kernel=args.brc_local_kernel,
-            input_scale=args.brc_input_scale,
             attn_scale=args.brc_attn_scale,
             local_scale=args.brc_local_scale,
             position_encoding=args.brc_position_encoding,

@@ -168,7 +168,7 @@ def _brc_compact_training_rollout(
             has_selected,
         ) = carry
         step_index, step_dropout_key = scan_inputs
-        next_q, next_hidden, halt_logits, q_update_alpha = model._q_step(
+        next_q, next_hidden, halt_logits, flow_diagnostics = model._q_step(
             inputs,
             q,
             hidden_state,
@@ -212,7 +212,10 @@ def _brc_compact_training_rollout(
             q_confidence,
             halt_logits,
             step_exact.astype(jnp.float32),
-            jnp.mean(q_update_alpha.astype(jnp.float32)),
+            jnp.mean(flow_diagnostics["flow_speed"].astype(jnp.float32)),
+            jnp.mean(flow_diagnostics["proposal_distance"].astype(jnp.float32)),
+            jnp.mean(flow_diagnostics["q_delta"].astype(jnp.float32)),
+            jnp.mean(flow_diagnostics["flow_energy"].astype(jnp.float32)),
         )
 
     step_indices = jnp.arange(rollout_steps, dtype=jnp.int32)
@@ -251,7 +254,10 @@ def _brc_compact_training_rollout(
         q_confidence,
         halt_logits,
         per_step_exact,
-        q_update_alpha,
+        flow_speed,
+        proposal_distance,
+        q_delta,
+        flow_energy,
     ) = scan_outputs
     final_step = jnp.asarray(rollout_steps - 1, dtype=jnp.int32)
     final_logits = model._q_to_token_logits(q_final, inputs, final_step)
@@ -264,7 +270,10 @@ def _brc_compact_training_rollout(
         "final_candidate": final_candidate,
         "halt_logits": halt_logits,
         "per_step_exact": per_step_exact,
-        "q_update_alpha": q_update_alpha,
+        "flow_speed": flow_speed,
+        "proposal_distance": proposal_distance,
+        "q_delta": q_delta,
+        "flow_energy": flow_energy,
         "selected_candidate": selected_candidate,
         "selected_step": selected_step,
     }
@@ -320,7 +329,7 @@ def brc_loss_and_metrics(
             solve_key,
         )
     else:
-        step_logits, diagnostics = model.run_q_steps(
+        step_logits, diagnostics = model.run_commit_steps(
             inputs,
             initial_q=initial_q,
             train=train,
@@ -407,7 +416,10 @@ def brc_loss_and_metrics(
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "step_loss_weights": step_loss_weights,
         "q_confidence": q_confidence,
-        "q_update_alpha": jnp.mean(diagnostics["q_update_alpha"]),
+        "flow_speed": jnp.mean(diagnostics["flow_speed"]),
+        "proposal_distance": jnp.mean(diagnostics["proposal_distance"]),
+        "q_delta": jnp.mean(diagnostics["q_delta"]),
+        "flow_energy": jnp.mean(diagnostics["flow_energy"]),
     }
     if model.config.task_type == "sudoku":
         metrics.update(
@@ -421,7 +433,10 @@ def brc_loss_and_metrics(
             {
                 "per_step_loss": per_step_loss,
                 "per_step_q_confidence": per_step_q_confidence,
-                "per_step_q_update_alpha": diagnostics["q_update_alpha"],
+                "per_step_flow_speed": diagnostics["flow_speed"],
+                "per_step_proposal_distance": diagnostics["proposal_distance"],
+                "per_step_q_delta": diagnostics["q_delta"],
+                "per_step_flow_energy": diagnostics["flow_energy"],
             }
         )
     if halt_loss_weight != 0.0:
@@ -598,7 +613,10 @@ def brc_act_loss_and_metrics(
         "halted_rate": diagnostics["halted_rate"],
         "completed_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
-        "q_update_alpha": diagnostics["q_update_alpha"],
+        "flow_speed": diagnostics["flow_speed"],
+        "proposal_distance": diagnostics["proposal_distance"],
+        "q_delta": diagnostics["q_delta"],
+        "flow_energy": diagnostics["flow_energy"],
     }
     if model.config.task_type == "sudoku":
         metrics.update(
