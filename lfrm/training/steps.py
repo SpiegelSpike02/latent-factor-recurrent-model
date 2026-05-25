@@ -113,6 +113,11 @@ def _masked_probability(probability: jax.Array, mask: jax.Array) -> jax.Array:
     return jnp.sum(probability * mask_f32) / jnp.maximum(jnp.sum(mask_f32), 1.0)
 
 
+def _masked_logit_confidence(logits: jax.Array, mask: jax.Array) -> jax.Array:
+    confidence = jnp.max(jax.nn.softmax(logits.astype(jnp.float32), axis=-1), axis=-1)
+    return _masked_probability(confidence, mask)
+
+
 def _normalized_step_loss_weights(configured: tuple[float, ...] | None, rollout_steps: int) -> jax.Array:
     if configured is None:
         weights = jnp.arange(1, rollout_steps + 1, dtype=jnp.float32)
@@ -376,11 +381,17 @@ def brc_loss_and_metrics(
     target_probability = jnp.sum(target_probability_cells * loss_mask.astype(jnp.float32)) / normalizer
     context_target_probability = _masked_probability(target_probability_cells, context_mask)
     query_target_probability = _masked_probability(target_probability_cells, query_mask)
+    q_confidence = _masked_logit_confidence(final_logits, metric_loss_mask)
     if train:
         oracle_step = jnp.argmin(per_step_loss)
     else:
         per_step_example_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=-1) / per_example_normalizer[None, :]
         oracle_step = _masked_example_mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32), example_mask)
+        per_step_q_confidence = jnp.sum(
+            jnp.max(jax.nn.softmax(step_logits.astype(jnp.float32), axis=-1), axis=-1)
+            * step_loss_mask.astype(jnp.float32),
+            axis=(1, 2),
+        ) / normalizer
     metrics = {
         "loss": loss,
         "ce_loss": step_ce_loss,
@@ -394,7 +405,7 @@ def brc_loss_and_metrics(
         "query_target_probability": query_target_probability,
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "step_loss_weights": step_loss_weights,
-        "q_confidence": jnp.mean(diagnostics["q_confidence"]),
+        "q_confidence": q_confidence,
         "q_update_alpha": jnp.mean(diagnostics["q_update_alpha"]),
     }
     if model.config.task_type == "sudoku":
@@ -408,7 +419,7 @@ def brc_loss_and_metrics(
         metrics.update(
             {
                 "per_step_loss": per_step_loss,
-                "per_step_q_confidence": diagnostics["q_confidence"],
+                "per_step_q_confidence": per_step_q_confidence,
                 "per_step_q_update_alpha": diagnostics["q_update_alpha"],
             }
         )
