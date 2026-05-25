@@ -308,8 +308,8 @@ class GridModelTests(unittest.TestCase):
                 )
             )
         )
-        self.assertEqual(diagnostics["q_confidence"].shape, (2,))
-        self.assertEqual(final_only_diagnostics["q_confidence"].shape, (2,))
+        self.assertEqual(diagnostics["q_top1_probability"].shape, (2,))
+        self.assertEqual(final_only_diagnostics["q_top1_probability"].shape, (2,))
 
     def test_brc_losses_are_finite(self) -> None:
         model = BRCModel(
@@ -372,7 +372,7 @@ class GridModelTests(unittest.TestCase):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
         self.assertNotIn("per_step_loss", metrics)
-        self.assertNotIn("per_step_q_confidence", metrics)
+        self.assertNotIn("per_step_q_top1_probability", metrics)
         self.assertEqual(metrics["step_loss_weights"].shape, (2,))
     def test_brc_arc_canvas_belief_loss_is_finite(self) -> None:
         model = BRCModel(
@@ -399,7 +399,7 @@ class GridModelTests(unittest.TestCase):
         labels = jnp.asarray([[6, 7, 1, 0, 8, 9, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0]], dtype=jnp.int32)
         logits, diagnostics = model.forward_all_steps_with_diagnostics(inputs, train=False)
         self.assertEqual(logits.shape, (2, 1, 16, 12))
-        self.assertEqual(diagnostics["q_confidence"].shape, (2,))
+        self.assertEqual(diagnostics["q_top1_probability"].shape, (2,))
         batch = {
             "inputs": inputs,
             "labels": labels,

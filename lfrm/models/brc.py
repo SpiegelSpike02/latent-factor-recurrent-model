@@ -189,9 +189,9 @@ class BRCSolverBlock(nnx.Module):
 class BRCModel(nnx.Module):
     """Q-state recurrent solver for fixed-size grid reasoning tasks.
 
-    The recurrent state is the per-cell answer q on the class simplex.
-    q is read as a typed hypothesis hint; BRC does not learn a separate
-    per-cell confidence state.
+    The recurrent state stores centered log-q logits. Its softmax is the
+    per-cell explicit answer distribution, which is read as a typed hypothesis
+    hint; BRC does not learn a separate per-cell confidence state.
     """
 
     def __init__(
@@ -242,7 +242,6 @@ class BRCModel(nnx.Module):
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
         self.q_vocab_size = config.vocab_size
-        self.q_eps = 1e-6
         self.output_logit_eps = 1e-9
         self.box_height, self.box_width = self._box_shape(config.grid_height, config.grid_width)
 
@@ -379,21 +378,24 @@ class BRCModel(nnx.Module):
             return tokens > 1
         return tokens != 0
 
-    def _normalize_q(self, q: Array) -> Array:
-        q = jnp.maximum(q.astype(jnp.float32), self.q_eps)
-        return q / jnp.sum(q, axis=-1, keepdims=True)
+    def _center_q_logits(self, q_logits: Array) -> Array:
+        q_logits = q_logits.astype(jnp.float32)
+        return q_logits - jnp.mean(q_logits, axis=-1, keepdims=True)
+
+    def _normalize_q(self, q_logits: Array) -> Array:
+        """Return the explicit answer distribution from the stored log-q state."""
+        return jax.nn.softmax(q_logits.astype(jnp.float32), axis=-1)
 
     def _uniform_q(self, tokens: Array) -> Array:
-        return jnp.full(
+        # Zero centered logits represent the uniform answer distribution.
+        return jnp.zeros(
             (*tokens.shape, self.q_vocab_size),
-            1.0 / float(self.q_vocab_size),
             dtype=jnp.float32,
         )
 
-    def _q_to_output_logits(self, q: Array, tokens: Array) -> Array:
+    def _q_to_output_logits(self, q_logits: Array, tokens: Array) -> Array:
         del tokens
-        q = self._normalize_q(q)
-        return jnp.log(jnp.maximum(q, self.output_logit_eps))
+        return self._center_q_logits(q_logits)
 
     def initial_q(self, tokens: Array) -> Array:
         return self._uniform_q(tokens)
@@ -407,9 +409,9 @@ class BRCModel(nnx.Module):
             + self.box_embed(self.box_ids)
         )
 
-    def _q_embedding(self, tokens: Array, q: Array, step_index: Array) -> Array:
+    def _q_embedding(self, tokens: Array, q_logits: Array, step_index: Array) -> Array:
         del tokens, step_index
-        q = self._normalize_q(q)
+        q = self._normalize_q(q_logits)
         uniform = jnp.full_like(q, 1.0 / float(self.q_vocab_size))
         trusted_q = q - uniform
         embedding_table = maybe_cast(self.q_embed.embedding[: self.config.vocab_size], self.dtype)
@@ -442,34 +444,40 @@ class BRCModel(nnx.Module):
         del step_index
         return self._q_to_output_logits(q, tokens)
 
-    def _q_update(self, tokens: Array, q: Array, read_state: Array, step_index: Array) -> tuple[Array, dict[str, Array]]:
+    def _q_update(
+        self,
+        tokens: Array,
+        q_logits: Array,
+        read_state: Array,
+        step_index: Array,
+    ) -> tuple[Array, dict[str, Array]]:
         del tokens
-        current_q = self._normalize_q(q)
+        current_logits = self._center_q_logits(q_logits)
+        current_log_q = jax.nn.log_softmax(current_logits, axis=-1)
+        current_q = jnp.exp(current_log_q)
         class_logits = self.q_proposal_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
-        proposal_q = jax.nn.softmax(class_logits, axis=-1)
+        proposal_log_q = jax.nn.log_softmax(class_logits, axis=-1)
+        proposal_q = jnp.exp(proposal_log_q)
         flow_speed = jax.nn.sigmoid(
             self.q_update_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         )
-        log_q = jnp.log(jnp.maximum(current_q, self.output_logit_eps))
-        log_proposal = jnp.log(jnp.maximum(proposal_q, self.output_logit_eps))
-        next_q = jax.nn.softmax(
-            (1.0 - flow_speed) * log_q + flow_speed * log_proposal,
-            axis=-1,
-        )
+        next_logits = (1.0 - flow_speed) * current_log_q + flow_speed * proposal_log_q
+        next_logits = self._center_q_logits(next_logits)
+        next_q = jax.nn.softmax(next_logits, axis=-1)
 
-        proposal_distance = 0.5 * jnp.sum(jnp.abs(proposal_q - current_q), axis=-1, keepdims=True)
-        q_delta = 0.5 * jnp.sum(jnp.abs(next_q - current_q), axis=-1, keepdims=True)
-        kl_qp = jnp.sum(current_q * (log_q - log_proposal), axis=-1, keepdims=True)
-        kl_pq = jnp.sum(proposal_q * (log_proposal - log_q), axis=-1, keepdims=True)
+        proposal_tv_distance = 0.5 * jnp.sum(jnp.abs(proposal_q - current_q), axis=-1, keepdims=True)
+        q_tv_delta = 0.5 * jnp.sum(jnp.abs(next_q - current_q), axis=-1, keepdims=True)
+        kl_qp = jnp.sum(current_q * (current_log_q - proposal_log_q), axis=-1, keepdims=True)
+        kl_pq = jnp.sum(proposal_q * (proposal_log_q - current_log_q), axis=-1, keepdims=True)
         symmetric_kl = 0.5 * (kl_qp + kl_pq)
-        flow_energy = jnp.square(flow_speed) * symmetric_kl
+        flow_kl_energy = jnp.square(flow_speed) * symmetric_kl
         diagnostics = {
             "flow_speed": flow_speed,
-            "proposal_distance": proposal_distance,
-            "q_delta": q_delta,
-            "flow_energy": flow_energy,
+            "proposal_tv_distance": proposal_tv_distance,
+            "q_tv_delta": q_tv_delta,
+            "flow_kl_energy": flow_kl_energy,
         }
-        return next_q, diagnostics
+        return next_logits, diagnostics
 
     def _halt_logits(self, read_state: Array) -> Array:
         pooled = jnp.mean(read_state.astype(jnp.float32), axis=1)
@@ -526,9 +534,9 @@ class BRCModel(nnx.Module):
         halt_logits = jnp.zeros((tokens.shape[0],), dtype=jnp.float32)
         flow_diagnostics = {
             "flow_speed": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "proposal_distance": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "q_delta": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "flow_energy": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "proposal_tv_distance": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "q_tv_delta": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "flow_kl_energy": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
         }
         context_condition, q_condition = self._typed_conditions(
             tokens,
@@ -683,9 +691,9 @@ class BRCModel(nnx.Module):
             "halted_rate": jnp.mean(halted.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
             "flow_speed": jnp.mean(flow_diagnostics["flow_speed"].astype(jnp.float32)),
-            "proposal_distance": jnp.mean(flow_diagnostics["proposal_distance"].astype(jnp.float32)),
-            "q_delta": jnp.mean(flow_diagnostics["q_delta"].astype(jnp.float32)),
-            "flow_energy": jnp.mean(flow_diagnostics["flow_energy"].astype(jnp.float32)),
+            "proposal_tv_distance": jnp.mean(flow_diagnostics["proposal_tv_distance"].astype(jnp.float32)),
+            "q_tv_delta": jnp.mean(flow_diagnostics["q_tv_delta"].astype(jnp.float32)),
+            "flow_kl_energy": jnp.mean(flow_diagnostics["flow_kl_energy"].astype(jnp.float32)),
         }
         return new_carry, logits, diagnostics
 
@@ -722,15 +730,15 @@ class BRCModel(nnx.Module):
                 return next_carry, None
             logits = self._q_to_token_logits(next_q, tokens, step_index)
             confidence = jnp.max(self._normalize_q(next_q), axis=-1)
-            q_confidence = jnp.sum(confidence * query_mask) / query_normalizer
+            q_top1_probability = jnp.sum(confidence * query_mask) / query_normalizer
             return next_carry, (
                 logits,
-                q_confidence,
+                q_top1_probability,
                 halt_logits,
                 jnp.mean(flow_diagnostics["flow_speed"].astype(jnp.float32)),
-                jnp.mean(flow_diagnostics["proposal_distance"].astype(jnp.float32)),
-                jnp.mean(flow_diagnostics["q_delta"].astype(jnp.float32)),
-                jnp.mean(flow_diagnostics["flow_energy"].astype(jnp.float32)),
+                jnp.mean(flow_diagnostics["proposal_tv_distance"].astype(jnp.float32)),
+                jnp.mean(flow_diagnostics["q_tv_delta"].astype(jnp.float32)),
+                jnp.mean(flow_diagnostics["flow_kl_energy"].astype(jnp.float32)),
             )
 
         step_indices = jnp.arange(self.total_steps, dtype=jnp.int32)
@@ -756,32 +764,32 @@ class BRCModel(nnx.Module):
             final_step = jnp.asarray(self.total_steps - 1, dtype=jnp.int32)
             logits = self._q_to_token_logits(q_final, tokens, final_step)
             diagnostics = {
-                "q_confidence": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "q_top1_probability": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
                 "halt_logits": jnp.zeros((self.total_steps, tokens.shape[0]), dtype=jnp.float32),
                 "flow_speed": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "proposal_distance": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "q_delta": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "flow_energy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "proposal_tv_distance": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "q_tv_delta": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "flow_kl_energy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
             }
             return logits, diagnostics
         (
             step_logits,
-            q_confidence,
+            q_top1_probability,
             halt_logits,
             flow_speed,
-            proposal_distance,
-            q_delta,
-            flow_energy,
+            proposal_tv_distance,
+            q_tv_delta,
+            flow_kl_energy,
         ) = scan_outputs
         diagnostics = {
-            "q_confidence": q_confidence,
+            "q_top1_probability": q_top1_probability,
             "halt_logits": halt_logits,
             "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
             "flow_speed": flow_speed,
-            "proposal_distance": proposal_distance,
-            "q_delta": q_delta,
-            "flow_energy": flow_energy,
+            "proposal_tv_distance": proposal_tv_distance,
+            "q_tv_delta": q_tv_delta,
+            "flow_kl_energy": flow_kl_energy,
         }
         return step_logits, diagnostics
 

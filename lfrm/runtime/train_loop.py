@@ -65,11 +65,11 @@ from lfrm.training.metrics import (
 PER_STEP_SCALAR_SERIES = (
     ("per_step_loss", "loss_by_step"),
     ("per_step_accuracy", "accuracy_by_step"),
-    ("per_step_q_confidence", "q_confidence_by_step"),
+    ("per_step_q_top1_probability", "q_top1_probability_by_step"),
     ("per_step_flow_speed", "flow_speed_by_step"),
-    ("per_step_proposal_distance", "proposal_distance_by_step"),
-    ("per_step_q_delta", "q_delta_by_step"),
-    ("per_step_flow_energy", "flow_energy_by_step"),
+    ("per_step_proposal_tv_distance", "proposal_tv_distance_by_step"),
+    ("per_step_q_tv_delta", "q_tv_delta_by_step"),
+    ("per_step_flow_kl_energy", "flow_kl_energy_by_step"),
 )
 
 
