@@ -53,7 +53,7 @@ grad_clip_norm = 1.0
 
 [train]
 batch_size = 768
-epochs = 10000
+epochs = 50000
 log_epochs = 10
 train_mode = "step_carry"
 seed = 0

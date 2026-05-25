@@ -388,17 +388,22 @@ def brc_loss_and_metrics(
         "mean_ce_loss": jnp.mean(per_step_loss),
         "final_target_probability": target_probability,
         "accuracy": cell_accuracy,
-        "context_accuracy": context_accuracy,
         "query_accuracy": query_accuracy,
         "exact_accuracy": exact_accuracy,
         "exact_count": exact_count,
-        "context_target_probability": context_target_probability,
         "query_target_probability": query_target_probability,
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "step_loss_weights": step_loss_weights,
         "q_confidence": jnp.mean(diagnostics["q_confidence"]),
         "q_update_alpha": jnp.mean(diagnostics["q_update_alpha"]),
     }
+    if model.config.task_type == "sudoku":
+        metrics.update(
+            {
+                "context_accuracy": context_accuracy,
+                "context_target_probability": context_target_probability,
+            }
+        )
     if not train:
         metrics.update(
             {
@@ -562,20 +567,16 @@ def brc_act_loss_and_metrics(
         "ce_loss": ce_loss,
         "active_ce_loss": ce_loss,
         "completed_accuracy": accuracy,
-        "completed_context_accuracy": context_accuracy,
         "completed_query_accuracy": query_accuracy,
         "completed_exact_accuracy": exact_accuracy,
         "completed_exact_count": exact_count,
         "completed_target_probability": target_probability,
-        "completed_context_target_probability": context_target_probability,
         "completed_query_target_probability": query_target_probability,
         "completed_count": valid_halted_count,
         "active_accuracy": current_accuracy,
-        "active_context_accuracy": current_context_accuracy,
         "active_query_accuracy": current_query_accuracy,
         "active_exact_accuracy": _masked_example_mean(exact_f32, example_mask),
         "active_target_probability": active_target_probability,
-        "active_context_target_probability": active_context_target_probability,
         "active_query_target_probability": active_query_target_probability,
         "carry_step": diagnostics["act_step"],
         "act_step": diagnostics["act_step"],
@@ -588,6 +589,14 @@ def brc_act_loss_and_metrics(
         "q_update_alpha": diagnostics["q_update_alpha"],
     }
     if model.config.task_type == "sudoku":
+        metrics.update(
+            {
+                "completed_context_accuracy": context_accuracy,
+                "completed_context_target_probability": context_target_probability,
+                "active_context_accuracy": current_context_accuracy,
+                "active_context_target_probability": active_context_target_probability,
+            }
+        )
         context_consistency, conflicts = _sudoku_board_metrics(model, predictions, inputs)
         metrics.update(
             {

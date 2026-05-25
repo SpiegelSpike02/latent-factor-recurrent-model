@@ -397,6 +397,12 @@ def metric_display_name(name: str) -> str:
 
 def scalar_metric_names(config) -> tuple[str, ...]:
     names = list(BRC_SCALAR_METRICS if config.model.model_type == "brc" else CORE_SCALAR_METRICS)
+    if config.model.model_type == "brc" and config.model.task_type != "sudoku":
+        names = [
+            name for name in names
+            if "context_" not in name
+            and name not in ("context_accuracy", "context_target_probability", "context_consistency", "conflicts")
+        ]
     brc_halt_enabled = (
         config.model.model_type == "brc"
         and config.train.halt_loss_weight != 0.0
