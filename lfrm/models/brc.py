@@ -129,6 +129,23 @@ class BRCSolverBlock(nnx.Module):
         rope_cos: Array | None,
         rope_sin: Array | None,
     ) -> Array:
+        h = self.global_communicate(
+            h,
+            context_condition,
+            q_condition,
+            rope_cos,
+            rope_sin,
+        )
+        return self.local_think(h, context_condition, q_condition)
+
+    def global_communicate(
+        self,
+        h: Array,
+        context_condition: Array,
+        q_condition: Array,
+        rope_cos: Array | None,
+        rope_sin: Array | None,
+    ) -> Array:
         input_scale = float(self.config.brc_config.input_scale)
         route_condition = input_scale * context_condition.astype(jnp.float32)
         q_hint = q_condition.astype(jnp.float32)
@@ -146,7 +163,17 @@ class BRCSolverBlock(nnx.Module):
             rope_sin=rope_sin,
             name="BRC self attention",
         )
-        h = (h.astype(jnp.float32) + self.attn_scale * attn.astype(jnp.float32)).astype(self.dtype)
+        return (h.astype(jnp.float32) + self.attn_scale * attn.astype(jnp.float32)).astype(self.dtype)
+
+    def local_think(
+        self,
+        h: Array,
+        context_condition: Array,
+        q_condition: Array,
+    ) -> Array:
+        input_scale = float(self.config.brc_config.input_scale)
+        route_condition = input_scale * context_condition.astype(jnp.float32)
+        q_hint = q_condition.astype(jnp.float32)
         local_base = self.local_norm(h.astype(jnp.float32) + route_condition).astype(self.dtype)
         local_input = (local_base.astype(jnp.float32) + q_hint).astype(self.dtype)
         local = self.local_mlp(local_input).astype(jnp.float32)
@@ -206,6 +233,7 @@ class BRCModel(nnx.Module):
         self.brc = brc
         self.q_steps = int(brc.q_steps)
         self.h_cycles = int(brc.h_cycles)
+        self.total_steps = self.q_steps * self.h_cycles
         self.refine_steps = int(brc.refine_steps)
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
@@ -417,7 +445,7 @@ class BRCModel(nnx.Module):
         return self._q_to_output_logits(q, tokens)
 
     def _trust_gamma(self, step_index: Array) -> Array:
-        progress = (step_index.astype(jnp.float32) + 1.0) / float(self.q_steps)
+        progress = (step_index.astype(jnp.float32) + 1.0) / float(self.total_steps)
         return float(self.brc.gamma) * jnp.square(progress)
 
     def _q_update(self, tokens: Array, q: Array, read_state: Array, step_index: Array) -> tuple[Array, Array]:
@@ -436,29 +464,27 @@ class BRCModel(nnx.Module):
         pooled = jnp.mean(read_state.astype(jnp.float32), axis=1)
         return self.halt_head(maybe_cast(pooled, self.dtype)).astype(jnp.float32)[..., 0]
 
-    def _hidden_l_cycle(
+    def _hidden_h_cycle(
         self,
         hidden_state: Array,
         context_condition: Array,
         q_condition: Array,
     ) -> Array:
         hidden = hidden_state.astype(self.dtype)
-        def hidden_cycle(carry: Array) -> Array:
-            hidden_cycle_state = carry
-            for _ in range(self.refine_steps):
-                for block in self.solver_blocks:
-                    hidden_cycle_state = block(
-                        hidden_cycle_state,
-                        context_condition,
-                        q_condition,
-                        self.rope_cos,
-                        self.rope_sin,
-                    )
-            return hidden_cycle_state
-
-        for _ in range(self.h_cycles - 1):
-            hidden = jax.lax.stop_gradient(hidden_cycle(hidden))
-        hidden = hidden_cycle(hidden)
+        # Within an h-cycle, cheap local propagation runs for every refine step.
+        # The expensive all-to-all attention is reserved for the cycle boundary,
+        # immediately before q commit / halt.
+        for _ in range(self.refine_steps):
+            for block in self.solver_blocks:
+                hidden = block.local_think(hidden, context_condition, q_condition)
+        for block in self.solver_blocks:
+            hidden = block.global_communicate(
+                hidden,
+                context_condition,
+                q_condition,
+                self.rope_cos,
+                self.rope_sin,
+            )
         return hidden
 
     def _readout_fuse(
@@ -500,7 +526,7 @@ class BRCModel(nnx.Module):
             dropout_key=dropout_key,
         )
         hidden_state = jax.lax.stop_gradient(hidden_state) if stop_hidden_between_steps else hidden_state
-        hidden_state = self._hidden_l_cycle(
+        hidden_state = self._hidden_h_cycle(
             hidden_state,
             context_condition,
             q_condition,
@@ -588,7 +614,7 @@ class BRCModel(nnx.Module):
         steps = jnp.where(reset, 0, carry["steps"])
 
         base_embeddings, _context = self.context_memory(inputs)
-        step_index = jnp.minimum(steps, self.q_steps - 1)
+        step_index = jnp.minimum(steps, self.total_steps - 1)
         reset_q = self.initial_q(inputs)
         q = jnp.where(reset_state, reset_q, carry["q"])
         reset_hidden = self.initial_hidden_state(
@@ -611,19 +637,19 @@ class BRCModel(nnx.Module):
         )
         logits = self._q_to_token_logits(next_q, inputs, step_index)
         new_steps = steps + 1
-        is_last_step = new_steps >= self.q_steps
+        is_last_step = new_steps >= self.total_steps
         if train and enable_halt:
             halted = is_last_step | (halt_logits > 0.0)
-            min_halt_steps = min(int(self.brc.halt_min_steps), self.q_steps)
+            min_halt_steps = min(int(self.brc.halt_min_steps), self.total_steps)
             min_steps = jnp.full_like(new_steps, min_halt_steps)
-            if self.q_steps > 1 and self.brc.halt_exploration_prob > 0.0:
+            if self.total_steps > 1 and self.brc.halt_exploration_prob > 0.0:
                 explore_key, min_step_key = jax.random.split(dropout_key)
                 explore = jax.random.uniform(explore_key, halt_logits.shape) < self.brc.halt_exploration_prob
                 random_step = jax.random.randint(
                     min_step_key,
                     halt_logits.shape,
                     min_halt_steps,
-                    self.q_steps + 1,
+                    self.total_steps + 1,
                 )
                 min_steps = jnp.where(explore, random_step, min_steps)
             halted = halted & (new_steps >= min_steps)
@@ -688,11 +714,11 @@ class BRCModel(nnx.Module):
                 jnp.mean(q_update_alpha.astype(jnp.float32)),
             )
 
-        step_indices = jnp.arange(self.q_steps, dtype=jnp.int32)
+        step_indices = jnp.arange(self.total_steps, dtype=jnp.int32)
         if dropout_key is None:
-            step_dropout_keys = jax.random.split(jax.random.key(0), self.q_steps)
+            step_dropout_keys = jax.random.split(jax.random.key(0), self.total_steps)
         else:
-            step_dropout_keys = jax.random.split(dropout_key, self.q_steps)
+            step_dropout_keys = jax.random.split(dropout_key, self.total_steps)
         initial_hidden = self.initial_hidden_state(
             tokens,
             initial_q,
@@ -708,13 +734,13 @@ class BRCModel(nnx.Module):
         )
         q_final, _hidden_final = final_carry
         if return_final_only:
-            final_step = jnp.asarray(self.q_steps - 1, dtype=jnp.int32)
+            final_step = jnp.asarray(self.total_steps - 1, dtype=jnp.int32)
             logits = self._q_to_token_logits(q_final, tokens, final_step)
             diagnostics = {
-                "q_confidence": jnp.zeros((self.q_steps,), dtype=jnp.float32),
-                "unroll_steps": jnp.asarray(self.q_steps, dtype=jnp.float32),
-                "halt_logits": jnp.zeros((self.q_steps, tokens.shape[0]), dtype=jnp.float32),
-                "q_update_alpha": jnp.zeros((self.q_steps,), dtype=jnp.float32),
+                "q_confidence": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
+                "halt_logits": jnp.zeros((self.total_steps, tokens.shape[0]), dtype=jnp.float32),
+                "q_update_alpha": jnp.zeros((self.total_steps,), dtype=jnp.float32),
             }
             return logits, diagnostics
         (
@@ -726,7 +752,7 @@ class BRCModel(nnx.Module):
         diagnostics = {
             "q_confidence": q_confidence,
             "halt_logits": halt_logits,
-            "unroll_steps": jnp.asarray(self.q_steps, dtype=jnp.float32),
+            "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
             "q_update_alpha": q_update_alpha,
         }
         return step_logits, diagnostics

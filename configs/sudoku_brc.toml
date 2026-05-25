@@ -39,7 +39,7 @@ rope_theta = 10000.0
 
 [model.brc.halt]
 halt_exploration_prob = 0.1
-halt_min_steps = 1
+halt_min_steps = 3
 
 [optimizer]
 optimizer_type = "adamw"
@@ -82,5 +82,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-q-dualtime-16x12x2-b64"
+name = "sudoku-brc-q-3clock-16x3x4x2-b768"
 mode = "online"

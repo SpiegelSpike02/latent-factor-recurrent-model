@@ -154,7 +154,8 @@ def _brc_compact_training_rollout(
     supervised_cells_per_example = jnp.sum(loss_mask_f32, axis=-1)
     candidate_init = jnp.zeros_like(inputs)
     early_index = jnp.asarray(0, dtype=jnp.int32)
-    mid_index = jnp.asarray(model.q_steps // 2, dtype=jnp.int32)
+    rollout_steps = int(model.total_steps)
+    mid_index = jnp.asarray(rollout_steps // 2, dtype=jnp.int32)
 
     def scan_step(carry, scan_inputs):
         (
@@ -190,7 +191,7 @@ def _brc_compact_training_rollout(
             True,
         )
         step_halted = halt_logits > 0.0
-        step_halted = jnp.where(step_index == model.q_steps - 1, True, step_halted)
+        step_halted = jnp.where(step_index == rollout_steps - 1, True, step_halted)
         take_selected = step_halted & (~has_selected)
         selected_candidate = jnp.where(take_selected[:, None], predictions, selected_candidate)
         selected_step = jnp.where(take_selected, step_index, selected_step)
@@ -214,8 +215,8 @@ def _brc_compact_training_rollout(
             jnp.mean(q_update_alpha.astype(jnp.float32)),
         )
 
-    step_indices = jnp.arange(model.q_steps, dtype=jnp.int32)
-    step_dropout_keys = jax.random.split(dropout_key, model.q_steps)
+    step_indices = jnp.arange(rollout_steps, dtype=jnp.int32)
+    step_dropout_keys = jax.random.split(dropout_key, rollout_steps)
     initial_hidden = model.initial_hidden_state(
         inputs,
         initial_q,
@@ -229,7 +230,7 @@ def _brc_compact_training_rollout(
         candidate_init,
         candidate_init,
         candidate_init,
-        jnp.full((inputs.shape[0],), model.q_steps - 1, dtype=jnp.int32),
+        jnp.full((inputs.shape[0],), rollout_steps - 1, dtype=jnp.int32),
         jnp.zeros((inputs.shape[0],), dtype=bool),
     )
     (
@@ -252,12 +253,12 @@ def _brc_compact_training_rollout(
         per_step_exact,
         q_update_alpha,
     ) = scan_outputs
-    final_step = jnp.asarray(model.q_steps - 1, dtype=jnp.int32)
+    final_step = jnp.asarray(rollout_steps - 1, dtype=jnp.int32)
     final_logits = model._q_to_token_logits(q_final, inputs, final_step)
     final_candidate = jnp.argmax(final_logits, axis=-1).astype(jnp.int32)
     diagnostics = {
         "q_confidence": q_confidence,
-        "unroll_steps": jnp.asarray(model.q_steps, dtype=jnp.float32),
+        "unroll_steps": jnp.asarray(rollout_steps, dtype=jnp.float32),
         "early_candidate": early_candidate,
         "mid_candidate": mid_candidate,
         "final_candidate": final_candidate,

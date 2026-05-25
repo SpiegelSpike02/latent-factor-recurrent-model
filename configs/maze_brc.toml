@@ -39,7 +39,7 @@ rope_theta = 10000.0
 
 [model.brc.halt]
 halt_exploration_prob = 0.1
-halt_min_steps = 1
+halt_min_steps = 3
 
 [optimizer]
 optimizer_type = "adamw"
@@ -53,7 +53,7 @@ grad_clip_norm = 1.0
 
 [train]
 batch_size = 128
-epochs = 10000
+epochs = 50000
 log_epochs = 10
 train_mode = "step_carry"
 seed = 0
@@ -82,5 +82,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-brc-q-dualtime-16x12x2-b64-adamw"
+name = "maze-brc-q-3clock-16x3x4x2-b128-adamw"
 mode = "online"
