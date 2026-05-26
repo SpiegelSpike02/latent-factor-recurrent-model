@@ -819,7 +819,6 @@ class GridModelTests(unittest.TestCase):
                 "commit_steps = 4\n"
                 "refine_steps = 4\n"
                 "block_depth = 1\n"
-                "trajectory_window = 3\n"
                 "hidden_state_dim = 16\n"
                 "num_heads = 4\n"
                 "step_loss_schedule = \"quadratic\"\n"
@@ -838,7 +837,6 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_commit_steps"], 4)
             self.assertEqual(loaded["brc_refine_steps"], 4)
             self.assertEqual(loaded["brc_block_depth"], 1)
-            self.assertEqual(loaded["brc_trajectory_window"], 3)
             self.assertEqual(loaded["brc_hidden_state_dim"], 16)
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_step_loss_schedule"], "quadratic")

@@ -215,8 +215,6 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC commit_steps must be at least 1")
         if min(brc.refine_steps, brc.block_depth) < 1:
             raise ValueError("BRC refine_steps and block_depth must be at least 1")
-        if brc.trajectory_window < 1:
-            raise ValueError("BRC trajectory_window must be at least 1")
         hidden_dim = int(brc.hidden_state_dim) if brc.hidden_state_dim > 0 else config.d_model
         if hidden_dim < 1:
             raise ValueError("BRC hidden_state_dim must be positive or 0 for d_model")
@@ -250,7 +248,7 @@ class BRCModel(nnx.Module):
         self.commit_steps = int(brc.commit_steps)
         self.total_steps = self.commit_steps
         self.refine_steps = int(brc.refine_steps)
-        self.trajectory_window = int(brc.trajectory_window)
+        self.trajectory_length = self.total_steps
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
@@ -423,7 +421,7 @@ class BRCModel(nnx.Module):
     def initial_trajectory(self, tokens: Array, q_logits: Array | None = None) -> Array:
         if q_logits is None:
             q_logits = self.initial_q(tokens)
-        return jnp.repeat(q_logits[:, None, :, :], self.trajectory_window, axis=1)
+        return jnp.repeat(q_logits[:, None, :, :], self.trajectory_length, axis=1)
 
     def initial_trajectory_count(self, tokens: Array) -> Array:
         return jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
@@ -447,15 +445,10 @@ class BRCModel(nnx.Module):
         trajectory_count: Array,
     ) -> tuple[Array, Array]:
         q_logits = q_logits.astype(jnp.float32)
-        next_count = jnp.minimum(trajectory_count + 1, self.trajectory_window)
-        if self.trajectory_window == 1:
-            return q_logits[:, None, :, :], next_count
-        is_full = trajectory_count >= self.trajectory_window
-        shifted = jnp.concatenate((trajectory[:, 1:], q_logits[:, None, :, :]), axis=1)
-        insert_index = jnp.minimum(trajectory_count, self.trajectory_window - 1)
-        insert_mask = jax.nn.one_hot(insert_index, self.trajectory_window, dtype=bool)
-        inserted = jnp.where(insert_mask[:, :, None, None], q_logits[:, None, :, :], trajectory)
-        next_trajectory = jnp.where(is_full[:, None, None, None], shifted, inserted)
+        next_count = jnp.minimum(trajectory_count + 1, self.trajectory_length)
+        insert_index = jnp.minimum(trajectory_count, self.trajectory_length - 1)
+        insert_mask = jax.nn.one_hot(insert_index, self.trajectory_length, dtype=bool)
+        next_trajectory = jnp.where(insert_mask[:, :, None, None], q_logits[:, None, :, :], trajectory)
         return next_trajectory, next_count
 
     def _position_embeddings(self) -> Array:
@@ -475,6 +468,10 @@ class BRCModel(nnx.Module):
         step_index: Array,
     ) -> Array:
         del tokens, step_index
+        time_index = jnp.arange(self.trajectory_length, dtype=jnp.int32)
+        valid = time_index[None, :] < trajectory_count[:, None]
+        valid_f = valid.astype(jnp.float32)[:, :, None, None]
+        count = jnp.maximum(trajectory_count.astype(jnp.float32), 1.0)[:, None, None]
         current_index = jnp.maximum(trajectory_count - 1, 0)
         previous_index = jnp.maximum(trajectory_count - 2, 0)
         previous2_index = jnp.maximum(trajectory_count - 3, 0)
@@ -482,24 +479,37 @@ class BRCModel(nnx.Module):
         has_previous = (trajectory_count >= 2)[:, None, None]
         has_previous2 = (trajectory_count >= 3)[:, None, None]
 
+        centered_trajectory = self._center_q_logits(trajectory)
+        trajectory_q = jax.nn.softmax(centered_trajectory, axis=-1)
+        uniform = jnp.full_like(trajectory_q, 1.0 / float(self.q_vocab_size))
+        trajectory_direction = jnp.where(valid_f.astype(bool), trajectory_q - uniform, 0.0)
+        mean_direction = jnp.sum(trajectory_direction, axis=1) / count
+
         q_logits = self._center_q_logits(self._history_at(trajectory, current_index))
         q_logits = jnp.where(has_current, q_logits, jnp.zeros_like(q_logits))
         q = self._normalize_q(q_logits)
-        uniform = jnp.full_like(q, 1.0 / float(self.q_vocab_size))
-        direction = jnp.where(has_current, q - uniform, jnp.zeros_like(q))
-        if self.trajectory_window >= 2:
-            previous = self._center_q_logits(self._history_at(trajectory, previous_index))
-            history_delta = self._center_q_logits(q_logits - previous)
-            history_delta = jnp.where(has_previous, history_delta, jnp.zeros_like(history_delta))
-        else:
-            history_delta = jnp.zeros_like(q_logits)
-        if self.trajectory_window >= 3:
-            previous = self._center_q_logits(self._history_at(trajectory, previous_index))
-            previous2 = self._center_q_logits(self._history_at(trajectory, previous2_index))
-            acceleration = self._center_q_logits(q_logits - 2.0 * previous + previous2)
-            acceleration = jnp.where(has_previous2, acceleration, jnp.zeros_like(acceleration))
-        else:
-            acceleration = jnp.zeros_like(q_logits)
+        latest_direction = jnp.where(has_current, q - uniform[:, 0], jnp.zeros_like(q))
+        direction = latest_direction + mean_direction
+
+        previous = self._center_q_logits(self._history_at(trajectory, previous_index))
+        previous2 = self._center_q_logits(self._history_at(trajectory, previous2_index))
+        latest_delta = self._center_q_logits(q_logits - previous)
+        latest_delta = jnp.where(has_previous, latest_delta, jnp.zeros_like(latest_delta))
+        pair_valid = (time_index[None, 1:] < trajectory_count[:, None]).astype(jnp.float32)[:, :, None, None]
+        pair_count = jnp.maximum((trajectory_count - 1).astype(jnp.float32), 1.0)[:, None, None]
+        trajectory_delta = self._center_q_logits(centered_trajectory[:, 1:] - centered_trajectory[:, :-1])
+        mean_delta = jnp.sum(trajectory_delta * pair_valid, axis=1) / pair_count
+        history_delta = latest_delta + mean_delta
+
+        latest_acceleration = self._center_q_logits(q_logits - 2.0 * previous + previous2)
+        latest_acceleration = jnp.where(has_previous2, latest_acceleration, jnp.zeros_like(latest_acceleration))
+        accel_valid = (time_index[None, 2:] < trajectory_count[:, None]).astype(jnp.float32)[:, :, None, None]
+        accel_count = jnp.maximum((trajectory_count - 2).astype(jnp.float32), 1.0)[:, None, None]
+        trajectory_acceleration = self._center_q_logits(
+            centered_trajectory[:, 2:] - 2.0 * centered_trajectory[:, 1:-1] + centered_trajectory[:, :-2]
+        )
+        mean_acceleration = jnp.sum(trajectory_acceleration * accel_valid, axis=1) / accel_count
+        acceleration = latest_acceleration + mean_acceleration
         embedding_table = maybe_cast(self.trajectory_embed.embedding[: self.q_vocab_size], self.dtype)
         direction_embedding = jnp.einsum(
             "bnd,dk->bnk",
@@ -726,7 +736,7 @@ class BRCModel(nnx.Module):
         target_logits = self.target_q_logits(targets)
         base_embeddings, _context = self.context_memory(tokens)
         target_trajectory = self.initial_trajectory(tokens, target_logits)
-        target_trajectory_count = jnp.full((tokens.shape[0],), self.trajectory_window, dtype=jnp.int32)
+        target_trajectory_count = jnp.full((tokens.shape[0],), self.trajectory_length, dtype=jnp.int32)
         hidden = self.initial_hidden_state(
             tokens,
             target_logits,

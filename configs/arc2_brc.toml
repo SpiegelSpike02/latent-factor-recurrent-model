@@ -20,7 +20,6 @@ loss_type = "softmax"
 commit_steps = 48
 refine_steps = 4
 block_depth = 2
-trajectory_window = 3
 step_loss_schedule = "uniform"
 descent_step_size = 0.3
 descent_rms_clip = 1.0

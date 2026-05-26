@@ -34,7 +34,6 @@ class BRCConfig:
     commit_steps: int = 6
     refine_steps: int = 2
     block_depth: int = 1
-    trajectory_window: int = 3
     hidden_state_dim: int = 0
     num_heads: int = 4
     mlp_ratio: int = 2
