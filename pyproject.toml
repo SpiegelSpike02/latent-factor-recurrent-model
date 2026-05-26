@@ -23,7 +23,7 @@ lfrm-train = "lfrm.cli:main"
 lfrm-build-sudoku = "lfrm.scripts.build_sudoku_dataset:main"
 lfrm-build-maze = "lfrm.scripts.build_maze_dataset:main"
 lfrm-build-arc = "lfrm.scripts.build_arc_dataset:main"
-lfrm-debug-single-brc-act = "lfrm.scripts.debug_single_brc_act:main"
+lfrm-debug-single-brc = "lfrm.scripts.debug_single_brc:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["lfrm"]

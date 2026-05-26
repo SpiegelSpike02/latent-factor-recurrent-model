@@ -15,19 +15,43 @@ dropout_rate = 0.0
 loss_type = "softmax"
 
 [model.brc]
+
+[model.brc.dynamics]
 commit_steps = 48
 refine_steps = 4
 block_depth = 2
+trajectory_window = 3
+step_loss_schedule = "uniform"
+descent_step_size = 0.3
+descent_rms_clip = 1.0
+
+[model.brc.objective]
+path_energy_weight = 1e-4
+fixed_point_update_weight = 1e-4
+fixed_point_label_smoothing = 1e-3
+
+[model.brc.early_stop]
+early_stop_enabled = true
+early_stop_min_steps = 4
+early_stop_patience = 2
+early_stop_energy_grad_threshold = 1e-2
+early_stop_distribution_delta_threshold = 1e-3
+early_stop_flip_threshold = 0.0
+early_stop_margin_threshold = 0.5
+early_stop_require_constraints = false
+
+[model.brc.hidden]
 hidden_state_dim = 256
 num_heads = 8
 mlp_ratio = 4
 local_kernel = 3
 attn_scale = 0.2
 local_scale = 0.2
-position_encoding = "rope"
 rms_norm_eps = 1e-5
+
+[model.brc.position]
+position_encoding = "rope"
 rope_theta = 10000.0
-step_loss_schedule = "uniform"
 
 [optimizer]
 optimizer_type = "adam_atan2"
@@ -43,6 +67,7 @@ grad_clip_norm = 1.0
 batch_size = 768
 epochs = 100000
 log_epochs = 10
+train_mode = "step_carry"
 seed = 0
 checkpoint_dir = "checkpoints"
 

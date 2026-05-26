@@ -34,7 +34,7 @@ class BRCConfig:
     commit_steps: int = 6
     refine_steps: int = 2
     block_depth: int = 1
-    q_window: int = 3
+    trajectory_window: int = 3
     hidden_state_dim: int = 0
     num_heads: int = 4
     mlp_ratio: int = 2
@@ -45,7 +45,19 @@ class BRCConfig:
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     step_loss_schedule: str = "uniform"
-    flow_energy_weight: float = 1e-4
+    descent_step_size: float = 0.3
+    descent_rms_clip: float = 1.0
+    path_energy_weight: float = 1e-4
+    fixed_point_update_weight: float = 0.0
+    fixed_point_label_smoothing: float = 1e-3
+    early_stop_enabled: bool = True
+    early_stop_min_steps: int = 4
+    early_stop_patience: int = 2
+    early_stop_energy_grad_threshold: float = 1e-2
+    early_stop_distribution_delta_threshold: float = 1e-3
+    early_stop_flip_threshold: float = 0.0
+    early_stop_margin_threshold: float = 0.5
+    early_stop_require_constraints: bool = True
 
 
 @dataclass(frozen=True)

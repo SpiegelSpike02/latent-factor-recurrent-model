@@ -127,29 +127,31 @@ class BRCSolverBlock(nnx.Module):
         self,
         h: Array,
         context_condition: Array,
-        q_condition: Array,
+        trajectory_condition: Array,
         rope_cos: Array | None,
         rope_sin: Array | None,
     ) -> Array:
         h = self.global_communicate(
             h,
             context_condition,
-            q_condition,
+            trajectory_condition,
             rope_cos,
             rope_sin,
         )
-        return self.local_think(h, context_condition, q_condition)
+        return self.local_think(h, context_condition, trajectory_condition)
 
     def global_communicate(
         self,
         h: Array,
         context_condition: Array,
-        q_condition: Array,
+        trajectory_condition: Array,
         rope_cos: Array | None,
         rope_sin: Array | None,
     ) -> Array:
         route_condition = self.attn_context_norm(context_condition.astype(jnp.float32)).astype(jnp.float32)
-        q_hint = q_condition.astype(jnp.float32)
+        q_hint = trajectory_condition.astype(jnp.float32)
+        # Attention routing is anchored by the hidden workspace and hard context.
+        # The stopped q/history signal is only a value hint for energy-context construction.
         route = (
             self.attn_norm(h.astype(jnp.float32)).astype(jnp.float32)
             + route_condition
@@ -165,7 +167,7 @@ class BRCSolverBlock(nnx.Module):
             dtype=self.dtype,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
-            name="BRC self attention",
+            name="BRC energy-context attention",
         )
         return (h.astype(jnp.float32) + self.attn_scale * attn.astype(jnp.float32)).astype(self.dtype)
 
@@ -173,14 +175,15 @@ class BRCSolverBlock(nnx.Module):
         self,
         h: Array,
         context_condition: Array,
-        q_condition: Array,
+        trajectory_condition: Array,
     ) -> Array:
         route_condition = self.local_context_norm(context_condition.astype(jnp.float32)).astype(jnp.float32)
-        q_hint = q_condition.astype(jnp.float32)
+        q_hint = trajectory_condition.astype(jnp.float32)
         local_base = (
             self.local_norm(h.astype(jnp.float32)).astype(jnp.float32)
             + route_condition
         ).astype(self.dtype)
+        # Local mixing has fixed spatial routing, so it can safely consume the q hint.
         local_input = (local_base.astype(jnp.float32) + q_hint).astype(self.dtype)
         local = self.local_mlp(local_input).astype(jnp.float32)
         return (h.astype(jnp.float32) + self.local_scale * local).astype(self.dtype)
@@ -212,8 +215,8 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC commit_steps must be at least 1")
         if min(brc.refine_steps, brc.block_depth) < 1:
             raise ValueError("BRC refine_steps and block_depth must be at least 1")
-        if brc.q_window < 1:
-            raise ValueError("BRC q_window must be at least 1")
+        if brc.trajectory_window < 1:
+            raise ValueError("BRC trajectory_window must be at least 1")
         hidden_dim = int(brc.hidden_state_dim) if brc.hidden_state_dim > 0 else config.d_model
         if hidden_dim < 1:
             raise ValueError("BRC hidden_state_dim must be positive or 0 for d_model")
@@ -231,13 +234,23 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC axial RoPE head dimension must be divisible by 4")
         if brc.step_loss_schedule not in ("uniform", "linear", "quadratic"):
             raise ValueError("BRC step_loss_schedule must be 'uniform', 'linear', or 'quadratic'")
+        if brc.descent_step_size <= 0.0:
+            raise ValueError("BRC descent_step_size must be positive")
+        if brc.descent_rms_clip <= 0.0:
+            raise ValueError("BRC descent_rms_clip must be positive")
+        if brc.fixed_point_label_smoothing < 0.0 or brc.fixed_point_label_smoothing >= 1.0:
+            raise ValueError("BRC fixed_point_label_smoothing must be in [0, 1)")
+        if brc.early_stop_min_steps < 1:
+            raise ValueError("BRC early_stop_min_steps must be at least 1")
+        if brc.early_stop_patience < 1:
+            raise ValueError("BRC early_stop_patience must be at least 1")
         self.config = config
         self.runtime = runtime
         self.brc = brc
         self.commit_steps = int(brc.commit_steps)
         self.total_steps = self.commit_steps
         self.refine_steps = int(brc.refine_steps)
-        self.q_window = int(brc.q_window)
+        self.trajectory_window = int(brc.trajectory_window)
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
@@ -272,7 +285,7 @@ class BRCModel(nnx.Module):
             rngs=rngs,
         )
         self.context_embed = nnx.Embed(2, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.q_embed = nnx.Embed(
+        self.trajectory_embed = nnx.Embed(
             max(10, self.q_vocab_size),
             config.d_model,
             dtype=self.dtype,
@@ -307,7 +320,7 @@ class BRCModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.q_to_hidden = nnx.Linear(
+        self.trajectory_to_hidden = nnx.Linear(
             config.d_model,
             self.hidden_dim,
             use_bias=False,
@@ -316,9 +329,9 @@ class BRCModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.readout_hidden_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
-        self.readout_condition_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
-        self.readout_output_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
+        self.energy_context_hidden_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
+        self.energy_context_condition_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
+        self.energy_context_output_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
         self.solver_blocks = nnx.List(
             [
                 BRCSolverBlock(
@@ -332,21 +345,30 @@ class BRCModel(nnx.Module):
                 for _ in range(brc.block_depth)
             ]
         )
-        self.q_velocity_head = nnx.Linear(
-            self.hidden_dim,
+        self.energy_state_to_hidden = nnx.Linear(
             self.q_vocab_size,
+            self.hidden_dim,
+            use_bias=False,
             dtype=self.dtype,
             param_dtype=jnp.float32,
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.q_update_head = nnx.Linear(
+        self.energy_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
+        self.energy_hidden = nnx.Linear(
+            self.hidden_dim,
+            self.hidden_dim,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.energy_head = nnx.Linear(
             self.hidden_dim,
             1,
             dtype=self.dtype,
             param_dtype=jnp.float32,
-            kernel_init=nnx.initializers.zeros,
-            bias_init=nnx.initializers.constant(math.log(math.expm1(1.0))),
+            kernel_init=casted_linear_init,
             rngs=rngs,
         )
     @staticmethod
@@ -398,43 +420,43 @@ class BRCModel(nnx.Module):
     def initial_q(self, tokens: Array) -> Array:
         return self._uniform_q(tokens)
 
-    def initial_q_history(self, tokens: Array, q_logits: Array | None = None) -> Array:
+    def initial_trajectory(self, tokens: Array, q_logits: Array | None = None) -> Array:
         if q_logits is None:
             q_logits = self.initial_q(tokens)
-        return jnp.repeat(q_logits[:, None, :, :], self.q_window, axis=1)
+        return jnp.repeat(q_logits[:, None, :, :], self.trajectory_window, axis=1)
 
-    def initial_q_history_count(self, tokens: Array) -> Array:
+    def initial_trajectory_count(self, tokens: Array) -> Array:
         return jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
 
-    def _history_at(self, q_history: Array, index: Array) -> Array:
+    def _history_at(self, trajectory: Array, index: Array) -> Array:
         gather_index = jnp.broadcast_to(
             index[:, None, None, None],
-            (q_history.shape[0], 1, q_history.shape[2], q_history.shape[3]),
+            (trajectory.shape[0], 1, trajectory.shape[2], trajectory.shape[3]),
         )
         gathered = jnp.take_along_axis(
-            q_history,
+            trajectory,
             gather_index,
             axis=1,
         )
         return gathered[:, 0]
 
-    def _append_q_history(
+    def _append_trajectory(
         self,
-        q_history: Array,
+        trajectory: Array,
         q_logits: Array,
-        q_history_count: Array,
+        trajectory_count: Array,
     ) -> tuple[Array, Array]:
         q_logits = q_logits.astype(jnp.float32)
-        next_count = jnp.minimum(q_history_count + 1, self.q_window)
-        if self.q_window == 1:
+        next_count = jnp.minimum(trajectory_count + 1, self.trajectory_window)
+        if self.trajectory_window == 1:
             return q_logits[:, None, :, :], next_count
-        is_full = q_history_count >= self.q_window
-        shifted = jnp.concatenate((q_history[:, 1:], q_logits[:, None, :, :]), axis=1)
-        insert_index = jnp.minimum(q_history_count, self.q_window - 1)
-        insert_mask = jax.nn.one_hot(insert_index, self.q_window, dtype=bool)
-        inserted = jnp.where(insert_mask[:, :, None, None], q_logits[:, None, :, :], q_history)
-        next_history = jnp.where(is_full[:, None, None, None], shifted, inserted)
-        return next_history, next_count
+        is_full = trajectory_count >= self.trajectory_window
+        shifted = jnp.concatenate((trajectory[:, 1:], q_logits[:, None, :, :]), axis=1)
+        insert_index = jnp.minimum(trajectory_count, self.trajectory_window - 1)
+        insert_mask = jax.nn.one_hot(insert_index, self.trajectory_window, dtype=bool)
+        inserted = jnp.where(insert_mask[:, :, None, None], q_logits[:, None, :, :], trajectory)
+        next_trajectory = jnp.where(is_full[:, None, None, None], shifted, inserted)
+        return next_trajectory, next_count
 
     def _position_embeddings(self) -> Array:
         if self.brc.position_encoding != "learned":
@@ -445,49 +467,49 @@ class BRCModel(nnx.Module):
             + self.box_embed(self.box_ids)
         )
 
-    def _q_embedding(
+    def _trajectory_embedding(
         self,
         tokens: Array,
-        q_history: Array,
-        q_history_count: Array,
+        trajectory: Array,
+        trajectory_count: Array,
         step_index: Array,
     ) -> Array:
         del tokens, step_index
-        current_index = jnp.maximum(q_history_count - 1, 0)
-        previous_index = jnp.maximum(q_history_count - 2, 0)
-        previous2_index = jnp.maximum(q_history_count - 3, 0)
-        has_current = (q_history_count >= 1)[:, None, None]
-        has_previous = (q_history_count >= 2)[:, None, None]
-        has_previous2 = (q_history_count >= 3)[:, None, None]
+        current_index = jnp.maximum(trajectory_count - 1, 0)
+        previous_index = jnp.maximum(trajectory_count - 2, 0)
+        previous2_index = jnp.maximum(trajectory_count - 3, 0)
+        has_current = (trajectory_count >= 1)[:, None, None]
+        has_previous = (trajectory_count >= 2)[:, None, None]
+        has_previous2 = (trajectory_count >= 3)[:, None, None]
 
-        q_logits = self._center_q_logits(self._history_at(q_history, current_index))
+        q_logits = self._center_q_logits(self._history_at(trajectory, current_index))
         q_logits = jnp.where(has_current, q_logits, jnp.zeros_like(q_logits))
         q = self._normalize_q(q_logits)
         uniform = jnp.full_like(q, 1.0 / float(self.q_vocab_size))
         direction = jnp.where(has_current, q - uniform, jnp.zeros_like(q))
-        if self.q_window >= 2:
-            previous = self._center_q_logits(self._history_at(q_history, previous_index))
-            velocity = self._center_q_logits(q_logits - previous)
-            velocity = jnp.where(has_previous, velocity, jnp.zeros_like(velocity))
+        if self.trajectory_window >= 2:
+            previous = self._center_q_logits(self._history_at(trajectory, previous_index))
+            history_delta = self._center_q_logits(q_logits - previous)
+            history_delta = jnp.where(has_previous, history_delta, jnp.zeros_like(history_delta))
         else:
-            velocity = jnp.zeros_like(q_logits)
-        if self.q_window >= 3:
-            previous = self._center_q_logits(self._history_at(q_history, previous_index))
-            previous2 = self._center_q_logits(self._history_at(q_history, previous2_index))
+            history_delta = jnp.zeros_like(q_logits)
+        if self.trajectory_window >= 3:
+            previous = self._center_q_logits(self._history_at(trajectory, previous_index))
+            previous2 = self._center_q_logits(self._history_at(trajectory, previous2_index))
             acceleration = self._center_q_logits(q_logits - 2.0 * previous + previous2)
             acceleration = jnp.where(has_previous2, acceleration, jnp.zeros_like(acceleration))
         else:
             acceleration = jnp.zeros_like(q_logits)
-        embedding_table = maybe_cast(self.q_embed.embedding[: self.q_vocab_size], self.dtype)
+        embedding_table = maybe_cast(self.trajectory_embed.embedding[: self.q_vocab_size], self.dtype)
         direction_embedding = jnp.einsum(
             "bnd,dk->bnk",
             maybe_cast(direction, self.dtype),
             embedding_table,
             preferred_element_type=jnp.float32,
         )
-        velocity_embedding = jnp.einsum(
+        delta_embedding = jnp.einsum(
             "bnd,dk->bnk",
-            maybe_cast(jnp.tanh(velocity), self.dtype),
+            maybe_cast(jnp.tanh(history_delta), self.dtype),
             embedding_table,
             preferred_element_type=jnp.float32,
         )
@@ -497,62 +519,87 @@ class BRCModel(nnx.Module):
             embedding_table,
             preferred_element_type=jnp.float32,
         )
-        return direction_embedding + velocity_embedding + acceleration_embedding
+        return direction_embedding + delta_embedding + acceleration_embedding
 
     def _typed_conditions(
         self,
         tokens: Array,
-        q_history: Array,
-        q_history_count: Array,
+        trajectory: Array,
+        trajectory_count: Array,
         base_embeddings: Array,
         step_index: Array,
         *,
         train: bool,
         dropout_key: Array | None,
     ) -> tuple[Array, Array]:
-        q_embedding = self._q_embedding(tokens, q_history, q_history_count, step_index)
+        trajectory_embedding = self._trajectory_embedding(tokens, trajectory, trajectory_count, step_index)
         context_input = self.dropout(base_embeddings, deterministic=not train, rngs=dropout_key)
-        q_input = self.dropout(q_embedding, deterministic=not train, rngs=dropout_key)
+        q_input = self.dropout(trajectory_embedding, deterministic=not train, rngs=dropout_key)
         context_condition = self.context_to_hidden(maybe_cast(context_input, self.dtype)).astype(self.dtype)
-        q_condition = self.q_to_hidden(maybe_cast(q_input, self.dtype)).astype(self.dtype)
-        return context_condition, q_condition
+        trajectory_condition = self.trajectory_to_hidden(maybe_cast(q_input, self.dtype)).astype(self.dtype)
+        return context_condition, trajectory_condition
 
     def _q_to_token_logits(self, q: Array, tokens: Array, step_index: Array) -> Array:
         del step_index
         return self._q_to_output_logits(q, tokens)
 
-    def _q_update(
+    def _energy_descent_step(
         self,
         tokens: Array,
         q_logits: Array,
-        read_state: Array,
+        energy_context: Array,
         step_index: Array,
     ) -> tuple[Array, dict[str, Array]]:
         del tokens
         current_logits = self._center_q_logits(q_logits)
         current_q = jax.nn.softmax(current_logits, axis=-1)
-        raw_velocity = self.q_velocity_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
-        velocity = self._center_q_logits(raw_velocity)
-        flow_step_length = jax.nn.softplus(
-            self.q_update_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
+        uniform = jnp.full_like(current_q, 1.0 / float(self.q_vocab_size))
+
+        def energy_per_cell(candidate_q: Array) -> Array:
+            trajectory_condition = self.energy_state_to_hidden(
+                maybe_cast(candidate_q - uniform, self.dtype)
+            ).astype(jnp.float32)
+            energy_input = self.energy_norm(
+                (energy_context.astype(jnp.float32) + trajectory_condition).astype(self.dtype)
+            )
+            energy_hidden = jax.nn.silu(
+                self.energy_hidden(maybe_cast(energy_input, self.dtype)).astype(jnp.float32)
+            )
+            return self.energy_head(maybe_cast(energy_hidden, self.dtype)).astype(jnp.float32)[..., 0]
+
+        def total_energy(candidate_q: Array) -> Array:
+            return jnp.sum(energy_per_cell(candidate_q))
+
+        energy_value = energy_per_cell(current_q)[..., None]
+        energy_grad = self._center_q_logits(jax.grad(total_energy)(current_q))
+        descent_direction = -energy_grad
+        raw_logit_step = float(self.brc.descent_step_size) * descent_direction
+        raw_step_rms = jnp.sqrt(jnp.mean(jnp.square(raw_logit_step), axis=-1, keepdims=True) + 1e-12)
+        clip_scale = jnp.minimum(1.0, float(self.brc.descent_rms_clip) / raw_step_rms)
+        logit_step = raw_logit_step * clip_scale
+        descent_step_size = jnp.broadcast_to(
+            jnp.asarray(float(self.brc.descent_step_size), dtype=jnp.float32),
+            (*current_logits.shape[:-1], 1),
         )
-        flow_speed = flow_step_length / (1.0 + flow_step_length)
-        logit_delta = flow_speed * velocity
-        next_logits = current_logits + logit_delta
+        descent_clip_scale = clip_scale
+        next_logits = current_logits + logit_step
         next_logits = self._center_q_logits(next_logits)
         next_q = jax.nn.softmax(next_logits, axis=-1)
 
-        q_tv_delta = 0.5 * jnp.sum(jnp.abs(next_q - current_q), axis=-1, keepdims=True)
-        velocity_rms = jnp.sqrt(jnp.mean(jnp.square(velocity), axis=-1, keepdims=True) + 1e-12)
-        logit_delta_rms = jnp.sqrt(jnp.mean(jnp.square(logit_delta), axis=-1, keepdims=True) + 1e-12)
-        flow_energy = jnp.mean(jnp.square(logit_delta), axis=-1, keepdims=True)
+        distribution_tv_delta = 0.5 * jnp.sum(jnp.abs(next_q - current_q), axis=-1, keepdims=True)
+        energy_grad_rms = jnp.sqrt(jnp.mean(jnp.square(energy_grad), axis=-1, keepdims=True) + 1e-12)
+        descent_rms = jnp.sqrt(jnp.mean(jnp.square(descent_direction), axis=-1, keepdims=True) + 1e-12)
+        logit_step_rms = jnp.sqrt(jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True) + 1e-12)
+        path_energy = jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True)
         diagnostics = {
-            "flow_speed": flow_speed,
-            "flow_step_length": flow_step_length,
-            "velocity_rms": velocity_rms,
-            "logit_delta_rms": logit_delta_rms,
-            "q_tv_delta": q_tv_delta,
-            "flow_energy": flow_energy,
+            "energy_value": energy_value,
+            "energy_grad_rms": energy_grad_rms,
+            "descent_step_size": descent_step_size,
+            "descent_clip_scale": descent_clip_scale,
+            "descent_rms": descent_rms,
+            "logit_step_rms": logit_step_rms,
+            "distribution_tv_delta": distribution_tv_delta,
+            "path_energy": path_energy,
         }
         return next_logits, diagnostics
 
@@ -560,44 +607,45 @@ class BRCModel(nnx.Module):
         self,
         hidden_state: Array,
         context_condition: Array,
-        q_condition: Array,
+        trajectory_condition: Array,
     ) -> Array:
         hidden = hidden_state.astype(self.dtype)
         # Within an h-cycle, cheap local propagation runs for every refine step.
         # The expensive all-to-all attention is reserved for the cycle boundary,
-        # immediately before q commit / halt.
+        # immediately before q commit / early-stop check.
         for _ in range(self.refine_steps):
             for block in self.solver_blocks:
-                hidden = block.local_think(hidden, context_condition, q_condition)
+                hidden = block.local_think(hidden, context_condition, trajectory_condition)
         for block in self.solver_blocks:
             hidden = block.global_communicate(
                 hidden,
                 context_condition,
-                q_condition,
+                trajectory_condition,
                 self.rope_cos,
                 self.rope_sin,
             )
         return hidden
 
-    def _readout_fuse(
+    def _energy_context(
         self,
         hidden_state: Array,
         context_condition: Array,
-        q_condition: Array,
+        trajectory_condition: Array,
     ) -> Array:
-        hidden = self.readout_hidden_norm(hidden_state.astype(jnp.float32)).astype(jnp.float32)
-        context_condition = self.readout_condition_norm(
+        hidden = self.energy_context_hidden_norm(hidden_state.astype(jnp.float32)).astype(jnp.float32)
+        context_condition = self.energy_context_condition_norm(
             context_condition.astype(jnp.float32)
         ).astype(jnp.float32)
-        base = self.readout_output_norm(hidden + context_condition).astype(self.dtype)
-        return (base.astype(jnp.float32) + q_condition.astype(jnp.float32)).astype(self.dtype)
+        base = self.energy_context_output_norm(hidden + context_condition).astype(self.dtype)
+        # This is the fixed context Phi for the black-box scalar energy.
+        return (base.astype(jnp.float32) + trajectory_condition.astype(jnp.float32)).astype(self.dtype)
 
-    def _q_step(
+    def _commit_step(
         self,
         tokens: Array,
         q: Array,
-        q_history: Array,
-        q_history_count: Array,
+        trajectory: Array,
+        trajectory_count: Array,
         hidden_state: Array,
         base_embeddings: Array,
         step_index: Array,
@@ -606,18 +654,22 @@ class BRCModel(nnx.Module):
         dropout_key: Array | None,
         stop_hidden_between_steps: bool = True,
     ) -> tuple[Array, Array, dict[str, Array]]:
-        flow_diagnostics = {
-            "flow_speed": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "flow_step_length": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "velocity_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "logit_delta_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "q_tv_delta": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "flow_energy": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+        update_diagnostics = {
+            "descent_step_size": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "descent_clip_scale": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "energy_value": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "energy_grad_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "descent_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "logit_step_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "distribution_tv_delta": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "path_energy": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
         }
-        context_condition, q_condition = self._typed_conditions(
+        # q/history are stopped before context construction: attention builds Phi,
+        # while the differentiable energy descent only flows through E(q; Phi).
+        context_condition, trajectory_condition = self._typed_conditions(
             tokens,
-            jax.lax.stop_gradient(q_history),
-            jax.lax.stop_gradient(q_history_count),
+            jax.lax.stop_gradient(trajectory),
+            jax.lax.stop_gradient(trajectory_count),
             base_embeddings,
             step_index,
             train=train,
@@ -627,24 +679,137 @@ class BRCModel(nnx.Module):
         hidden_state = self._hidden_h_cycle(
             hidden_state,
             context_condition,
-            q_condition,
+            trajectory_condition,
         )
-        read_state = self._readout_fuse(
+        energy_context = self._energy_context(
             hidden_state,
             context_condition,
-            q_condition,
+            trajectory_condition,
         )
-        q, flow_diagnostics = self._q_update(
+        q, update_diagnostics = self._energy_descent_step(
             tokens,
             q,
-            read_state,
+            energy_context,
             step_index,
         )
         return (
             q,
             hidden_state,
-            flow_diagnostics,
+            update_diagnostics,
         )
+
+    def target_q_logits(self, targets: Array) -> Array:
+        """Return centered logits for the smoothed fixed-point answer distribution."""
+        smoothing = float(self.brc.fixed_point_label_smoothing)
+        labels = jnp.clip(targets.astype(jnp.int32), 0, self.q_vocab_size - 1)
+        target_distribution = (
+            (1.0 - smoothing) * jax.nn.one_hot(labels, self.q_vocab_size, dtype=jnp.float32)
+            + smoothing / float(self.q_vocab_size)
+        )
+        return self._center_q_logits(jnp.log(jnp.maximum(target_distribution, self.output_logit_eps)))
+
+    def fixed_point_update_loss(
+        self,
+        tokens: Array,
+        targets: Array,
+        loss_mask: Array,
+        *,
+        train: bool,
+        dropout_key: Array | None,
+    ) -> Array:
+        """Penalize nonzero update at the smoothed target fixed point.
+
+        This auxiliary fixed-point probe asks the energy-descent update to vanish
+        when q is already the smoothed target distribution. It does not change
+        the main q trajectory state.
+        """
+        target_logits = self.target_q_logits(targets)
+        base_embeddings, _context = self.context_memory(tokens)
+        target_trajectory = self.initial_trajectory(tokens, target_logits)
+        target_trajectory_count = jnp.full((tokens.shape[0],), self.trajectory_window, dtype=jnp.int32)
+        hidden = self.initial_hidden_state(
+            tokens,
+            target_logits,
+            base_embeddings,
+            train=train,
+            dropout_key=dropout_key,
+        )
+        final_step = jnp.asarray(self.total_steps - 1, dtype=jnp.int32)
+        _next_q, _next_hidden, diagnostics = self._commit_step(
+            tokens,
+            target_logits,
+            target_trajectory,
+            target_trajectory_count,
+            hidden,
+            base_embeddings,
+            final_step,
+            train=train,
+            dropout_key=dropout_key,
+            stop_hidden_between_steps=True,
+        )
+        mask = loss_mask.astype(jnp.float32)
+        cell_energy = diagnostics["path_energy"][..., 0].astype(jnp.float32)
+        return jnp.sum(cell_energy * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+
+    def _sudoku_constraint_ok(self, prediction_digits: Array, inputs: Array) -> Array:
+        given_mask = inputs > self.sudoku_blank_token_id
+        given_digits = jnp.clip(inputs - 1, 0, self.q_vocab_size - 1)
+        givens_ok = jnp.all(jnp.where(given_mask, prediction_digits == given_digits, True), axis=-1)
+        grid = prediction_digits.reshape((prediction_digits.shape[0], self.config.grid_height, self.config.grid_width))
+        row_ok = jnp.all(jnp.all(jnp.sum(jax.nn.one_hot(grid, self.q_vocab_size), axis=2) == 1, axis=-1), axis=-1)
+        col_ok = jnp.all(jnp.all(jnp.sum(jax.nn.one_hot(grid, self.q_vocab_size), axis=1) == 1, axis=-1), axis=-1)
+        flat = prediction_digits
+        box_values = jnp.take(flat, self.box_indices, axis=1)
+        box_ok = jnp.all(jnp.all(jnp.sum(jax.nn.one_hot(box_values, self.q_vocab_size), axis=2) == 1, axis=-1), axis=-1)
+        return givens_ok & row_ok & col_ok & box_ok
+
+    def _early_stop(
+        self,
+        q_old_logits: Array,
+        q_new_logits: Array,
+        inputs: Array,
+        new_steps: Array,
+        update_diagnostics: dict[str, Array],
+    ) -> tuple[Array, dict[str, Array]]:
+        old_q = self._normalize_q(q_old_logits)
+        new_q = self._normalize_q(q_new_logits)
+        query_mask = (~self.context_mask(inputs)).astype(jnp.float32)
+        query_normalizer = jnp.maximum(jnp.sum(query_mask, axis=-1), 1.0)
+        distribution_delta_cell = 0.5 * jnp.sum(jnp.abs(new_q - old_q), axis=-1)
+        distribution_delta = jnp.sum(distribution_delta_cell * query_mask, axis=-1) / query_normalizer
+        old_pred = jnp.argmax(old_q, axis=-1)
+        new_pred = jnp.argmax(new_q, axis=-1)
+        flip_rate = jnp.sum((old_pred != new_pred).astype(jnp.float32) * query_mask, axis=-1) / query_normalizer
+        energy_grad_cell = update_diagnostics["energy_grad_rms"][..., 0].astype(jnp.float32)
+        energy_grad_rms = jnp.sum(energy_grad_cell * query_mask, axis=-1) / query_normalizer
+        top2 = jnp.sort(new_q, axis=-1)[..., -2:]
+        margin = top2[..., 1] - top2[..., 0]
+        margin_min = jnp.min(jnp.where(query_mask.astype(bool), margin, jnp.inf), axis=-1)
+        has_query = jnp.sum(query_mask, axis=-1) > 0
+        margin_min = jnp.where(has_query, margin_min, jnp.max(margin, axis=-1))
+        if self.config.task_type == "sudoku":
+            constraint_ok = self._sudoku_constraint_ok(new_pred, inputs)
+        else:
+            constraint_ok = jnp.ones((inputs.shape[0],), dtype=bool)
+        if not bool(self.brc.early_stop_require_constraints):
+            constraint_ok = jnp.ones_like(constraint_ok)
+        stable = (
+            bool(self.brc.early_stop_enabled)
+            & (new_steps >= int(self.brc.early_stop_min_steps))
+            & (energy_grad_rms <= float(self.brc.early_stop_energy_grad_threshold))
+            & (distribution_delta <= float(self.brc.early_stop_distribution_delta_threshold))
+            & (flip_rate <= float(self.brc.early_stop_flip_threshold))
+            & (margin_min >= float(self.brc.early_stop_margin_threshold))
+            & constraint_ok
+        )
+        diagnostics = {
+            "early_stop_energy_grad_rms": jnp.mean(energy_grad_rms.astype(jnp.float32)),
+            "early_stop_distribution_delta": jnp.mean(distribution_delta.astype(jnp.float32)),
+            "early_stop_flip_rate": jnp.mean(flip_rate.astype(jnp.float32)),
+            "early_stop_margin_min": jnp.mean(margin_min.astype(jnp.float32)),
+            "early_stop_constraint_rate": jnp.mean(constraint_ok.astype(jnp.float32)),
+        }
+        return stable, diagnostics
 
     def initial_hidden_state(
         self,
@@ -676,13 +841,14 @@ class BRCModel(nnx.Module):
         batch_size = batch["inputs"].shape[0]
         return {
             "q": self._uniform_q(batch["inputs"]),
-            "q_history": self.initial_q_history(batch["inputs"]),
-            "q_history_count": self.initial_q_history_count(batch["inputs"]),
+            "trajectory": self.initial_trajectory(batch["inputs"]),
+            "trajectory_count": self.initial_trajectory_count(batch["inputs"]),
             "hidden": jnp.zeros(
                 (batch_size, self.config.seq_len, self.hidden_dim),
                 dtype=self.dtype,
             ),
             "steps": jnp.zeros((batch_size,), dtype=jnp.int32),
+            "stable_steps": jnp.zeros((batch_size,), dtype=jnp.int32),
             "reset": jnp.ones((batch_size,), dtype=bool),
             "current_inputs": jnp.zeros_like(batch["inputs"]),
             "current_labels": jnp.zeros_like(batch["labels"]),
@@ -715,10 +881,11 @@ class BRCModel(nnx.Module):
         step_index = jnp.minimum(steps, self.total_steps - 1)
         reset_q = self.initial_q(inputs)
         q = jnp.where(reset_state, reset_q, carry["q"])
-        reset_q_history = self.initial_q_history(inputs, reset_q)
-        reset_q_history_count = self.initial_q_history_count(inputs)
-        q_history = jnp.where(reset[:, None, None, None], reset_q_history, carry["q_history"])
-        q_history_count = jnp.where(reset, reset_q_history_count, carry["q_history_count"])
+        reset_trajectory = self.initial_trajectory(inputs, reset_q)
+        reset_trajectory_count = self.initial_trajectory_count(inputs)
+        trajectory = jnp.where(reset[:, None, None, None], reset_trajectory, carry["trajectory"])
+        trajectory_count = jnp.where(reset, reset_trajectory_count, carry["trajectory_count"])
+        stable_steps = jnp.where(reset, 0, carry["stable_steps"])
         reset_hidden = self.initial_hidden_state(
             inputs,
             reset_q,
@@ -727,11 +894,11 @@ class BRCModel(nnx.Module):
             dropout_key=dropout_key,
         )
         hidden = jnp.where(reset_state, reset_hidden, carry["hidden"])
-        next_q, next_hidden, flow_diagnostics = self._q_step(
+        next_q, next_hidden, update_diagnostics = self._commit_step(
             inputs,
             q,
-            q_history,
-            q_history_count,
+            trajectory,
+            trajectory_count,
             hidden,
             base_embeddings,
             step_index,
@@ -741,19 +908,29 @@ class BRCModel(nnx.Module):
         )
         logits = self._q_to_token_logits(next_q, inputs, step_index)
         new_steps = steps + 1
-        next_q_history, next_q_history_count = self._append_q_history(
-            q_history,
+        next_trajectory, next_trajectory_count = self._append_trajectory(
+            trajectory,
             next_q,
-            q_history_count,
+            trajectory_count,
         )
         is_last_step = new_steps >= self.total_steps
-        next_reset = is_last_step
+        early_stop, early_stop_diagnostics = self._early_stop(
+            q,
+            next_q,
+            inputs,
+            new_steps,
+            update_diagnostics,
+        )
+        stable_steps = jnp.where(early_stop, stable_steps + 1, 0)
+        stable_reset = stable_steps >= int(self.brc.early_stop_patience)
+        next_reset = is_last_step | stable_reset
         new_carry = {
             "q": jax.lax.stop_gradient(next_q),
-            "q_history": jax.lax.stop_gradient(next_q_history),
-            "q_history_count": jax.lax.stop_gradient(next_q_history_count),
+            "trajectory": jax.lax.stop_gradient(next_trajectory),
+            "trajectory_count": jax.lax.stop_gradient(next_trajectory_count),
             "hidden": jax.lax.stop_gradient(next_hidden),
             "steps": jax.lax.stop_gradient(new_steps),
+            "stable_steps": jax.lax.stop_gradient(stable_steps),
             "reset": jax.lax.stop_gradient(next_reset),
             "current_inputs": inputs,
             "current_labels": labels,
@@ -761,14 +938,20 @@ class BRCModel(nnx.Module):
         }
         diagnostics = {
             "carry_step": jnp.mean(new_steps.astype(jnp.float32)),
-            "terminal_reset_rate": jnp.mean(next_reset.astype(jnp.float32)),
+            "max_step_reset_rate": jnp.mean(is_last_step.astype(jnp.float32)),
+            "early_stop_rate": jnp.mean(stable_reset.astype(jnp.float32)),
+            "stability_rate": jnp.mean(early_stop.astype(jnp.float32)),
+            "stable_steps": jnp.mean(stable_steps.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
-            "flow_speed": jnp.mean(flow_diagnostics["flow_speed"].astype(jnp.float32)),
-            "flow_step_length": jnp.mean(flow_diagnostics["flow_step_length"].astype(jnp.float32)),
-            "velocity_rms": jnp.mean(flow_diagnostics["velocity_rms"].astype(jnp.float32)),
-            "logit_delta_rms": jnp.mean(flow_diagnostics["logit_delta_rms"].astype(jnp.float32)),
-            "q_tv_delta": jnp.mean(flow_diagnostics["q_tv_delta"].astype(jnp.float32)),
-            "flow_energy": jnp.mean(flow_diagnostics["flow_energy"].astype(jnp.float32)),
+            "descent_step_size": jnp.mean(update_diagnostics["descent_step_size"].astype(jnp.float32)),
+            "descent_clip_scale": jnp.mean(update_diagnostics["descent_clip_scale"].astype(jnp.float32)),
+            "energy_value": jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
+            "energy_grad_rms": jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
+            "descent_rms": jnp.mean(update_diagnostics["descent_rms"].astype(jnp.float32)),
+            "logit_step_rms": jnp.mean(update_diagnostics["logit_step_rms"].astype(jnp.float32)),
+            "distribution_tv_delta": jnp.mean(update_diagnostics["distribution_tv_delta"].astype(jnp.float32)),
+            "path_energy": jnp.mean(update_diagnostics["path_energy"].astype(jnp.float32)),
+            **early_stop_diagnostics,
         }
         return new_carry, logits, diagnostics
 
@@ -783,20 +966,20 @@ class BRCModel(nnx.Module):
     ) -> tuple[Array, dict[str, Array]]:
         if initial_q is None:
             initial_q = self.initial_q(tokens)
-        initial_q_history = self.initial_q_history(tokens, initial_q)
-        initial_q_history_count = self.initial_q_history_count(tokens)
+        initial_trajectory = self.initial_trajectory(tokens, initial_q)
+        initial_trajectory_count = self.initial_trajectory_count(tokens)
         base_embeddings, context = self.context_memory(tokens)
         query_mask = (~context).astype(jnp.float32)
         query_normalizer = jnp.maximum(jnp.sum(query_mask), 1.0)
 
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key = scan_inputs
-            q, q_history, q_history_count, hidden_state = carry
-            next_q, next_hidden, flow_diagnostics = self._q_step(
+            q, trajectory, trajectory_count, hidden_state = carry
+            next_q, next_hidden, update_diagnostics = self._commit_step(
                 tokens,
                 q,
-                q_history,
-                q_history_count,
+                trajectory,
+                trajectory_count,
                 hidden_state,
                 base_embeddings,
                 step_index,
@@ -804,12 +987,12 @@ class BRCModel(nnx.Module):
                 dropout_key=step_dropout_key,
                 stop_hidden_between_steps=True,
             )
-            next_q_history, next_q_history_count = self._append_q_history(
-                q_history,
+            next_trajectory, next_trajectory_count = self._append_trajectory(
+                trajectory,
                 next_q,
-                q_history_count,
+                trajectory_count,
             )
-            next_carry = (next_q, next_q_history, next_q_history_count, next_hidden)
+            next_carry = (next_q, next_trajectory, next_trajectory_count, next_hidden)
             if return_final_only:
                 return next_carry, None
             logits = self._q_to_token_logits(next_q, tokens, step_index)
@@ -818,12 +1001,14 @@ class BRCModel(nnx.Module):
             return next_carry, (
                 logits,
                 q_top1_probability,
-                jnp.mean(flow_diagnostics["flow_speed"].astype(jnp.float32)),
-                jnp.mean(flow_diagnostics["flow_step_length"].astype(jnp.float32)),
-                jnp.mean(flow_diagnostics["velocity_rms"].astype(jnp.float32)),
-                jnp.mean(flow_diagnostics["logit_delta_rms"].astype(jnp.float32)),
-                jnp.mean(flow_diagnostics["q_tv_delta"].astype(jnp.float32)),
-                jnp.mean(flow_diagnostics["flow_energy"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["descent_step_size"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["descent_clip_scale"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["descent_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["logit_step_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["distribution_tv_delta"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["path_energy"].astype(jnp.float32)),
             )
 
         step_indices = jnp.arange(self.total_steps, dtype=jnp.int32)
@@ -840,8 +1025,8 @@ class BRCModel(nnx.Module):
         )
         initial_carry = (
             initial_q.astype(jnp.float32),
-            initial_q_history.astype(jnp.float32),
-            initial_q_history_count,
+            initial_trajectory.astype(jnp.float32),
+            initial_trajectory_count,
             initial_hidden,
         )
         final_carry, scan_outputs = jax.lax.scan(
@@ -849,40 +1034,46 @@ class BRCModel(nnx.Module):
             initial_carry,
             (step_indices, step_dropout_keys),
         )
-        q_final, _q_history_final, _q_history_count_final, _hidden_final = final_carry
+        q_final, _trajectory_final, _trajectory_count_final, _hidden_final = final_carry
         if return_final_only:
             final_step = jnp.asarray(self.total_steps - 1, dtype=jnp.int32)
             logits = self._q_to_token_logits(q_final, tokens, final_step)
             diagnostics = {
                 "q_top1_probability": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
-                "flow_speed": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "flow_step_length": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "velocity_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "logit_delta_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "q_tv_delta": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "flow_energy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "descent_step_size": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "descent_clip_scale": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "energy_value": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "energy_grad_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "descent_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "logit_step_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "distribution_tv_delta": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "path_energy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
             }
             return logits, diagnostics
         (
             step_logits,
             q_top1_probability,
-            flow_speed,
-            flow_step_length,
-            velocity_rms,
-            logit_delta_rms,
-            q_tv_delta,
-            flow_energy,
+            descent_step_size,
+            descent_clip_scale,
+            energy_value,
+            energy_grad_rms,
+            descent_rms,
+            logit_step_rms,
+            distribution_tv_delta,
+            path_energy,
         ) = scan_outputs
         diagnostics = {
             "q_top1_probability": q_top1_probability,
             "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
-            "flow_speed": flow_speed,
-            "flow_step_length": flow_step_length,
-            "velocity_rms": velocity_rms,
-            "logit_delta_rms": logit_delta_rms,
-            "q_tv_delta": q_tv_delta,
-            "flow_energy": flow_energy,
+            "descent_step_size": descent_step_size,
+            "descent_clip_scale": descent_clip_scale,
+            "energy_value": energy_value,
+            "energy_grad_rms": energy_grad_rms,
+            "descent_rms": descent_rms,
+            "logit_step_rms": logit_step_rms,
+            "distribution_tv_delta": distribution_tv_delta,
+            "path_energy": path_energy,
         }
         return step_logits, diagnostics
 

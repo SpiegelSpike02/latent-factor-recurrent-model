@@ -171,18 +171,18 @@ def _brc_compact_training_rollout(
     def scan_step(carry, scan_inputs):
         (
             q,
-            q_history,
-            q_history_count,
+            trajectory,
+            trajectory_count,
             hidden_state,
             early_candidate,
             mid_candidate,
         ) = carry
         step_index, step_dropout_key = scan_inputs
-        next_q, next_hidden, flow_diagnostics = model._q_step(
+        next_q, next_hidden, update_diagnostics = model._commit_step(
             inputs,
             q,
-            q_history,
-            q_history_count,
+            trajectory,
+            trajectory_count,
             hidden_state,
             base_embeddings,
             step_index,
@@ -204,15 +204,15 @@ def _brc_compact_training_rollout(
         )
         confidence = jnp.max(model._normalize_q(next_q), axis=-1)
         q_top1_probability = jnp.sum(confidence * query_mask) / query_normalizer
-        next_q_history, next_q_history_count = model._append_q_history(
-            q_history,
+        next_trajectory, next_trajectory_count = model._append_trajectory(
+            trajectory,
             next_q,
-            q_history_count,
+            trajectory_count,
         )
         return (
             next_q,
-            next_q_history,
-            next_q_history_count,
+            next_trajectory,
+            next_trajectory_count,
             next_hidden,
             early_candidate,
             mid_candidate,
@@ -220,12 +220,14 @@ def _brc_compact_training_rollout(
             per_step_loss,
             q_top1_probability,
             step_exact.astype(jnp.float32),
-            jnp.mean(flow_diagnostics["flow_speed"].astype(jnp.float32)),
-            jnp.mean(flow_diagnostics["flow_step_length"].astype(jnp.float32)),
-            jnp.mean(flow_diagnostics["velocity_rms"].astype(jnp.float32)),
-            jnp.mean(flow_diagnostics["logit_delta_rms"].astype(jnp.float32)),
-            jnp.mean(flow_diagnostics["q_tv_delta"].astype(jnp.float32)),
-            jnp.mean(flow_diagnostics["flow_energy"].astype(jnp.float32)),
+            jnp.mean(update_diagnostics["descent_step_size"].astype(jnp.float32)),
+            jnp.mean(update_diagnostics["descent_clip_scale"].astype(jnp.float32)),
+            jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
+            jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
+            jnp.mean(update_diagnostics["descent_rms"].astype(jnp.float32)),
+            jnp.mean(update_diagnostics["logit_step_rms"].astype(jnp.float32)),
+            jnp.mean(update_diagnostics["distribution_tv_delta"].astype(jnp.float32)),
+            jnp.mean(update_diagnostics["path_energy"].astype(jnp.float32)),
         )
 
     step_indices = jnp.arange(rollout_steps, dtype=jnp.int32)
@@ -239,16 +241,16 @@ def _brc_compact_training_rollout(
     )
     initial_carry = (
         initial_q.astype(jnp.float32),
-        model.initial_q_history(inputs, initial_q).astype(jnp.float32),
-        model.initial_q_history_count(inputs),
+        model.initial_trajectory(inputs, initial_q).astype(jnp.float32),
+        model.initial_trajectory_count(inputs),
         initial_hidden,
         candidate_init,
         candidate_init,
     )
     (
         q_final,
-        _q_history_final,
-        _q_history_count_final,
+        _trajectory_final,
+        _trajectory_count_final,
         _hidden_final,
         early_candidate,
         mid_candidate,
@@ -261,12 +263,14 @@ def _brc_compact_training_rollout(
         per_step_loss,
         q_top1_probability,
         per_step_exact,
-        flow_speed,
-        flow_step_length,
-        velocity_rms,
-        logit_delta_rms,
-        q_tv_delta,
-        flow_energy,
+        descent_step_size,
+        descent_clip_scale,
+        energy_value,
+        energy_grad_rms,
+        descent_rms,
+        logit_step_rms,
+        distribution_tv_delta,
+        path_energy,
     ) = scan_outputs
     final_step = jnp.asarray(rollout_steps - 1, dtype=jnp.int32)
     final_logits = model._q_to_token_logits(q_final, inputs, final_step)
@@ -278,12 +282,14 @@ def _brc_compact_training_rollout(
         "mid_candidate": mid_candidate,
         "final_candidate": final_candidate,
         "per_step_exact": per_step_exact,
-        "flow_speed": flow_speed,
-        "flow_step_length": flow_step_length,
-        "velocity_rms": velocity_rms,
-        "logit_delta_rms": logit_delta_rms,
-        "q_tv_delta": q_tv_delta,
-        "flow_energy": flow_energy,
+        "descent_step_size": descent_step_size,
+        "descent_clip_scale": descent_clip_scale,
+        "energy_value": energy_value,
+        "energy_grad_rms": energy_grad_rms,
+        "descent_rms": descent_rms,
+        "logit_step_rms": logit_step_rms,
+        "distribution_tv_delta": distribution_tv_delta,
+        "path_energy": path_energy,
     }
     return final_logits, per_step_loss, diagnostics
 
@@ -307,7 +313,7 @@ def brc_loss_and_metrics(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     if dropout_key is None:
         dropout_key = jax.random.key(0)
-    augment_key, solve_key = jax.random.split(dropout_key, 2)
+    augment_key, solve_key, terminal_key = jax.random.split(dropout_key, 3)
     if model.config.task_type == "sudoku":
         inputs, targets = _permute_sudoku_digits(
             batch["inputs"],
@@ -349,12 +355,23 @@ def brc_loss_and_metrics(
         final_logits = step_logits[-1]
     step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
     step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
-    per_step_flow_energy = diagnostics["flow_energy"].astype(jnp.float32)
-    flow_energy_loss = jnp.sum(step_loss_weights * per_step_flow_energy)
+    per_step_path_energy = diagnostics["path_energy"].astype(jnp.float32)
+    path_energy_loss = jnp.sum(step_loss_weights * per_step_path_energy)
+    if float(model.brc.fixed_point_update_weight) != 0.0:
+        fixed_point_update_loss = model.fixed_point_update_loss(
+            inputs,
+            targets,
+            loss_mask,
+            train=train,
+            dropout_key=terminal_key,
+        )
+    else:
+        fixed_point_update_loss = zero
     solution_loss = per_step_loss[-1]
     loss = (
         step_ce_loss
-        + float(model.brc.flow_energy_weight) * flow_energy_loss
+        + float(model.brc.path_energy_weight) * path_energy_loss
+        + float(model.brc.fixed_point_update_weight) * fixed_point_update_loss
     )
 
     predictions = _output_predictions_to_tokens(model, final_logits)
@@ -393,7 +410,8 @@ def brc_loss_and_metrics(
         "ce_loss": step_ce_loss,
         "final_ce_loss": solution_loss,
         "mean_ce_loss": jnp.mean(per_step_loss),
-        "flow_energy_loss": flow_energy_loss,
+        "path_energy_loss": path_energy_loss,
+        "fixed_point_update_loss": fixed_point_update_loss,
         "final_target_probability": target_probability,
         "accuracy": cell_accuracy,
         "query_accuracy": query_accuracy,
@@ -403,12 +421,14 @@ def brc_loss_and_metrics(
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "step_loss_weights": step_loss_weights,
         "q_top1_probability": q_top1_probability,
-        "flow_speed": jnp.mean(diagnostics["flow_speed"]),
-        "flow_step_length": jnp.mean(diagnostics["flow_step_length"]),
-        "velocity_rms": jnp.mean(diagnostics["velocity_rms"]),
-        "logit_delta_rms": jnp.mean(diagnostics["logit_delta_rms"]),
-        "q_tv_delta": jnp.mean(diagnostics["q_tv_delta"]),
-        "flow_energy": jnp.mean(diagnostics["flow_energy"]),
+        "descent_step_size": jnp.mean(diagnostics["descent_step_size"]),
+        "descent_clip_scale": jnp.mean(diagnostics["descent_clip_scale"]),
+        "energy_value": jnp.mean(diagnostics["energy_value"]),
+        "energy_grad_rms": jnp.mean(diagnostics["energy_grad_rms"]),
+        "descent_rms": jnp.mean(diagnostics["descent_rms"]),
+        "logit_step_rms": jnp.mean(diagnostics["logit_step_rms"]),
+        "distribution_tv_delta": jnp.mean(diagnostics["distribution_tv_delta"]),
+        "path_energy": jnp.mean(diagnostics["path_energy"]),
     }
     if model.config.task_type == "sudoku":
         metrics.update(
@@ -422,12 +442,14 @@ def brc_loss_and_metrics(
             {
                 "per_step_loss": per_step_loss,
                 "per_step_q_top1_probability": per_step_q_top1_probability,
-                "per_step_flow_speed": diagnostics["flow_speed"],
-                "per_step_flow_step_length": diagnostics["flow_step_length"],
-                "per_step_velocity_rms": diagnostics["velocity_rms"],
-                "per_step_logit_delta_rms": diagnostics["logit_delta_rms"],
-                "per_step_q_tv_delta": diagnostics["q_tv_delta"],
-                "per_step_flow_energy": diagnostics["flow_energy"],
+                "per_step_descent_step_size": diagnostics["descent_step_size"],
+                "per_step_descent_clip_scale": diagnostics["descent_clip_scale"],
+                "per_step_energy_value": diagnostics["energy_value"],
+                "per_step_energy_grad_rms": diagnostics["energy_grad_rms"],
+                "per_step_descent_rms": diagnostics["descent_rms"],
+                "per_step_logit_step_rms": diagnostics["logit_step_rms"],
+                "per_step_distribution_tv_delta": diagnostics["distribution_tv_delta"],
+                "per_step_path_energy": diagnostics["path_energy"],
             }
         )
     if model.config.task_type == "sudoku":
@@ -451,11 +473,12 @@ def brc_carry_loss_and_metrics(
 ) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
     if dropout_key is None:
         dropout_key = jax.random.key(0)
+    step_key, terminal_key = jax.random.split(dropout_key)
     new_carry, logits, diagnostics = model.forward_carry_step(
         carry,
         batch,
         train=train,
-        dropout_key=dropout_key,
+        dropout_key=step_key,
     )
     inputs = new_carry["current_inputs"]
     targets = new_carry["current_labels"]
@@ -484,12 +507,27 @@ def brc_carry_loss_and_metrics(
     target_probability = jnp.sum(target_probability_cells * loss_mask.astype(jnp.float32)) / normalizer
     context_target_probability = _masked_probability(target_probability_cells, context_mask)
     query_target_probability = _masked_probability(target_probability_cells, query_mask)
-    flow_energy_loss = diagnostics["flow_energy"].astype(jnp.float32)
-    loss = ce_loss + float(model.brc.flow_energy_weight) * flow_energy_loss
+    path_energy_loss = diagnostics["path_energy"].astype(jnp.float32)
+    if float(model.brc.fixed_point_update_weight) != 0.0:
+        fixed_point_update_loss = model.fixed_point_update_loss(
+            inputs,
+            targets,
+            loss_mask,
+            train=train,
+            dropout_key=terminal_key,
+        )
+    else:
+        fixed_point_update_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    loss = (
+        ce_loss
+        + float(model.brc.path_energy_weight) * path_energy_loss
+        + float(model.brc.fixed_point_update_weight) * fixed_point_update_loss
+    )
     metrics = {
         "loss": loss,
         "ce_loss": ce_loss,
-        "flow_energy_loss": flow_energy_loss,
+        "path_energy_loss": path_energy_loss,
+        "fixed_point_update_loss": fixed_point_update_loss,
         "accuracy": accuracy,
         "query_accuracy": query_accuracy,
         "exact_accuracy": exact_accuracy,
@@ -498,13 +536,23 @@ def brc_carry_loss_and_metrics(
         "query_target_probability": query_target_probability,
         "carry_step": diagnostics["carry_step"],
         "reset_rate": diagnostics["reset_rate"],
-        "terminal_reset_rate": diagnostics["terminal_reset_rate"],
-        "flow_speed": diagnostics["flow_speed"],
-        "flow_step_length": diagnostics["flow_step_length"],
-        "velocity_rms": diagnostics["velocity_rms"],
-        "logit_delta_rms": diagnostics["logit_delta_rms"],
-        "q_tv_delta": diagnostics["q_tv_delta"],
-        "flow_energy": diagnostics["flow_energy"],
+        "max_step_reset_rate": diagnostics["max_step_reset_rate"],
+        "early_stop_rate": diagnostics["early_stop_rate"],
+        "stability_rate": diagnostics["stability_rate"],
+        "stable_steps": diagnostics["stable_steps"],
+        "early_stop_energy_grad_rms": diagnostics["early_stop_energy_grad_rms"],
+        "early_stop_distribution_delta": diagnostics["early_stop_distribution_delta"],
+        "early_stop_flip_rate": diagnostics["early_stop_flip_rate"],
+        "early_stop_margin_min": diagnostics["early_stop_margin_min"],
+        "early_stop_constraint_rate": diagnostics["early_stop_constraint_rate"],
+        "descent_step_size": diagnostics["descent_step_size"],
+        "descent_clip_scale": diagnostics["descent_clip_scale"],
+        "energy_value": diagnostics["energy_value"],
+        "energy_grad_rms": diagnostics["energy_grad_rms"],
+        "descent_rms": diagnostics["descent_rms"],
+        "logit_step_rms": diagnostics["logit_step_rms"],
+        "distribution_tv_delta": diagnostics["distribution_tv_delta"],
+        "path_energy": diagnostics["path_energy"],
     }
     if model.config.task_type == "sudoku":
         metrics.update(
@@ -687,8 +735,6 @@ def loss_and_metrics(
         metrics["terminal_belief_mse"] = terminal_residual
     if "rho_mean" in diagnostics:
         metrics["per_step_rho"] = diagnostics["rho_mean"]
-    if "alpha_mean" in diagnostics:
-        metrics["per_step_alpha"] = diagnostics["alpha_mean"]
     for key in (
         "unroll_steps",
         "terminal_belief_delta",

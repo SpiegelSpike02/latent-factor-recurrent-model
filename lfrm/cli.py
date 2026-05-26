@@ -33,8 +33,26 @@ NESTED_SECTIONS = {
 }
 GROUPED_NESTED_KEYS = {
     "brc": {
-        "dynamics": {"commit_steps", "refine_steps", "block_depth", "q_window", "step_loss_schedule"},
-        "objective": {"flow_energy_weight"},
+        "dynamics": {
+            "commit_steps",
+            "refine_steps",
+            "block_depth",
+            "trajectory_window",
+            "step_loss_schedule",
+            "descent_step_size",
+            "descent_rms_clip",
+        },
+        "objective": {"path_energy_weight", "fixed_point_update_weight", "fixed_point_label_smoothing"},
+        "early_stop": {
+            "early_stop_enabled",
+            "early_stop_min_steps",
+            "early_stop_patience",
+            "early_stop_energy_grad_threshold",
+            "early_stop_distribution_delta_threshold",
+            "early_stop_flip_threshold",
+            "early_stop_margin_threshold",
+            "early_stop_require_constraints",
+        },
         "hidden": {
             "hidden_state_dim",
             "num_heads",
@@ -134,7 +152,7 @@ ALLOWED_NESTED_KEYS = {
         "commit_steps",
         "refine_steps",
         "block_depth",
-        "q_window",
+        "trajectory_window",
         "hidden_state_dim",
         "num_heads",
         "mlp_ratio",
@@ -145,9 +163,22 @@ ALLOWED_NESTED_KEYS = {
         "rms_norm_eps",
         "rope_theta",
         "step_loss_schedule",
-        "flow_energy_weight",
+        "descent_step_size",
+        "descent_rms_clip",
+        "path_energy_weight",
+        "fixed_point_update_weight",
+        "fixed_point_label_smoothing",
+        "early_stop_enabled",
+        "early_stop_min_steps",
+        "early_stop_patience",
+        "early_stop_energy_grad_threshold",
+        "early_stop_distribution_delta_threshold",
+        "early_stop_flip_threshold",
+        "early_stop_margin_threshold",
+        "early_stop_require_constraints",
         "dynamics",
         "objective",
+        "early_stop",
         "hidden",
         "position",
         "halt",
@@ -314,7 +345,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
     parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
-    parser.add_argument("--brc-flow-energy-weight", type=float, default=1e-4)
+    parser.add_argument("--brc-energy-step-size", type=float, default=0.3)
+    parser.add_argument("--brc-energy-update-rms-clip", type=float, default=1.0)
+    parser.add_argument("--brc-update-energy-weight", type=float, default=1e-4)
+    parser.add_argument("--brc-terminal-update-weight", type=float, default=0.0)
+    parser.add_argument("--brc-terminal-label-smoothing", type=float, default=1e-3)
+    parser.add_argument("--brc-early-stop-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--brc-early-stop-min-steps", type=int, default=4)
+    parser.add_argument("--brc-early-stop-patience", type=int, default=2)
+    parser.add_argument("--brc-early-stop-energy-grad-threshold", type=float, default=1e-2)
+    parser.add_argument("--brc-early-stop-q-delta-threshold", type=float, default=1e-3)
+    parser.add_argument("--brc-early-stop-flip-threshold", type=float, default=0.0)
+    parser.add_argument("--brc-early-stop-margin-threshold", type=float, default=0.5)
+    parser.add_argument("--brc-early-stop-require-constraints", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
     parser.add_argument("--urm-l-cycles", type=int, default=6)
@@ -454,7 +497,7 @@ def build_config(
             commit_steps=args.brc_commit_steps,
             refine_steps=args.brc_refine_steps,
             block_depth=args.brc_block_depth,
-            q_window=args.brc_q_window,
+            trajectory_window=args.brc_trajectory_window,
             hidden_state_dim=args.brc_hidden_state_dim,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,
@@ -465,7 +508,19 @@ def build_config(
             rms_norm_eps=args.brc_rms_norm_eps,
             rope_theta=args.brc_rope_theta,
             step_loss_schedule=args.brc_step_loss_schedule,
-            flow_energy_weight=args.brc_flow_energy_weight,
+            descent_step_size=args.brc_descent_step_size,
+            descent_rms_clip=args.brc_descent_rms_clip,
+            path_energy_weight=args.brc_path_energy_weight,
+            fixed_point_update_weight=args.brc_fixed_point_update_weight,
+            fixed_point_label_smoothing=args.brc_fixed_point_label_smoothing,
+            early_stop_enabled=args.brc_early_stop_enabled,
+            early_stop_min_steps=args.brc_early_stop_min_steps,
+            early_stop_patience=args.brc_early_stop_patience,
+            early_stop_energy_grad_threshold=args.brc_early_stop_energy_grad_threshold,
+            early_stop_distribution_delta_threshold=args.brc_early_stop_distribution_delta_threshold,
+            early_stop_flip_threshold=args.brc_early_stop_flip_threshold,
+            early_stop_margin_threshold=args.brc_early_stop_margin_threshold,
+            early_stop_require_constraints=args.brc_early_stop_require_constraints,
         ),
         urm=URMConfig(
             recurrent_steps=args.urm_recurrent_steps,

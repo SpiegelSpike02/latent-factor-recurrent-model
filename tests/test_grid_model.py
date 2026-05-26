@@ -380,7 +380,7 @@ class GridModelTests(unittest.TestCase):
             "query_target_probability",
             "context_consistency",
             "conflicts",
-            "flow_energy_loss",
+            "path_energy_loss",
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
@@ -819,11 +819,17 @@ class GridModelTests(unittest.TestCase):
                 "commit_steps = 4\n"
                 "refine_steps = 4\n"
                 "block_depth = 1\n"
-                "q_window = 3\n"
+                "trajectory_window = 3\n"
                 "hidden_state_dim = 16\n"
                 "num_heads = 4\n"
-                "step_loss_schedule = \"quadratic\"\n",
-                "flow_energy_weight = 0.0001\n",
+                "step_loss_schedule = \"quadratic\"\n"
+                "descent_step_size = 0.4\n"
+                "descent_rms_clip = 0.9\n"
+                "\n"
+                "[model.brc.objective]\n"
+                "path_energy_weight = 0.0001\n"
+                "fixed_point_update_weight = 0.0002\n"
+                "fixed_point_label_smoothing = 0.002\n",
                 encoding="utf-8",
             )
             loaded = load_toml_config(str(config_path))
@@ -832,11 +838,15 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_commit_steps"], 4)
             self.assertEqual(loaded["brc_refine_steps"], 4)
             self.assertEqual(loaded["brc_block_depth"], 1)
-            self.assertEqual(loaded["brc_q_window"], 3)
+            self.assertEqual(loaded["brc_trajectory_window"], 3)
             self.assertEqual(loaded["brc_hidden_state_dim"], 16)
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_step_loss_schedule"], "quadratic")
-            self.assertEqual(loaded["brc_flow_energy_weight"], 0.0001)
+            self.assertEqual(loaded["brc_descent_step_size"], 0.4)
+            self.assertEqual(loaded["brc_descent_rms_clip"], 0.9)
+            self.assertEqual(loaded["brc_path_energy_weight"], 0.0001)
+            self.assertEqual(loaded["brc_fixed_point_update_weight"], 0.0002)
+            self.assertEqual(loaded["brc_fixed_point_label_smoothing"], 0.002)
 
             eval_config_path = Path(tmpdir) / "eval.toml"
             eval_config_path.write_text(

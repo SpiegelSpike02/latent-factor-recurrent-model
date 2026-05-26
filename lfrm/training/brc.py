@@ -66,9 +66,9 @@ def build_brc_step_carry_train_step_runner():
         optimizer.update(model, grads)
         return metrics, new_carry
 
-    # Step-carry is a fixed-rollout truncated execution path for BRC. It carries
-    # q/H between optimizer updates, but deliberately does not train or execute
-    # learned ACT halt; samples reset only at the terminal commit.
+    # Step-carry is a truncated execution path for BRC. It carries q/H between
+    # optimizer updates and lets deterministic energy-stability early stop reset
+    # samples without training a learned halt head.
     return nnx.jit(train_step)
 
 
