@@ -33,7 +33,7 @@ NESTED_SECTIONS = {
 }
 GROUPED_NESTED_KEYS = {
     "brc": {
-        "dynamics": {"commit_steps", "refine_steps", "block_depth", "step_loss_schedule"},
+        "dynamics": {"commit_steps", "refine_steps", "block_depth", "q_window", "step_loss_schedule"},
         "objective": {"flow_kl_energy_weight"},
         "hidden": {
             "hidden_state_dim",
@@ -135,6 +135,7 @@ ALLOWED_NESTED_KEYS = {
         "commit_steps",
         "refine_steps",
         "block_depth",
+        "q_window",
         "hidden_state_dim",
         "num_heads",
         "mlp_ratio",
@@ -305,6 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-commit-steps", type=int, default=6)
     parser.add_argument("--brc-refine-steps", type=int, default=2)
     parser.add_argument("--brc-block-depth", type=int, default=1)
+    parser.add_argument("--brc-q-window", type=int, default=3)
     parser.add_argument("--brc-hidden-state-dim", type=int, default=0)
     parser.add_argument("--brc-num-heads", type=int, default=4)
     parser.add_argument("--brc-mlp-ratio", type=int, default=2)
@@ -455,6 +457,7 @@ def build_config(
             commit_steps=args.brc_commit_steps,
             refine_steps=args.brc_refine_steps,
             block_depth=args.brc_block_depth,
+            q_window=args.brc_q_window,
             hidden_state_dim=args.brc_hidden_state_dim,
             num_heads=args.brc_num_heads,
             mlp_ratio=args.brc_mlp_ratio,

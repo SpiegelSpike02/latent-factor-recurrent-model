@@ -805,6 +805,7 @@ class GridModelTests(unittest.TestCase):
                 "commit_steps = 4\n"
                 "refine_steps = 4\n"
                 "block_depth = 1\n"
+                "q_window = 3\n"
                 "hidden_state_dim = 16\n"
                 "num_heads = 4\n"
                 "halt_exploration_prob = 0.2\n"
@@ -819,6 +820,7 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_commit_steps"], 4)
             self.assertEqual(loaded["brc_refine_steps"], 4)
             self.assertEqual(loaded["brc_block_depth"], 1)
+            self.assertEqual(loaded["brc_q_window"], 3)
             self.assertEqual(loaded["brc_hidden_state_dim"], 16)
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_halt_exploration_prob"], 0.2)

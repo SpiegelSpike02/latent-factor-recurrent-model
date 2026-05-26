@@ -212,6 +212,8 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC commit_steps must be at least 1")
         if min(brc.refine_steps, brc.block_depth) < 1:
             raise ValueError("BRC refine_steps and block_depth must be at least 1")
+        if brc.q_window < 1:
+            raise ValueError("BRC q_window must be at least 1")
         hidden_dim = int(brc.hidden_state_dim) if brc.hidden_state_dim > 0 else config.d_model
         if hidden_dim < 1:
             raise ValueError("BRC hidden_state_dim must be positive or 0 for d_model")
@@ -238,6 +240,7 @@ class BRCModel(nnx.Module):
         self.commit_steps = int(brc.commit_steps)
         self.total_steps = self.commit_steps
         self.refine_steps = int(brc.refine_steps)
+        self.q_window = int(brc.q_window)
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
@@ -400,6 +403,44 @@ class BRCModel(nnx.Module):
     def initial_q(self, tokens: Array) -> Array:
         return self._uniform_q(tokens)
 
+    def initial_q_history(self, tokens: Array, q_logits: Array | None = None) -> Array:
+        if q_logits is None:
+            q_logits = self.initial_q(tokens)
+        return jnp.repeat(q_logits[:, None, :, :], self.q_window, axis=1)
+
+    def initial_q_history_count(self, tokens: Array) -> Array:
+        return jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
+
+    def _history_at(self, q_history: Array, index: Array) -> Array:
+        gather_index = jnp.broadcast_to(
+            index[:, None, None, None],
+            (q_history.shape[0], 1, q_history.shape[2], q_history.shape[3]),
+        )
+        gathered = jnp.take_along_axis(
+            q_history,
+            gather_index,
+            axis=1,
+        )
+        return gathered[:, 0]
+
+    def _append_q_history(
+        self,
+        q_history: Array,
+        q_logits: Array,
+        q_history_count: Array,
+    ) -> tuple[Array, Array]:
+        q_logits = q_logits.astype(jnp.float32)
+        next_count = jnp.minimum(q_history_count + 1, self.q_window)
+        if self.q_window == 1:
+            return q_logits[:, None, :, :], next_count
+        is_full = q_history_count >= self.q_window
+        shifted = jnp.concatenate((q_history[:, 1:], q_logits[:, None, :, :]), axis=1)
+        insert_index = jnp.minimum(q_history_count, self.q_window - 1)
+        insert_mask = jax.nn.one_hot(insert_index, self.q_window, dtype=bool)
+        inserted = jnp.where(insert_mask[:, :, None, None], q_logits[:, None, :, :], q_history)
+        next_history = jnp.where(is_full[:, None, None, None], shifted, inserted)
+        return next_history, next_count
+
     def _position_embeddings(self) -> Array:
         if self.brc.position_encoding != "learned":
             return jnp.zeros((self.config.seq_len, self.config.d_model), dtype=self.dtype)
@@ -409,31 +450,72 @@ class BRCModel(nnx.Module):
             + self.box_embed(self.box_ids)
         )
 
-    def _q_embedding(self, tokens: Array, q_logits: Array, step_index: Array) -> Array:
+    def _q_embedding(
+        self,
+        tokens: Array,
+        q_history: Array,
+        q_history_count: Array,
+        step_index: Array,
+    ) -> Array:
         del tokens, step_index
+        current_index = jnp.maximum(q_history_count - 1, 0)
+        previous_index = jnp.maximum(q_history_count - 2, 0)
+        previous2_index = jnp.maximum(q_history_count - 3, 0)
+        has_current = (q_history_count >= 1)[:, None, None]
+        has_previous = (q_history_count >= 2)[:, None, None]
+        has_previous2 = (q_history_count >= 3)[:, None, None]
+
+        q_logits = self._center_q_logits(self._history_at(q_history, current_index))
+        q_logits = jnp.where(has_current, q_logits, jnp.zeros_like(q_logits))
         q = self._normalize_q(q_logits)
         uniform = jnp.full_like(q, 1.0 / float(self.q_vocab_size))
-        trusted_q = q - uniform
+        direction = jnp.where(has_current, q - uniform, jnp.zeros_like(q))
+        if self.q_window >= 2:
+            previous = self._center_q_logits(self._history_at(q_history, previous_index))
+            velocity = self._center_q_logits(q_logits - previous)
+            velocity = jnp.where(has_previous, velocity, jnp.zeros_like(velocity))
+        else:
+            velocity = jnp.zeros_like(q_logits)
+        if self.q_window >= 3:
+            previous = self._center_q_logits(self._history_at(q_history, previous_index))
+            previous2 = self._center_q_logits(self._history_at(q_history, previous2_index))
+            acceleration = self._center_q_logits(q_logits - 2.0 * previous + previous2)
+            acceleration = jnp.where(has_previous2, acceleration, jnp.zeros_like(acceleration))
+        else:
+            acceleration = jnp.zeros_like(q_logits)
         embedding_table = maybe_cast(self.q_embed.embedding[: self.config.vocab_size], self.dtype)
-        q_embedding = jnp.einsum(
+        direction_embedding = jnp.einsum(
             "bnd,dk->bnk",
-            maybe_cast(trusted_q, self.dtype),
+            maybe_cast(direction, self.dtype),
             embedding_table,
             preferred_element_type=jnp.float32,
         )
-        return q_embedding
+        velocity_embedding = jnp.einsum(
+            "bnd,dk->bnk",
+            maybe_cast(jnp.tanh(velocity), self.dtype),
+            embedding_table,
+            preferred_element_type=jnp.float32,
+        )
+        acceleration_embedding = jnp.einsum(
+            "bnd,dk->bnk",
+            maybe_cast(jnp.tanh(acceleration), self.dtype),
+            embedding_table,
+            preferred_element_type=jnp.float32,
+        )
+        return direction_embedding + velocity_embedding + acceleration_embedding
 
     def _typed_conditions(
         self,
         tokens: Array,
-        q: Array,
+        q_history: Array,
+        q_history_count: Array,
         base_embeddings: Array,
         step_index: Array,
         *,
         train: bool,
         dropout_key: Array | None,
     ) -> tuple[Array, Array]:
-        q_embedding = self._q_embedding(tokens, q, step_index)
+        q_embedding = self._q_embedding(tokens, q_history, q_history_count, step_index)
         context_input = self.dropout(base_embeddings, deterministic=not train, rngs=dropout_key)
         q_input = self.dropout(q_embedding, deterministic=not train, rngs=dropout_key)
         context_condition = self.context_to_hidden(maybe_cast(context_input, self.dtype)).astype(self.dtype)
@@ -523,6 +605,8 @@ class BRCModel(nnx.Module):
         self,
         tokens: Array,
         q: Array,
+        q_history: Array,
+        q_history_count: Array,
         hidden_state: Array,
         base_embeddings: Array,
         step_index: Array,
@@ -540,7 +624,8 @@ class BRCModel(nnx.Module):
         }
         context_condition, q_condition = self._typed_conditions(
             tokens,
-            jax.lax.stop_gradient(q),
+            jax.lax.stop_gradient(q_history),
+            jax.lax.stop_gradient(q_history_count),
             base_embeddings,
             step_index,
             train=train,
@@ -600,6 +685,8 @@ class BRCModel(nnx.Module):
         batch_size = batch["inputs"].shape[0]
         return {
             "q": self._uniform_q(batch["inputs"]),
+            "q_history": self.initial_q_history(batch["inputs"]),
+            "q_history_count": self.initial_q_history_count(batch["inputs"]),
             "hidden": jnp.zeros(
                 (batch_size, self.config.seq_len, self.hidden_dim),
                 dtype=self.dtype,
@@ -638,6 +725,10 @@ class BRCModel(nnx.Module):
         step_index = jnp.minimum(steps, self.total_steps - 1)
         reset_q = self.initial_q(inputs)
         q = jnp.where(reset_state, reset_q, carry["q"])
+        reset_q_history = self.initial_q_history(inputs, reset_q)
+        reset_q_history_count = self.initial_q_history_count(inputs)
+        q_history = jnp.where(reset[:, None, None, None], reset_q_history, carry["q_history"])
+        q_history_count = jnp.where(reset, reset_q_history_count, carry["q_history_count"])
         reset_hidden = self.initial_hidden_state(
             inputs,
             reset_q,
@@ -649,6 +740,8 @@ class BRCModel(nnx.Module):
         next_q, next_hidden, halt_logits, flow_diagnostics = self._q_step(
             inputs,
             q,
+            q_history,
+            q_history_count,
             hidden,
             base_embeddings,
             step_index,
@@ -658,6 +751,11 @@ class BRCModel(nnx.Module):
         )
         logits = self._q_to_token_logits(next_q, inputs, step_index)
         new_steps = steps + 1
+        next_q_history, next_q_history_count = self._append_q_history(
+            q_history,
+            next_q,
+            q_history_count,
+        )
         is_last_step = new_steps >= self.total_steps
         if train and enable_halt:
             halted = is_last_step | (halt_logits > 0.0)
@@ -678,6 +776,8 @@ class BRCModel(nnx.Module):
             halted = is_last_step
         new_carry = {
             "q": jax.lax.stop_gradient(next_q),
+            "q_history": jax.lax.stop_gradient(next_q_history),
+            "q_history_count": jax.lax.stop_gradient(next_q_history_count),
             "hidden": jax.lax.stop_gradient(next_hidden),
             "steps": jax.lax.stop_gradient(new_steps),
             "halted": jax.lax.stop_gradient(halted),
@@ -708,16 +808,20 @@ class BRCModel(nnx.Module):
     ) -> tuple[Array, dict[str, Array]]:
         if initial_q is None:
             initial_q = self.initial_q(tokens)
+        initial_q_history = self.initial_q_history(tokens, initial_q)
+        initial_q_history_count = self.initial_q_history_count(tokens)
         base_embeddings, context = self.context_memory(tokens)
         query_mask = (~context).astype(jnp.float32)
         query_normalizer = jnp.maximum(jnp.sum(query_mask), 1.0)
 
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key = scan_inputs
-            q, hidden_state = carry
+            q, q_history, q_history_count, hidden_state = carry
             next_q, next_hidden, halt_logits, flow_diagnostics = self._q_step(
                 tokens,
                 q,
+                q_history,
+                q_history_count,
                 hidden_state,
                 base_embeddings,
                 step_index,
@@ -725,7 +829,12 @@ class BRCModel(nnx.Module):
                 dropout_key=step_dropout_key,
                 stop_hidden_between_steps=True,
             )
-            next_carry = (next_q, next_hidden)
+            next_q_history, next_q_history_count = self._append_q_history(
+                q_history,
+                next_q,
+                q_history_count,
+            )
+            next_carry = (next_q, next_q_history, next_q_history_count, next_hidden)
             if return_final_only:
                 return next_carry, None
             logits = self._q_to_token_logits(next_q, tokens, step_index)
@@ -753,13 +862,18 @@ class BRCModel(nnx.Module):
             train=train,
             dropout_key=step_dropout_keys[0],
         )
-        initial_carry = (initial_q.astype(jnp.float32), initial_hidden)
+        initial_carry = (
+            initial_q.astype(jnp.float32),
+            initial_q_history.astype(jnp.float32),
+            initial_q_history_count,
+            initial_hidden,
+        )
         final_carry, scan_outputs = jax.lax.scan(
             scan_step,
             initial_carry,
             (step_indices, step_dropout_keys),
         )
-        q_final, _hidden_final = final_carry
+        q_final, _q_history_final, _q_history_count_final, _hidden_final = final_carry
         if return_final_only:
             final_step = jnp.asarray(self.total_steps - 1, dtype=jnp.int32)
             logits = self._q_to_token_logits(q_final, tokens, final_step)

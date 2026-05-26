@@ -160,6 +160,8 @@ def _brc_compact_training_rollout(
     def scan_step(carry, scan_inputs):
         (
             q,
+            q_history,
+            q_history_count,
             hidden_state,
             early_candidate,
             mid_candidate,
@@ -171,6 +173,8 @@ def _brc_compact_training_rollout(
         next_q, next_hidden, halt_logits, flow_diagnostics = model._q_step(
             inputs,
             q,
+            q_history,
+            q_history_count,
             hidden_state,
             base_embeddings,
             step_index,
@@ -199,8 +203,15 @@ def _brc_compact_training_rollout(
 
         confidence = jnp.max(model._normalize_q(next_q), axis=-1)
         q_top1_probability = jnp.sum(confidence * query_mask) / query_normalizer
+        next_q_history, next_q_history_count = model._append_q_history(
+            q_history,
+            next_q,
+            q_history_count,
+        )
         return (
             next_q,
+            next_q_history,
+            next_q_history_count,
             next_hidden,
             early_candidate,
             mid_candidate,
@@ -229,6 +240,8 @@ def _brc_compact_training_rollout(
     )
     initial_carry = (
         initial_q.astype(jnp.float32),
+        model.initial_q_history(inputs, initial_q).astype(jnp.float32),
+        model.initial_q_history_count(inputs),
         initial_hidden,
         candidate_init,
         candidate_init,
@@ -238,6 +251,8 @@ def _brc_compact_training_rollout(
     )
     (
         q_final,
+        _q_history_final,
+        _q_history_count_final,
         _hidden_final,
         early_candidate,
         mid_candidate,

@@ -19,6 +19,7 @@ loss_type = "softmax"
 commit_steps = 48
 refine_steps = 4
 block_depth = 2
+q_window = 3
 step_loss_schedule = "uniform"
 
 [model.brc.objective]
