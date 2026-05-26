@@ -176,12 +176,9 @@ def _brc_compact_training_rollout(
             hidden_state,
             early_candidate,
             mid_candidate,
-            selected_candidate,
-            selected_step,
-            has_selected,
         ) = carry
         step_index, step_dropout_key = scan_inputs
-        next_q, next_hidden, halt_logits, flow_diagnostics = model._q_step(
+        next_q, next_hidden, flow_diagnostics = model._q_step(
             inputs,
             q,
             q_history,
@@ -205,13 +202,6 @@ def _brc_compact_training_rollout(
             jnp.sum(step_correct, axis=-1) == supervised_cells_per_example,
             True,
         )
-        step_halted = halt_logits > 0.0
-        step_halted = jnp.where(step_index == rollout_steps - 1, True, step_halted)
-        take_selected = step_halted & (~has_selected)
-        selected_candidate = jnp.where(take_selected[:, None], predictions, selected_candidate)
-        selected_step = jnp.where(take_selected, step_index, selected_step)
-        has_selected = has_selected | take_selected
-
         confidence = jnp.max(model._normalize_q(next_q), axis=-1)
         q_top1_probability = jnp.sum(confidence * query_mask) / query_normalizer
         next_q_history, next_q_history_count = model._append_q_history(
@@ -226,18 +216,16 @@ def _brc_compact_training_rollout(
             next_hidden,
             early_candidate,
             mid_candidate,
-            selected_candidate,
-            selected_step,
-            has_selected,
         ), (
             per_step_loss,
             q_top1_probability,
-            halt_logits,
             step_exact.astype(jnp.float32),
             jnp.mean(flow_diagnostics["flow_speed"].astype(jnp.float32)),
-            jnp.mean(flow_diagnostics["proposal_tv_distance"].astype(jnp.float32)),
+            jnp.mean(flow_diagnostics["flow_step_length"].astype(jnp.float32)),
+            jnp.mean(flow_diagnostics["velocity_rms"].astype(jnp.float32)),
+            jnp.mean(flow_diagnostics["logit_delta_rms"].astype(jnp.float32)),
             jnp.mean(flow_diagnostics["q_tv_delta"].astype(jnp.float32)),
-            jnp.mean(flow_diagnostics["flow_kl_energy"].astype(jnp.float32)),
+            jnp.mean(flow_diagnostics["flow_energy"].astype(jnp.float32)),
         )
 
     step_indices = jnp.arange(rollout_steps, dtype=jnp.int32)
@@ -256,9 +244,6 @@ def _brc_compact_training_rollout(
         initial_hidden,
         candidate_init,
         candidate_init,
-        candidate_init,
-        jnp.full((inputs.shape[0],), rollout_steps - 1, dtype=jnp.int32),
-        jnp.zeros((inputs.shape[0],), dtype=bool),
     )
     (
         q_final,
@@ -267,9 +252,6 @@ def _brc_compact_training_rollout(
         _hidden_final,
         early_candidate,
         mid_candidate,
-        selected_candidate,
-        selected_step,
-        _has_selected,
     ), scan_outputs = jax.lax.scan(
         scan_step,
         initial_carry,
@@ -278,12 +260,13 @@ def _brc_compact_training_rollout(
     (
         per_step_loss,
         q_top1_probability,
-        halt_logits,
         per_step_exact,
         flow_speed,
-        proposal_tv_distance,
+        flow_step_length,
+        velocity_rms,
+        logit_delta_rms,
         q_tv_delta,
-        flow_kl_energy,
+        flow_energy,
     ) = scan_outputs
     final_step = jnp.asarray(rollout_steps - 1, dtype=jnp.int32)
     final_logits = model._q_to_token_logits(q_final, inputs, final_step)
@@ -294,14 +277,13 @@ def _brc_compact_training_rollout(
         "early_candidate": early_candidate,
         "mid_candidate": mid_candidate,
         "final_candidate": final_candidate,
-        "halt_logits": halt_logits,
         "per_step_exact": per_step_exact,
         "flow_speed": flow_speed,
-        "proposal_tv_distance": proposal_tv_distance,
+        "flow_step_length": flow_step_length,
+        "velocity_rms": velocity_rms,
+        "logit_delta_rms": logit_delta_rms,
         "q_tv_delta": q_tv_delta,
-        "flow_kl_energy": flow_kl_energy,
-        "selected_candidate": selected_candidate,
-        "selected_step": selected_step,
+        "flow_energy": flow_energy,
     }
     return final_logits, per_step_loss, diagnostics
 
@@ -322,7 +304,6 @@ def brc_loss_and_metrics(
     batch: dict[str, jax.Array],
     train: bool,
     dropout_key: jax.Array | None,
-    halt_loss_weight: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     if dropout_key is None:
         dropout_key = jax.random.key(0)
@@ -366,41 +347,14 @@ def brc_loss_and_metrics(
         token_loss = token_cross_entropy(model, step_logits, step_targets)
         per_step_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=(1, 2)) / normalizer
         final_logits = step_logits[-1]
-        step_predictions = _output_predictions_to_tokens(model, step_logits)
-        step_correct = (step_predictions == step_targets).astype(jnp.float32) * step_loss_mask.astype(jnp.float32)
-        supervised_cells_per_example_for_steps = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
-        if halt_loss_weight != 0.0:
-            diagnostics["per_step_exact"] = jnp.where(
-                supervised_cells_per_example_for_steps[None, :] > 0,
-                jnp.sum(step_correct, axis=-1) == supervised_cells_per_example_for_steps[None, :],
-                True,
-            ).astype(jnp.float32)
-            selected_step = _trm_selected_step(diagnostics["halt_logits"])
-            gather_index = selected_step[None, :, None, None]
-            selected_logits = jnp.take_along_axis(
-                step_logits,
-                jnp.broadcast_to(gather_index, (1, inputs.shape[0], step_logits.shape[2], step_logits.shape[3])),
-                axis=0,
-            ).squeeze(0)
-            diagnostics["selected_candidate"] = _output_predictions_to_tokens(model, selected_logits)
-            diagnostics["selected_step"] = selected_step
     step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
     step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
-    per_step_flow_kl_energy = diagnostics["flow_kl_energy"].astype(jnp.float32)
-    flow_kl_energy_loss = jnp.sum(step_loss_weights * per_step_flow_kl_energy)
+    per_step_flow_energy = diagnostics["flow_energy"].astype(jnp.float32)
+    flow_energy_loss = jnp.sum(step_loss_weights * per_step_flow_energy)
     solution_loss = per_step_loss[-1]
-    halt_loss = zero
-    if halt_loss_weight != 0.0:
-        halt_targets = jax.lax.stop_gradient(diagnostics["per_step_exact"])
-        halt_loss_per_example = optax.sigmoid_binary_cross_entropy(diagnostics["halt_logits"], halt_targets)
-        halt_loss = jnp.sum(halt_loss_per_example * example_mask[None, :]) / jnp.maximum(
-            jnp.sum(example_mask) * diagnostics["halt_logits"].shape[0],
-            1.0,
-        )
     loss = (
         step_ce_loss
-        + float(model.brc.flow_kl_energy_weight) * flow_kl_energy_loss
-        + halt_loss_weight * halt_loss
+        + float(model.brc.flow_energy_weight) * flow_energy_loss
     )
 
     predictions = _output_predictions_to_tokens(model, final_logits)
@@ -439,7 +393,7 @@ def brc_loss_and_metrics(
         "ce_loss": step_ce_loss,
         "final_ce_loss": solution_loss,
         "mean_ce_loss": jnp.mean(per_step_loss),
-        "flow_kl_energy_loss": flow_kl_energy_loss,
+        "flow_energy_loss": flow_energy_loss,
         "final_target_probability": target_probability,
         "accuracy": cell_accuracy,
         "query_accuracy": query_accuracy,
@@ -450,9 +404,11 @@ def brc_loss_and_metrics(
         "step_loss_weights": step_loss_weights,
         "q_top1_probability": q_top1_probability,
         "flow_speed": jnp.mean(diagnostics["flow_speed"]),
-        "proposal_tv_distance": jnp.mean(diagnostics["proposal_tv_distance"]),
+        "flow_step_length": jnp.mean(diagnostics["flow_step_length"]),
+        "velocity_rms": jnp.mean(diagnostics["velocity_rms"]),
+        "logit_delta_rms": jnp.mean(diagnostics["logit_delta_rms"]),
         "q_tv_delta": jnp.mean(diagnostics["q_tv_delta"]),
-        "flow_kl_energy": jnp.mean(diagnostics["flow_kl_energy"]),
+        "flow_energy": jnp.mean(diagnostics["flow_energy"]),
     }
     if model.config.task_type == "sudoku":
         metrics.update(
@@ -467,15 +423,12 @@ def brc_loss_and_metrics(
                 "per_step_loss": per_step_loss,
                 "per_step_q_top1_probability": per_step_q_top1_probability,
                 "per_step_flow_speed": diagnostics["flow_speed"],
-                "per_step_proposal_tv_distance": diagnostics["proposal_tv_distance"],
+                "per_step_flow_step_length": diagnostics["flow_step_length"],
+                "per_step_velocity_rms": diagnostics["velocity_rms"],
+                "per_step_logit_delta_rms": diagnostics["logit_delta_rms"],
                 "per_step_q_tv_delta": diagnostics["q_tv_delta"],
-                "per_step_flow_kl_energy": diagnostics["flow_kl_energy"],
+                "per_step_flow_energy": diagnostics["flow_energy"],
             }
-        )
-    if halt_loss_weight != 0.0:
-        metrics["per_step_halt_probability"] = (
-            jnp.sum(jax.nn.sigmoid(diagnostics["halt_logits"]) * example_mask[None, :], axis=1)
-            / jnp.maximum(jnp.sum(example_mask), 1.0)
         )
     if model.config.task_type == "sudoku":
         context_consistency, conflicts = _sudoku_board_metrics(model, predictions, inputs)
@@ -486,66 +439,37 @@ def brc_loss_and_metrics(
             }
         )
     metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
-    if halt_loss_weight != 0.0:
-        selected_predictions = diagnostics["selected_candidate"]
-        selected_correct = (selected_predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
-        selected_accuracy = jnp.sum(selected_correct) / metric_normalizer
-        selected_correct_per_example = jnp.sum(selected_correct, axis=-1)
-        selected_exact_examples = jnp.where(
-            supervised_cells_per_example > 0,
-            selected_correct_per_example == supervised_cells_per_example,
-            True,
-        )
-        selected_exact_accuracy = _masked_example_mean(selected_exact_examples.astype(jnp.float32), example_mask)
-        metrics.update(
-            {
-                "halt_loss": halt_loss,
-                "selected_accuracy": selected_accuracy,
-                "selected_exact_accuracy": selected_exact_accuracy,
-                "selected_step": _masked_example_mean(
-                    diagnostics["selected_step"].astype(jnp.float32) + 1.0,
-                    example_mask,
-                ),
-            }
-        )
     return loss, metrics
 
 
-def brc_act_loss_and_metrics(
+def brc_carry_loss_and_metrics(
     model: BRCModel,
     carry: dict[str, jax.Array],
     batch: dict[str, jax.Array],
     train: bool,
     dropout_key: jax.Array | None,
-    halt_loss_weight: float = 0.0,
-    *,
-    enable_halt: bool = True,
 ) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
     if dropout_key is None:
         dropout_key = jax.random.key(0)
-    new_carry, logits, diagnostics = model.forward_act_step(
+    new_carry, logits, diagnostics = model.forward_carry_step(
         carry,
         batch,
         train=train,
         dropout_key=dropout_key,
-        enable_halt=enable_halt,
     )
     inputs = new_carry["current_inputs"]
     targets = new_carry["current_labels"]
     example_mask = new_carry["current_example_mask"].astype(jnp.float32)
-    loss_mask = _apply_example_mask(
-        supervised_loss_mask(model, targets),
-        example_mask,
-    )
+    loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
     normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32)), 1.0)
     token_loss = token_cross_entropy(model, logits, targets)
     ce_loss = jnp.sum(token_loss * loss_mask.astype(jnp.float32)) / normalizer
     predictions = _output_predictions_to_tokens(model, logits)
     metric_correct = (predictions == targets).astype(jnp.float32) * loss_mask.astype(jnp.float32)
     context_mask, query_mask = _brc_region_masks(model, inputs, loss_mask)
-    current_accuracy = jnp.sum(metric_correct) / normalizer
-    current_context_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
-    current_query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
+    accuracy = jnp.sum(metric_correct) / normalizer
+    context_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
+    query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
     supervised_cells_per_example = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
     correct_per_example = jnp.sum(metric_correct, axis=-1)
     exact_examples = jnp.where(
@@ -554,133 +478,49 @@ def brc_act_loss_and_metrics(
         True,
     )
     exact_f32 = exact_examples.astype(jnp.float32)
-    valid_halted = new_carry["halted"] & (supervised_cells_per_example > 0)
-    valid_halted_f32 = valid_halted.astype(jnp.float32)
-    valid_halted_count = jnp.sum(valid_halted_f32)
-    valid_halted_normalizer = jnp.maximum(valid_halted_count, 1.0)
-    per_example_accuracy = correct_per_example / jnp.maximum(supervised_cells_per_example, 1.0)
-    accuracy = jnp.sum(per_example_accuracy * valid_halted_f32) / valid_halted_normalizer
-    exact_accuracy = jnp.sum(exact_f32 * valid_halted_f32) / valid_halted_normalizer
-    exact_count = jnp.sum(exact_f32 * valid_halted_f32)
-
-    context_correct_per_example = jnp.sum(metric_correct * context_mask.astype(jnp.float32), axis=-1)
-    context_cells_per_example = jnp.sum(context_mask.astype(jnp.float32), axis=-1)
-    context_accuracy_per_example = context_correct_per_example / jnp.maximum(context_cells_per_example, 1.0)
-    query_correct_per_example = jnp.sum(metric_correct * query_mask.astype(jnp.float32), axis=-1)
-    query_cells_per_example = jnp.sum(query_mask.astype(jnp.float32), axis=-1)
-    query_accuracy_per_example = query_correct_per_example / jnp.maximum(query_cells_per_example, 1.0)
-    valid_context_halted = valid_halted & (context_cells_per_example > 0)
-    valid_query_halted = valid_halted & (query_cells_per_example > 0)
-    context_accuracy = _masked_example_mean(context_accuracy_per_example, valid_context_halted.astype(jnp.float32))
-    query_accuracy = _masked_example_mean(query_accuracy_per_example, valid_query_halted.astype(jnp.float32))
+    exact_accuracy = _masked_example_mean(exact_f32, example_mask)
+    exact_count = jnp.sum(exact_f32 * example_mask)
     target_probability_cells = token_target_probability(model, logits, targets)
-    per_example_target_probability = (
-        jnp.sum(target_probability_cells * loss_mask.astype(jnp.float32), axis=-1)
-        / jnp.maximum(supervised_cells_per_example, 1.0)
-    )
-    target_probability = jnp.sum(per_example_target_probability * valid_halted_f32) / valid_halted_normalizer
-    context_target_probability_per_example = (
-        jnp.sum(target_probability_cells * context_mask.astype(jnp.float32), axis=-1)
-        / jnp.maximum(context_cells_per_example, 1.0)
-    )
-    query_target_probability_per_example = (
-        jnp.sum(target_probability_cells * query_mask.astype(jnp.float32), axis=-1)
-        / jnp.maximum(query_cells_per_example, 1.0)
-    )
-    context_target_probability = _masked_example_mean(
-        context_target_probability_per_example,
-        valid_context_halted.astype(jnp.float32),
-    )
-    query_target_probability = _masked_example_mean(
-        query_target_probability_per_example,
-        valid_query_halted.astype(jnp.float32),
-    )
-    active_target_probability = jnp.sum(per_example_target_probability * example_mask) / jnp.maximum(
-        jnp.sum(example_mask),
-        1.0,
-    )
-    active_context_target_probability = _masked_probability(target_probability_cells, context_mask)
-    active_query_target_probability = _masked_probability(target_probability_cells, query_mask)
-    halt_loss = jnp.asarray(0.0, dtype=jnp.float32)
-    halt_predictions = diagnostics["halt_logits"] > 0.0
-    halt_target_rate = jnp.sum(exact_f32 * example_mask) / jnp.maximum(jnp.sum(example_mask), 1.0)
-    halt_positive_rate = jnp.sum(halt_predictions.astype(jnp.float32) * example_mask) / jnp.maximum(
-        jnp.sum(example_mask),
-        1.0,
-    )
-    halt_accuracy = jnp.sum(
-        (halt_predictions == exact_examples).astype(jnp.float32) * example_mask
-    ) / jnp.maximum(jnp.sum(example_mask), 1.0)
-    if halt_loss_weight != 0.0:
-        halt_targets = jax.lax.stop_gradient(exact_f32)
-        halt_loss_per_example = optax.sigmoid_binary_cross_entropy(
-            diagnostics["halt_logits"],
-            halt_targets,
-        )
-        halt_loss = jnp.sum(halt_loss_per_example * example_mask) / jnp.maximum(
-            jnp.sum(example_mask),
-            1.0,
-        )
-    flow_kl_energy_loss = diagnostics["flow_kl_energy"].astype(jnp.float32)
-    loss = (
-        ce_loss
-        + float(model.brc.flow_kl_energy_weight) * flow_kl_energy_loss
-        + halt_loss_weight * halt_loss
-    )
+    target_probability = jnp.sum(target_probability_cells * loss_mask.astype(jnp.float32)) / normalizer
+    context_target_probability = _masked_probability(target_probability_cells, context_mask)
+    query_target_probability = _masked_probability(target_probability_cells, query_mask)
+    flow_energy_loss = diagnostics["flow_energy"].astype(jnp.float32)
+    loss = ce_loss + float(model.brc.flow_energy_weight) * flow_energy_loss
     metrics = {
         "loss": loss,
         "ce_loss": ce_loss,
-        "active_ce_loss": ce_loss,
-        "flow_kl_energy_loss": flow_kl_energy_loss,
-        "completed_accuracy": accuracy,
-        "completed_query_accuracy": query_accuracy,
-        "completed_exact_accuracy": exact_accuracy,
-        "completed_exact_count": exact_count,
-        "completed_target_probability": target_probability,
-        "completed_query_target_probability": query_target_probability,
-        "completed_count": valid_halted_count,
-        "active_accuracy": current_accuracy,
-        "active_query_accuracy": current_query_accuracy,
-        "active_exact_accuracy": _masked_example_mean(exact_f32, example_mask),
-        "active_target_probability": active_target_probability,
-        "active_query_target_probability": active_query_target_probability,
-        "carry_step": diagnostics["act_step"],
-        "act_step": diagnostics["act_step"],
-        "halt_accuracy": halt_accuracy,
-        "halt_positive_rate": halt_positive_rate,
-        "halt_target_rate": halt_target_rate,
-        "halted_rate": diagnostics["halted_rate"],
-        "completed_rate": diagnostics["halted_rate"],
+        "flow_energy_loss": flow_energy_loss,
+        "accuracy": accuracy,
+        "query_accuracy": query_accuracy,
+        "exact_accuracy": exact_accuracy,
+        "exact_count": exact_count,
+        "final_target_probability": target_probability,
+        "query_target_probability": query_target_probability,
+        "carry_step": diagnostics["carry_step"],
         "reset_rate": diagnostics["reset_rate"],
+        "terminal_reset_rate": diagnostics["terminal_reset_rate"],
         "flow_speed": diagnostics["flow_speed"],
-        "proposal_tv_distance": diagnostics["proposal_tv_distance"],
+        "flow_step_length": diagnostics["flow_step_length"],
+        "velocity_rms": diagnostics["velocity_rms"],
+        "logit_delta_rms": diagnostics["logit_delta_rms"],
         "q_tv_delta": diagnostics["q_tv_delta"],
-        "flow_kl_energy": diagnostics["flow_kl_energy"],
+        "flow_energy": diagnostics["flow_energy"],
     }
     if model.config.task_type == "sudoku":
         metrics.update(
             {
-                "completed_context_accuracy": context_accuracy,
-                "completed_context_target_probability": context_target_probability,
-                "active_context_accuracy": current_context_accuracy,
-                "active_context_target_probability": active_context_target_probability,
+                "context_accuracy": context_accuracy,
+                "context_target_probability": context_target_probability,
             }
         )
         context_consistency, conflicts = _sudoku_board_metrics(model, predictions, inputs)
         metrics.update(
             {
-                "active_context_consistency": context_consistency,
-                "active_conflicts": conflicts,
+                "context_consistency": context_consistency,
+                "conflicts": conflicts,
             }
         )
-    metrics.update(
-        {
-            f"active_{key}": value
-            for key, value in _maybe_path_metrics(model, predictions, targets, loss_mask).items()
-        }
-    )
-    if halt_loss_weight != 0.0:
-        metrics["halt_loss"] = halt_loss
+    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
     return loss, (metrics, new_carry)
 
 
@@ -699,7 +539,6 @@ def loss_and_metrics(
             batch,
             train,
             dropout_key,
-            halt_loss_weight,
         )
 
     inputs = batch["inputs"]

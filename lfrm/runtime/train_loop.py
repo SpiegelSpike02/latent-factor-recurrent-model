@@ -34,7 +34,6 @@ from lfrm.runtime.sharding import (
 )
 from lfrm.training import (
     build_ema_update_runner,
-    build_brc_act_train_step_runner,
     build_brc_dense_unroll_train_step_runner,
     build_brc_step_carry_train_step_runner,
     build_state_copy_runner,
@@ -67,9 +66,11 @@ PER_STEP_SCALAR_SERIES = (
     ("per_step_accuracy", "accuracy_by_step"),
     ("per_step_q_top1_probability", "q_top1_probability_by_step"),
     ("per_step_flow_speed", "flow_speed_by_step"),
-    ("per_step_proposal_tv_distance", "proposal_tv_distance_by_step"),
+    ("per_step_flow_step_length", "flow_step_length_by_step"),
+    ("per_step_velocity_rms", "velocity_rms_by_step"),
+    ("per_step_logit_delta_rms", "logit_delta_rms_by_step"),
     ("per_step_q_tv_delta", "q_tv_delta_by_step"),
-    ("per_step_flow_kl_energy", "flow_kl_energy_by_step"),
+    ("per_step_flow_energy", "flow_energy_by_step"),
 )
 
 
@@ -131,7 +132,7 @@ def training_uses_carry(config: ExperimentConfig) -> bool:
 
 
 def halt_loss_weight_for_mode(config: ExperimentConfig) -> float:
-    if config.model.model_type == "brc" and config.train.train_mode == "dense_unroll":
+    if config.model.model_type == "brc" and config.train.train_mode in ("dense_unroll", "step_carry"):
         return 0.0
     return config.train.halt_loss_weight
 
@@ -153,11 +154,11 @@ def build_step_runners(config: ExperimentConfig):
     halt_loss_weight = halt_loss_weight_for_mode(config)
     if config.model.model_type == "brc":
         if config.train.train_mode == "dense_unroll":
-            train_step_fn = build_brc_dense_unroll_train_step_runner(halt_loss_weight)
+            train_step_fn = build_brc_dense_unroll_train_step_runner()
         elif config.train.train_mode == "step_carry":
-            train_step_fn = build_brc_step_carry_train_step_runner(halt_loss_weight)
+            train_step_fn = build_brc_step_carry_train_step_runner()
         else:
-            train_step_fn = build_brc_act_train_step_runner(halt_loss_weight)
+            raise ValueError("BRC supports train_mode='step_carry' or 'dense_unroll'")
         eval_step_fn = build_eval_step_runner(
             halt_loss_weight,
             config.train.terminal_residual_weight,

@@ -5,7 +5,7 @@ from flax import nnx
 
 from lfrm.models import BRCModel
 from lfrm.training.factory import GridReasoningModel
-from lfrm.training.steps import brc_act_loss_and_metrics, brc_loss_and_metrics, loss_and_metrics
+from lfrm.training.steps import brc_carry_loss_and_metrics, brc_loss_and_metrics, loss_and_metrics
 
 
 def build_train_step_runner(
@@ -36,7 +36,7 @@ def build_train_step_runner(
     return nnx.jit(train_step_with_weight)
 
 
-def build_brc_act_train_step_runner(halt_loss_weight: float = 0.0):
+def build_brc_step_carry_train_step_runner():
     def train_step(
         model: BRCModel,
         optimizer: nnx.Optimizer,
@@ -48,13 +48,12 @@ def build_brc_act_train_step_runner(halt_loss_weight: float = 0.0):
         dropout_key = jax.random.fold_in(dropout_key, optimizer_step)
 
         def objective(model, carry, batch, train, dropout_key):
-            return brc_act_loss_and_metrics(
+            return brc_carry_loss_and_metrics(
                 model,
                 carry,
                 batch,
                 train,
                 dropout_key,
-                halt_loss_weight,
             )
 
         (_, (metrics, new_carry)), grads = nnx.value_and_grad(objective, has_aux=True)(
@@ -67,50 +66,13 @@ def build_brc_act_train_step_runner(halt_loss_weight: float = 0.0):
         optimizer.update(model, grads)
         return metrics, new_carry
 
-    # The carry also contains raw int inputs/labels for reset bookkeeping. Donating
-    # the whole pytree asks JAX to donate those non-reusable buffers and produces
-    # noisy "donated buffers were not usable" warnings on newer JAX versions.
+    # Step-carry is a fixed-rollout truncated execution path for BRC. It carries
+    # q/H between optimizer updates, but deliberately does not train or execute
+    # learned ACT halt; samples reset only at the terminal commit.
     return nnx.jit(train_step)
 
 
-def build_brc_step_carry_train_step_runner(halt_loss_weight: float = 0.0):
-    def train_step(
-        model: BRCModel,
-        optimizer: nnx.Optimizer,
-        carry: dict[str, jax.Array],
-        batch: dict[str, jax.Array],
-        dropout_key: jax.Array,
-        optimizer_step: jax.Array,
-    ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
-        dropout_key = jax.random.fold_in(dropout_key, optimizer_step)
-
-        def objective(model, carry, batch, train, dropout_key):
-            return brc_act_loss_and_metrics(
-                model,
-                carry,
-                batch,
-                train,
-                dropout_key,
-                halt_loss_weight=halt_loss_weight,
-                enable_halt=True,
-            )
-
-        (_, (metrics, new_carry)), grads = nnx.value_and_grad(objective, has_aux=True)(
-            model,
-            carry,
-            batch,
-            True,
-            dropout_key,
-        )
-        optimizer.update(model, grads)
-        return metrics, new_carry
-
-    # See build_brc_act_train_step_runner: BRC carry contains non-donatable raw
-    # batch leaves, so avoid donating the full pytree.
-    return nnx.jit(train_step)
-
-
-def build_brc_dense_unroll_train_step_runner(halt_loss_weight: float = 0.0):
+def build_brc_dense_unroll_train_step_runner():
     def train_step(
         model: BRCModel,
         optimizer: nnx.Optimizer,
@@ -123,7 +85,6 @@ def build_brc_dense_unroll_train_step_runner(halt_loss_weight: float = 0.0):
                 batch,
                 train,
                 dropout_key,
-                halt_loss_weight,
             )
 
         (_, metrics), grads = nnx.value_and_grad(objective, has_aux=True)(

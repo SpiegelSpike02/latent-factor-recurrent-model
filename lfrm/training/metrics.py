@@ -112,10 +112,12 @@ CORE_SCALAR_METRICS = (
     "active_conflicts",
     "q_top1_probability",
     "flow_speed",
-    "proposal_tv_distance",
+    "flow_step_length",
+    "velocity_rms",
+    "logit_delta_rms",
     "q_tv_delta",
-    "flow_kl_energy",
-    "flow_kl_energy_loss",
+    "flow_energy",
+    "flow_energy_loss",
     "step_loss_weights",
     "halt_loss",
     "selected_lm_loss",
@@ -172,44 +174,15 @@ BRC_SCALAR_METRICS = (
     "target_path_rate",
     "q_top1_probability",
     "flow_speed",
-    "proposal_tv_distance",
+    "flow_step_length",
+    "velocity_rms",
+    "logit_delta_rms",
     "q_tv_delta",
-    "flow_kl_energy",
-    "flow_kl_energy_loss",
-    "halt_loss",
-    "halt_accuracy",
-    "halt_positive_rate",
-    "halt_target_rate",
-    "selected_accuracy",
-    "selected_exact_accuracy",
-    "selected_step",
+    "flow_energy",
+    "flow_energy_loss",
     "carry_step",
-    "completed_rate",
     "reset_rate",
-    "active_ce_loss",
-    "active_accuracy",
-    "active_context_accuracy",
-    "active_query_accuracy",
-    "active_exact_accuracy",
-    "active_target_probability",
-    "active_context_target_probability",
-    "active_query_target_probability",
-    "active_context_consistency",
-    "active_conflicts",
-    "active_path_precision",
-    "active_path_recall",
-    "active_path_f1",
-    "active_path_positive_rate",
-    "active_target_path_rate",
-    "completed_count",
-    "completed_accuracy",
-    "completed_context_accuracy",
-    "completed_query_accuracy",
-    "completed_exact_accuracy",
-    "completed_target_probability",
-    "completed_context_target_probability",
-    "completed_query_target_probability",
-    "completed_exact_count",
+    "terminal_reset_rate",
 )
 WANDB_HISTORY_EXCLUDED_SCALAR_METRICS: set[str] = set()
 TERMINAL_DIAGNOSTIC_METRICS = (
@@ -256,7 +229,6 @@ LEGACY_METRIC_NAMES = {
     "q_confidence",
     "proposal_distance",
     "q_delta",
-    "flow_energy",
     "q_update_alpha",
 }
 BRC_CONSOLE_GROUPS = (
@@ -281,56 +253,12 @@ BRC_CONSOLE_GROUPS = (
             "exact_count",
         ),
     ),
-    (
-        "completed",
-        (
-            "completed_count",
-            "completed_accuracy",
-            "completed_query_accuracy",
-            "completed_context_accuracy",
-            "completed_exact_accuracy",
-            "completed_target_probability",
-            "completed_query_target_probability",
-            "completed_context_target_probability",
-            "completed_exact_count",
-        ),
-    ),
-    (
-        "active",
-        (
-            "active_ce_loss",
-            "active_accuracy",
-            "active_query_accuracy",
-            "active_context_accuracy",
-            "active_exact_accuracy",
-            "active_target_probability",
-            "active_query_target_probability",
-            "active_context_target_probability",
-            "current_accuracy",
-            "current_query_accuracy",
-            "current_context_accuracy",
-            "current_exact_accuracy",
-            "reset_rate",
-        ),
-    ),
-    (
-        "halt",
-        (
-            "halt_loss",
-            "halt_accuracy",
-            "halt_positive_rate",
-            "halt_target_rate",
-            "carry_step",
-            "completed_rate",
-        ),
-    ),
+    ("carry", ("carry_step", "reset_rate", "terminal_reset_rate")),
     (
         "sudoku",
         (
             "context_consistency",
             "conflicts",
-            "active_context_consistency",
-            "active_conflicts",
         ),
     ),
     (
@@ -341,11 +269,6 @@ BRC_CONSOLE_GROUPS = (
             "path_f1",
             "path_positive_rate",
             "target_path_rate",
-            "active_path_precision",
-            "active_path_recall",
-            "active_path_f1",
-            "active_path_positive_rate",
-            "active_target_path_rate",
         ),
     ),
     (
@@ -353,10 +276,12 @@ BRC_CONSOLE_GROUPS = (
         (
             "q_top1_probability",
             "flow_speed",
-            "proposal_tv_distance",
+            "flow_step_length",
+            "velocity_rms",
+            "logit_delta_rms",
             "q_tv_delta",
-            "flow_kl_energy",
-            "flow_kl_energy_loss",
+            "flow_energy",
+            "flow_energy_loss",
         ),
     ),
 )
@@ -419,23 +344,6 @@ def scalar_metric_names(config) -> tuple[str, ...]:
             name for name in names
             if "context_" not in name
             and name not in ("context_accuracy", "context_target_probability", "context_consistency", "conflicts")
-        ]
-    brc_halt_enabled = (
-        config.model.model_type == "brc"
-        and config.train.halt_loss_weight != 0.0
-        and config.train.train_mode != "dense_unroll"
-    )
-    if config.model.model_type == "brc" and not brc_halt_enabled:
-        names = [
-            name for name in names
-            if not (
-                name == "halt_loss"
-                or name.startswith("halt_")
-                or name.startswith("selected_")
-                or name in ("act_step", "carry_step", "halted_rate", "completed_rate", "reset_rate")
-                or name.startswith("active_")
-                or name.startswith("completed_")
-            )
         ]
     if config.train.terminal_residual_weight != 0.0:
         names.extend(TERMINAL_DIAGNOSTIC_METRICS)

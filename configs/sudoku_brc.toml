@@ -23,7 +23,7 @@ q_window = 3
 step_loss_schedule = "uniform"
 
 [model.brc.objective]
-flow_kl_energy_weight = 1e-4
+flow_energy_weight = 1e-4
 
 [model.brc.hidden]
 hidden_state_dim = 512
@@ -37,10 +37,6 @@ rms_norm_eps = 1e-5
 [model.brc.position]
 position_encoding = "rope"
 rope_theta = 10000.0
-
-[model.brc.halt]
-halt_exploration_prob = 0.1
-halt_min_steps = 3
 
 [optimizer]
 optimizer_type = "adamw"
@@ -59,9 +55,6 @@ log_epochs = 10
 train_mode = "step_carry"
 seed = 0
 checkpoint_dir = "checkpoints"
-
-[train.objective]
-halt_loss_weight = 0.5
 
 [train.ema]
 enabled = true

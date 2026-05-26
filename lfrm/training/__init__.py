@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from lfrm.training.checkpointing import build_ema_update_runner, build_state_copy_runner, load_checkpoint, save_checkpoint
 from lfrm.training.brc import (
-    build_brc_act_train_step_runner,
     build_brc_dense_unroll_train_step_runner,
     build_brc_step_carry_train_step_runner,
     build_eval_step_runner,
@@ -38,7 +37,6 @@ __all__ = [
     "GridReasoningModel",
     "brc_loss_and_metrics",
     "build_ema_update_runner",
-    "build_brc_act_train_step_runner",
     "build_brc_dense_unroll_train_step_runner",
     "build_brc_step_carry_train_step_runner",
     "build_state_copy_runner",
