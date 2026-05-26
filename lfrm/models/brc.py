@@ -806,15 +806,14 @@ class BRCModel(nnx.Module):
         stable = (
             bool(self.brc.early_stop_enabled)
             & (new_steps >= int(self.brc.early_stop_min_steps))
-            & (energy_grad_rms <= float(self.brc.early_stop_energy_grad_threshold))
-            & (distribution_delta <= float(self.brc.early_stop_distribution_delta_threshold))
+            & (distribution_delta <= float(self.brc.early_stop_energy_q_delta_threshold))
             & (flip_rate <= float(self.brc.early_stop_flip_threshold))
             & (margin_min >= float(self.brc.early_stop_margin_threshold))
             & constraint_ok
         )
         diagnostics = {
             "early_stop_energy_grad_rms": jnp.mean(energy_grad_rms.astype(jnp.float32)),
-            "early_stop_distribution_delta": jnp.mean(distribution_delta.astype(jnp.float32)),
+            "early_stop_energy_q_delta": jnp.mean(distribution_delta.astype(jnp.float32)),
             "early_stop_flip_rate": jnp.mean(flip_rate.astype(jnp.float32)),
             "early_stop_margin_min": jnp.mean(margin_min.astype(jnp.float32)),
             "early_stop_constraint_rate": jnp.mean(constraint_ok.astype(jnp.float32)),

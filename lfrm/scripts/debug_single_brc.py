@@ -16,7 +16,7 @@ from lfrm.training.brc import build_brc_step_carry_train_step_runner
 from lfrm.training.factory import create_model, create_optimizer
 
 
-def _load_config(config_path: str, *, steps: int, commit_steps: int | None):
+def _load_config(config_path: str, *, steps: int, commit_steps: int | None, batch_size: int):
     parser = build_parser()
     parser.set_defaults(**load_toml_config(config_path))
     args = parser.parse_args(["--config", config_path])
@@ -38,14 +38,14 @@ def _load_config(config_path: str, *, steps: int, commit_steps: int | None):
     model = replace(config.model, brc=brc)
     train = replace(
         config.train,
-        batch_size=1,
+        batch_size=batch_size,
         optimizer_updates=steps,
     )
     runtime = replace(config.runtime, data_parallel_devices=1, prefetch_depth=1, prefetch_workers=1)
     return replace(config, model=model, train=train, runtime=runtime), dataset
 
 
-def _make_single_batch(dataset, *, split: str, index: int) -> dict[str, jax.Array]:
+def _make_batch(dataset, *, split: str, index: int, batch_size: int) -> dict[str, jax.Array]:
     if split == "train":
         inputs = dataset.train_inputs
         labels = dataset.train_labels
@@ -56,13 +56,18 @@ def _make_single_batch(dataset, *, split: str, index: int) -> dict[str, jax.Arra
         puzzle_identifiers = dataset.eval_puzzle_identifiers
     else:
         raise ValueError("--split must be train or eval")
+    if batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
     if index < 0 or index >= inputs.shape[0]:
         raise ValueError(f"--index={index} out of range for {split} split with {inputs.shape[0]} examples")
+    end = index + batch_size
+    if end > inputs.shape[0]:
+        raise ValueError(f"--index + --batch-size exceeds {split} split size {inputs.shape[0]}")
     batch = {
-        "inputs": np.asarray(inputs[index : index + 1], dtype=np.int32),
-        "labels": np.asarray(labels[index : index + 1], dtype=np.int32),
-        "puzzle_identifiers": np.asarray(puzzle_identifiers[index : index + 1], dtype=np.int32),
-        "example_mask": np.ones((1,), dtype=np.float32),
+        "inputs": np.asarray(inputs[index:end], dtype=np.int32),
+        "labels": np.asarray(labels[index:end], dtype=np.int32),
+        "puzzle_identifiers": np.asarray(puzzle_identifiers[index:end], dtype=np.int32),
+        "example_mask": np.ones((batch_size,), dtype=np.float32),
     }
     return jax.device_put(batch)
 
@@ -73,20 +78,20 @@ def _probe(
     prev_pred: np.ndarray | None,
     prev_q: np.ndarray | None,
 ):
-    inputs = batch_host["inputs"][0]
-    labels = batch_host["labels"][0]
-    q_logits = carry_host["q"][0]
+    inputs = batch_host["inputs"]
+    labels = batch_host["labels"]
+    q_logits = carry_host["q"]
     q_shifted = q_logits - np.max(q_logits, axis=-1, keepdims=True)
     q = np.exp(q_shifted)
     q = q / np.maximum(np.sum(q, axis=-1, keepdims=True), 1e-12)
     pred = np.argmax(q, axis=-1).astype(np.int32)
-    loss_mask = labels != 0
     loss_mask = np.ones_like(labels, dtype=bool)
     context_mask = (inputs > 0) & loss_mask
     query_mask = (inputs == 0) & loss_mask
     context_acc = float(np.mean(pred[context_mask] == labels[context_mask])) if np.any(context_mask) else 0.0
     query_acc = float(np.mean(pred[query_mask] == labels[query_mask])) if np.any(query_mask) else 0.0
-    exact = bool(np.all(pred[loss_mask] == labels[loss_mask])) if np.any(loss_mask) else True
+    exact_per_example = np.all((pred == labels) | ~loss_mask, axis=-1)
+    exact = float(np.mean(exact_per_example)) if exact_per_example.size else 1.0
     entropy = float(-np.mean(np.sum(q[loss_mask] * np.log(np.maximum(q[loss_mask], 1e-12)), axis=-1)))
     confidence = float(np.mean(np.max(q[loss_mask], axis=-1)))
     query_changed = 0.0
@@ -100,7 +105,8 @@ def _probe(
     return {
         "probe_context_accuracy": context_acc,
         "probe_query_accuracy": query_acc,
-        "probe_exact": exact,
+        "probe_exact_accuracy": exact,
+        "probe_exact_count": float(np.sum(exact_per_example)),
         "probe_entropy": entropy,
         "probe_q_top1_probability": confidence,
         "probe_changed": all_changed,
@@ -116,10 +122,11 @@ def _metric(metrics: dict[str, object], name: str, default: float = 0.0) -> floa
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Debug BRC step-carry on one fixed sudoku example.")
+    parser = argparse.ArgumentParser(description="Debug BRC step-carry on a fixed sudoku mini-batch.")
     parser.add_argument("--config", default="configs/sudoku_brc.toml")
     parser.add_argument("--split", choices=("train", "eval"), default="train")
     parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--commit-steps", type=int, default=None)
     parser.add_argument("--print-every", type=int, default=25)
@@ -131,8 +138,9 @@ def main() -> None:
         args.config,
         steps=args.steps,
         commit_steps=args.commit_steps,
+        batch_size=args.batch_size,
     )
-    batch = _make_single_batch(dataset, split=args.split, index=args.index)
+    batch = _make_batch(dataset, split=args.split, index=args.index, batch_size=args.batch_size)
     batch_host = jax.device_get(batch)
     model = create_model(config)
     optimizer = create_optimizer(model, config)
@@ -141,14 +149,14 @@ def main() -> None:
     key = jax.random.key(args.seed)
 
     log_path = Path(args.log_path) if args.log_path else Path("debug_logs") / (
-        f"single_brc_step_carry_{args.split}_{args.index}_{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+        f"single_brc_step_carry_{args.split}_{args.index}_b{args.batch_size}_{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     prev_pred = None
     prev_q = None
     print(
-        "step loss cur_q probe_q cur_ctx probe_ctx exact max early stable reset carry entropy conf eta clip descent dz dQ energy qchg",
+        "step loss cur_q probe_q cur_ctx probe_ctx exact n max early stable reset carry entropy conf eta clip descent dz dQ energy qchg",
         flush=True,
     )
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -182,6 +190,11 @@ def main() -> None:
                     "max_step_reset_rate": _metric(host_metrics, "max_step_reset_rate"),
                     "early_stop_rate": _metric(host_metrics, "early_stop_rate"),
                     "stability_rate": _metric(host_metrics, "stability_rate"),
+                    "stable_steps": _metric(host_metrics, "stable_steps"),
+                    "early_stop_energy_q_delta": _metric(host_metrics, "early_stop_energy_q_delta"),
+                    "early_stop_flip_rate": _metric(host_metrics, "early_stop_flip_rate"),
+                    "early_stop_margin_min": _metric(host_metrics, "early_stop_margin_min"),
+                    "early_stop_constraint_rate": _metric(host_metrics, "early_stop_constraint_rate"),
                     "reset_rate": _metric(host_metrics, "reset_rate"),
                     "carry_step": _metric(host_metrics, "carry_step"),
                     "descent_step_size": _metric(host_metrics, "descent_step_size"),
@@ -200,7 +213,8 @@ def main() -> None:
                     f"{row['probe_query_accuracy']:.3f} "
                     f"{row['context_accuracy']:.3f} "
                     f"{row['probe_context_accuracy']:.3f} "
-                    f"{row['exact_accuracy']:.0f} "
+                    f"{row['exact_accuracy']:.3f} "
+                    f"{row['probe_exact_count']:.0f} "
                     f"{row['max_step_reset_rate']:.2f} "
                     f"{row['early_stop_rate']:.2f} "
                     f"{row['stability_rate']:.2f} "

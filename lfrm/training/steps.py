@@ -541,7 +541,7 @@ def brc_carry_loss_and_metrics(
         "stability_rate": diagnostics["stability_rate"],
         "stable_steps": diagnostics["stable_steps"],
         "early_stop_energy_grad_rms": diagnostics["early_stop_energy_grad_rms"],
-        "early_stop_distribution_delta": diagnostics["early_stop_distribution_delta"],
+        "early_stop_energy_q_delta": diagnostics["early_stop_energy_q_delta"],
         "early_stop_flip_rate": diagnostics["early_stop_flip_rate"],
         "early_stop_margin_min": diagnostics["early_stop_margin_min"],
         "early_stop_constraint_rate": diagnostics["early_stop_constraint_rate"],

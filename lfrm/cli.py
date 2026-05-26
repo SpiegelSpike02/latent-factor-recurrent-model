@@ -46,8 +46,7 @@ GROUPED_NESTED_KEYS = {
             "early_stop_enabled",
             "early_stop_min_steps",
             "early_stop_patience",
-            "early_stop_energy_grad_threshold",
-            "early_stop_distribution_delta_threshold",
+            "early_stop_energy_q_delta_threshold",
             "early_stop_flip_threshold",
             "early_stop_margin_threshold",
             "early_stop_require_constraints",
@@ -169,8 +168,7 @@ ALLOWED_NESTED_KEYS = {
         "early_stop_enabled",
         "early_stop_min_steps",
         "early_stop_patience",
-        "early_stop_energy_grad_threshold",
-        "early_stop_distribution_delta_threshold",
+        "early_stop_energy_q_delta_threshold",
         "early_stop_flip_threshold",
         "early_stop_margin_threshold",
         "early_stop_require_constraints",
@@ -342,16 +340,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
     parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
-    parser.add_argument("--brc-energy-step-size", type=float, default=0.3)
-    parser.add_argument("--brc-energy-update-rms-clip", type=float, default=1.0)
-    parser.add_argument("--brc-update-energy-weight", type=float, default=1e-4)
-    parser.add_argument("--brc-terminal-update-weight", type=float, default=0.0)
-    parser.add_argument("--brc-terminal-label-smoothing", type=float, default=1e-3)
+    parser.add_argument("--brc-descent-step-size", type=float, default=0.3)
+    parser.add_argument("--brc-descent-rms-clip", type=float, default=1.0)
+    parser.add_argument("--brc-path-energy-weight", type=float, default=1e-4)
+    parser.add_argument("--brc-fixed-point-update-weight", type=float, default=0.0)
+    parser.add_argument("--brc-fixed-point-label-smoothing", type=float, default=1e-3)
     parser.add_argument("--brc-early-stop-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--brc-early-stop-min-steps", type=int, default=4)
     parser.add_argument("--brc-early-stop-patience", type=int, default=2)
-    parser.add_argument("--brc-early-stop-energy-grad-threshold", type=float, default=1e-2)
-    parser.add_argument("--brc-early-stop-q-delta-threshold", type=float, default=1e-3)
+    parser.add_argument("--brc-early-stop-energy-q-delta-threshold", type=float, default=1e-3)
     parser.add_argument("--brc-early-stop-flip-threshold", type=float, default=0.0)
     parser.add_argument("--brc-early-stop-margin-threshold", type=float, default=0.5)
     parser.add_argument("--brc-early-stop-require-constraints", action=argparse.BooleanOptionalAction, default=True)
@@ -512,8 +509,7 @@ def build_config(
             early_stop_enabled=args.brc_early_stop_enabled,
             early_stop_min_steps=args.brc_early_stop_min_steps,
             early_stop_patience=args.brc_early_stop_patience,
-            early_stop_energy_grad_threshold=args.brc_early_stop_energy_grad_threshold,
-            early_stop_distribution_delta_threshold=args.brc_early_stop_distribution_delta_threshold,
+            early_stop_energy_q_delta_threshold=args.brc_early_stop_energy_q_delta_threshold,
             early_stop_flip_threshold=args.brc_early_stop_flip_threshold,
             early_stop_margin_threshold=args.brc_early_stop_margin_threshold,
             early_stop_require_constraints=args.brc_early_stop_require_constraints,

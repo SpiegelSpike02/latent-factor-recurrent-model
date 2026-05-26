@@ -52,8 +52,7 @@ class BRCConfig:
     early_stop_enabled: bool = True
     early_stop_min_steps: int = 4
     early_stop_patience: int = 2
-    early_stop_energy_grad_threshold: float = 1e-2
-    early_stop_distribution_delta_threshold: float = 1e-3
+    early_stop_energy_q_delta_threshold: float = 1e-3
     early_stop_flip_threshold: float = 0.0
     early_stop_margin_threshold: float = 0.5
     early_stop_require_constraints: bool = True
