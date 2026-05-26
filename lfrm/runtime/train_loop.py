@@ -204,6 +204,7 @@ def print_run_overview(
         ("config_task_type", config.task.type),
         ("model_type", config.model.model_type),
         ("vocab_size", overview["vocab_size"]),
+        ("input_vocab_size", overview["input_vocab_size"]),
     ]
     if config.model.model_type in ("trm", "urm"):
         fields.append(("num_puzzle_identifiers", overview["num_puzzle_identifiers"]))

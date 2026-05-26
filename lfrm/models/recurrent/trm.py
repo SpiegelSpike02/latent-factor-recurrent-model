@@ -225,7 +225,7 @@ class TinyRecursiveModel(nnx.Module):
 
         embed_init = trunc_normal_init(1.0 / self.embed_scale)
         self.token_embed = CastedEmbedding(
-            config.vocab_size,
+            int(config.input_vocab_size or config.vocab_size),
             config.d_model,
             dtype,
             init_std=1.0 / self.embed_scale,

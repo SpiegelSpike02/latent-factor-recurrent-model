@@ -123,7 +123,7 @@ class UnifiedReasoningModel(nnx.Module):
         self.total_seq_len = config.seq_len + self.puzzle_embed_len
 
         self.token_embed = CastedEmbedding(
-            config.vocab_size,
+            int(config.input_vocab_size or config.vocab_size),
             config.d_model,
             self.dtype,
             init_std=1.0 / self.embed_scale,

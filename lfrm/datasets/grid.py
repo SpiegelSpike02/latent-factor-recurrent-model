@@ -13,6 +13,7 @@ class DatasetSpec:
     kind: str
     task_type: str
     vocab_size: int
+    input_vocab_size: int
     num_puzzle_identifiers: int
     total_groups: int
     total_puzzles: int
@@ -54,7 +55,15 @@ def load_dataset(*, dataset_path: str) -> GridDataset:
     train_metadata = _normalize_grid_metadata(train_metadata)
     eval_metadata = _normalize_grid_metadata(eval_metadata)
 
-    shared_keys = ("seq_len", "vocab_size", "num_puzzle_identifiers", "grid_height", "grid_width", "task_type")
+    shared_keys = (
+        "seq_len",
+        "vocab_size",
+        "input_vocab_size",
+        "num_puzzle_identifiers",
+        "grid_height",
+        "grid_width",
+        "task_type",
+    )
     for key in shared_keys:
         if train_metadata[key] != eval_metadata[key]:
             raise ValueError(f"Train/test metadata mismatch for '{key}'")
@@ -78,6 +87,7 @@ def load_dataset(*, dataset_path: str) -> GridDataset:
         kind=str(train_metadata.get("kind", "grid")),
         task_type=str(train_metadata["task_type"]),
         vocab_size=int(train_metadata["vocab_size"]),
+        input_vocab_size=int(train_metadata["input_vocab_size"]),
         num_puzzle_identifiers=int(train_metadata["num_puzzle_identifiers"]),
         total_groups=int(train_metadata["total_groups"]),
         total_puzzles=int(train_metadata["total_puzzles"]),
@@ -204,6 +214,7 @@ def dataset_overview(dataset: GridDataset) -> dict[str, Any]:
     return {
         "kind": dataset.spec.kind,
         "vocab_size": dataset.spec.vocab_size,
+        "input_vocab_size": dataset.spec.input_vocab_size,
         "num_puzzle_identifiers": dataset.spec.num_puzzle_identifiers,
         "total_groups": dataset.spec.total_groups,
         "total_puzzles": dataset.spec.total_puzzles,
@@ -329,6 +340,7 @@ def _normalize_grid_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         normalized["grid_height"] = side
         normalized["grid_width"] = side
     normalized.setdefault("kind", "grid")
+    normalized.setdefault("input_vocab_size", normalized["vocab_size"])
     if "num_puzzle_identifiers" not in normalized:
         normalized["num_puzzle_identifiers"] = 1
     normalized.setdefault("total_groups", normalized.get("num_examples", 0))

@@ -43,7 +43,8 @@ class SudokuDataTests(unittest.TestCase):
             )
 
             self.assertEqual(dataset.spec.kind, "sudoku")
-            self.assertEqual(dataset.spec.vocab_size, 11)
+            self.assertEqual(dataset.spec.vocab_size, 9)
+            self.assertEqual(dataset.spec.input_vocab_size, 10)
             self.assertEqual(dataset.spec.num_puzzle_identifiers, 1)
             self.assertEqual(dataset.spec.total_groups, 1)
             self.assertEqual(dataset.spec.total_puzzles, 2)
@@ -53,6 +54,10 @@ class SudokuDataTests(unittest.TestCase):
             self.assertEqual(dataset.eval_inputs.shape, (1, 81))
             self.assertEqual(dataset.train_inputs.dtype.name, "uint8")
             self.assertEqual(dataset.train_labels.dtype.name, "uint8")
+            self.assertEqual(int(dataset.train_inputs.min()), 0)
+            self.assertEqual(int(dataset.train_inputs.max()), 9)
+            self.assertEqual(int(dataset.train_labels.min()), 0)
+            self.assertEqual(int(dataset.train_labels.max()), 8)
             self.assertEqual(dataset.train_puzzle_identifiers.shape, (2,))
             self.assertEqual(dataset.eval_puzzle_identifiers.shape, (1,))
             self.assertEqual(dataset.train_puzzle_indices.tolist(), [0, 1, 2])
@@ -60,7 +65,7 @@ class SudokuDataTests(unittest.TestCase):
             self.assertTrue(np.all(dataset.train_puzzle_identifiers == 0))
             self.assertTrue((output_dir / "train" / "inputs.npy").is_file())
             self.assertTrue((output_dir / "train" / "labels.npy").is_file())
-            self.assertTrue((output_dir / "train" / "puzzle_identifiers.npy").is_file())
+            self.assertFalse((output_dir / "train" / "puzzle_identifiers.npy").exists())
             self.assertTrue((output_dir / "train" / "puzzle_indices.npy").is_file())
             self.assertTrue((output_dir / "train" / "group_indices.npy").is_file())
             self.assertFalse((output_dir / "train" / "given_mask.npy").exists())
@@ -72,7 +77,7 @@ class SudokuDataTests(unittest.TestCase):
             self.assertEqual(batch["puzzle_identifiers"].shape, (2,))
             self.assertTrue(np.all(batch["puzzle_identifiers"] == 0))
 
-    def test_load_legacy_sudoku_dataset_without_puzzle_identifiers(self) -> None:
+    def test_load_sudoku_dataset_without_puzzle_identifiers_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             csv_dir = root / "csv"
@@ -92,7 +97,6 @@ class SudokuDataTests(unittest.TestCase):
             )
             for split in ("train", "test"):
                 split_dir = output_dir / split
-                (split_dir / "puzzle_identifiers.npy").unlink()
                 metadata_path = split_dir / "dataset.json"
                 metadata = json.loads(metadata_path.read_text())
                 metadata.pop("num_puzzle_identifiers")
@@ -120,7 +124,7 @@ class SudokuDataTests(unittest.TestCase):
         with path.open("w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["source", "q", "a", "rating"])
-            writer.writerow(["local", puzzle, solution, "10"])
+            writer.writerow(["local", puzzle.replace("0", "."), solution, "10"])
 
 
 if __name__ == "__main__":

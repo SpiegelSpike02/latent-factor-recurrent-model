@@ -417,6 +417,7 @@ def build_config(
     args: argparse.Namespace,
     *,
     vocab_size: int,
+    input_vocab_size: int | None,
     num_puzzle_identifiers: int,
     seq_len: int,
 ) -> ExperimentConfig:
@@ -425,6 +426,7 @@ def build_config(
     )
     model = ModelConfig(
         vocab_size=vocab_size,
+        input_vocab_size=input_vocab_size,
         num_puzzle_identifiers=num_puzzle_identifiers,
         model_type=args.model_type,
         seq_len=seq_len,
@@ -566,6 +568,7 @@ def main() -> None:
     config = build_config(
         args,
         vocab_size=dataset.spec.vocab_size,
+        input_vocab_size=dataset.spec.input_vocab_size,
         num_puzzle_identifiers=dataset.spec.num_puzzle_identifiers,
         seq_len=dataset.spec.seq_len,
     )

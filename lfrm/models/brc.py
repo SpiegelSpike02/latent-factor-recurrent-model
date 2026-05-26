@@ -205,8 +205,8 @@ class BRCModel(nnx.Module):
             raise ValueError("BRCModel requires model_type='brc'")
         if config.grid_height * config.grid_width != config.seq_len:
             raise ValueError("grid_height * grid_width must equal seq_len")
-        if config.task_type == "sudoku" and config.vocab_size < 11:
-            raise ValueError("BRC Sudoku expects vocab_size >= 11")
+        if config.task_type == "sudoku" and config.vocab_size != 9:
+            raise ValueError("BRC Sudoku expects output vocab_size=9")
         brc = config.brc_config
         if brc.commit_steps < 1:
             raise ValueError("BRC commit_steps must be at least 1")
@@ -244,7 +244,14 @@ class BRCModel(nnx.Module):
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
-        self.q_vocab_size = config.vocab_size
+        if config.task_type == "sudoku":
+            self.input_vocab_size = int(config.input_vocab_size or 10)
+            self.q_vocab_size = 9
+            self.sudoku_blank_token_id = 0
+        else:
+            self.input_vocab_size = int(config.input_vocab_size or config.vocab_size)
+            self.q_vocab_size = config.vocab_size
+            self.sudoku_blank_token_id = 0
         self.output_logit_eps = 1e-9
         self.box_height, self.box_width = self._box_shape(config.grid_height, config.grid_width)
 
@@ -260,7 +267,7 @@ class BRCModel(nnx.Module):
 
         embed_init = trunc_normal_init(1.0 / self.embed_scale)
         self.puzzle_embed = nnx.Embed(
-            config.vocab_size,
+            self.input_vocab_size,
             config.d_model,
             dtype=self.dtype,
             param_dtype=jnp.float32,
@@ -269,7 +276,7 @@ class BRCModel(nnx.Module):
         )
         self.context_embed = nnx.Embed(2, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.q_embed = nnx.Embed(
-            max(10, config.vocab_size),
+            max(10, self.q_vocab_size),
             config.d_model,
             dtype=self.dtype,
             param_dtype=jnp.float32,
@@ -330,7 +337,7 @@ class BRCModel(nnx.Module):
         )
         self.q_proposal_head = nnx.Linear(
             self.hidden_dim,
-            config.vocab_size,
+            self.q_vocab_size,
             dtype=self.dtype,
             param_dtype=jnp.float32,
             kernel_init=casted_linear_init,
@@ -378,7 +385,7 @@ class BRCModel(nnx.Module):
 
     def context_mask(self, tokens: Array) -> Array:
         if self.config.task_type == "sudoku":
-            return tokens > 1
+            return tokens > self.sudoku_blank_token_id
         return tokens != 0
 
     def _center_q_logits(self, q_logits: Array) -> Array:
@@ -483,7 +490,7 @@ class BRCModel(nnx.Module):
             acceleration = jnp.where(has_previous2, acceleration, jnp.zeros_like(acceleration))
         else:
             acceleration = jnp.zeros_like(q_logits)
-        embedding_table = maybe_cast(self.q_embed.embedding[: self.config.vocab_size], self.dtype)
+        embedding_table = maybe_cast(self.q_embed.embedding[: self.q_vocab_size], self.dtype)
         direction_embedding = jnp.einsum(
             "bnd,dk->bnk",
             maybe_cast(direction, self.dtype),
@@ -673,8 +680,9 @@ class BRCModel(nnx.Module):
         tokens: Array,
     ) -> tuple[Array, Array]:
         context = self.context_mask(tokens)
+        token_ids = jnp.clip(tokens, 0, self.input_vocab_size - 1)
         base_embeddings = (
-            self.puzzle_embed(tokens.astype(jnp.int32))
+            self.puzzle_embed(token_ids.astype(jnp.int32))
             + self.context_embed(context.astype(jnp.int32))
         )
         if self.brc.position_encoding == "learned":

@@ -47,6 +47,14 @@ from lfrm.training import (
 from lfrm.training.optim import scheduled_lr
 
 
+def _sudoku_input_tokens(puzzle: str) -> jax.Array:
+    return jnp.asarray([[0 if ch in "0." else int(ch) for ch in puzzle]], dtype=jnp.int32)
+
+
+def _sudoku_label_tokens(solution: str) -> jax.Array:
+    return jnp.asarray([[int(ch) - 1 for ch in solution]], dtype=jnp.int32)
+
+
 class GridModelTests(unittest.TestCase):
     def test_updates_from_epochs_matches_official_floor_conversion(self) -> None:
         dataset = SimpleNamespace(
@@ -141,7 +149,8 @@ class GridModelTests(unittest.TestCase):
         self.assertIsInstance(create_model(trm_config), TinyRecursiveModel)
         brc_config = ExperimentConfig(
             model=ModelConfig(
-                vocab_size=11,
+                vocab_size=9,
+                input_vocab_size=10,
                 model_type="brc",
                 seq_len=81,
                 grid_height=9,
@@ -266,7 +275,8 @@ class GridModelTests(unittest.TestCase):
     def test_brc_forward_is_finite_without_optional_energy(self) -> None:
         model = BRCModel(
             ModelConfig(
-                vocab_size=11,
+                vocab_size=9,
+                input_vocab_size=10,
                 model_type="brc",
                 seq_len=81,
                 grid_height=9,
@@ -284,20 +294,21 @@ class GridModelTests(unittest.TestCase):
         )
         puzzle = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
         solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
-        tokens = jnp.asarray([[int(ch) + 1 for ch in puzzle]], dtype=jnp.int32)
-        labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
-        self.assertTrue(bool(jnp.all(model.context_mask(tokens) == (tokens > 1))))
+        tokens = _sudoku_input_tokens(puzzle)
+        labels = _sudoku_label_tokens(solution)
+        del labels
+        self.assertTrue(bool(jnp.all(model.context_mask(tokens) == (tokens > 0))))
         logits, diagnostics = model.forward_all_steps_with_diagnostics(tokens, train=False)
         final_only_logits, final_only_diagnostics = model.run_commit_steps(
             tokens,
             train=False,
             return_final_only=True,
         )
-        self.assertEqual(logits.shape, (2, 1, 81, 11))
-        self.assertEqual(final_only_logits.shape, (1, 81, 11))
+        self.assertEqual(logits.shape, (2, 1, 81, 9))
+        self.assertEqual(final_only_logits.shape, (1, 81, 9))
         self.assertTrue(bool(jnp.allclose(final_only_logits, logits[-1], rtol=1e-5, atol=1e-5)))
         q = jax.nn.softmax(
-            jnp.arange(2 * 81 * 11, dtype=jnp.float32).reshape(2, 81, 11) / 100.0,
+            jnp.arange(2 * 81 * 9, dtype=jnp.float32).reshape(2, 81, 9) / 100.0,
             axis=-1,
         )
         self.assertTrue(
@@ -314,7 +325,8 @@ class GridModelTests(unittest.TestCase):
     def test_brc_losses_are_finite(self) -> None:
         model = BRCModel(
             ModelConfig(
-                vocab_size=11,
+                vocab_size=9,
+                input_vocab_size=10,
                 model_type="brc",
                 seq_len=81,
                 grid_height=9,
@@ -332,8 +344,8 @@ class GridModelTests(unittest.TestCase):
         )
         puzzle = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
         solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
-        tokens = jnp.asarray([[int(ch) + 1 for ch in puzzle]], dtype=jnp.int32)
-        labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
+        tokens = _sudoku_input_tokens(puzzle)
+        labels = _sudoku_label_tokens(solution)
         batch = {
             "inputs": tokens,
             "labels": labels,
@@ -414,7 +426,8 @@ class GridModelTests(unittest.TestCase):
     def test_brc_train_step_updates_parameters(self) -> None:
         config = ExperimentConfig(
             model=ModelConfig(
-                vocab_size=11,
+                vocab_size=9,
+                input_vocab_size=10,
                 model_type="brc",
                 seq_len=81,
                 grid_height=9,
@@ -439,8 +452,8 @@ class GridModelTests(unittest.TestCase):
         train_step = build_train_step_runner()
         puzzle = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
         solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
-        tokens = jnp.asarray([[int(ch) + 1 for ch in puzzle]], dtype=jnp.int32)
-        labels = jnp.asarray([[int(ch) + 1 for ch in solution]], dtype=jnp.int32)
+        tokens = _sudoku_input_tokens(puzzle)
+        labels = _sudoku_label_tokens(solution)
         batch = {
             "inputs": tokens,
             "labels": labels,
@@ -756,7 +769,8 @@ class GridModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "divisible by num_heads"):
             BRCModel(
                 ModelConfig(
-                    vocab_size=11,
+                    vocab_size=9,
+                    input_vocab_size=10,
                     model_type="brc",
                     seq_len=81,
                     grid_height=9,

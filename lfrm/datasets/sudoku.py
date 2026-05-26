@@ -23,8 +23,12 @@ def _maybe_download_csv(source_repo: str, filename: str) -> Path:
 def _parse_sudoku_row(path: Path, q: str, a: str) -> tuple[np.ndarray, np.ndarray]:
     if len(q) != 81 or len(a) != 81:
         raise ValueError(f"Unexpected Sudoku lengths in {path}")
-    board = np.frombuffer(q.replace(".", "0").encode(), dtype=np.uint8).reshape(9, 9) - ord("0")
-    solution = np.frombuffer(a.encode(), dtype=np.uint8).reshape(9, 9) - ord("0")
+    if any(ch != "." and ch not in "123456789" for ch in q):
+        raise ValueError(f"Sudoku puzzle in {path} must use '.' for blanks and digits 1-9")
+    if any(ch not in "123456789" for ch in a):
+        raise ValueError(f"Sudoku solution in {path} must contain only digits 1-9")
+    board = np.fromiter((0 if ch == "." else int(ch) for ch in q), dtype=np.uint8, count=81).reshape(9, 9)
+    solution = np.fromiter((int(ch) for ch in a), dtype=np.uint8, count=81).reshape(9, 9)
     return board, solution
 
 
@@ -93,10 +97,16 @@ def shuffle_sudoku(board: np.ndarray, solution: np.ndarray, *, rng: np.random.Ge
     return apply_transform(board), apply_transform(solution)
 
 
-def _encode_sudoku_example(board: np.ndarray) -> np.ndarray:
+def _encode_sudoku_input(board: np.ndarray) -> np.ndarray:
     if not np.all((board >= 0) & (board <= 9)):
         raise ValueError("Sudoku array contains values outside [0, 9]")
-    return (board.reshape(-1) + 1).astype(np.uint8, copy=False)
+    return board.reshape(-1).astype(np.uint8, copy=False)
+
+
+def _encode_sudoku_label(solution: np.ndarray) -> np.ndarray:
+    if not np.all((solution >= 1) & (solution <= 9)):
+        raise ValueError("Sudoku solution contains values outside [1, 9]")
+    return (solution.reshape(-1) - 1).astype(np.uint8, copy=False)
 
 
 def build_sudoku_dataset(
@@ -174,13 +184,6 @@ def build_sudoku_dataset(
             dtype=np.int32,
             shape=(selected_examples + 1,),
         )
-        puzzle_identifiers = open_memmap(
-            split_dir / "puzzle_identifiers.npy",
-            mode="w+",
-            dtype=np.int32,
-            shape=(num_examples,),
-        )
-
         output_idx = 0
         group_idx = 0
         puzzle_indices[0] = 0
@@ -193,10 +196,9 @@ def build_sudoku_dataset(
                     aug_board, aug_solution = board, solution
                 else:
                     aug_board, aug_solution = shuffle_sudoku(board, solution, rng=rng)
-                encoded_input = _encode_sudoku_example(aug_board)
+                encoded_input = _encode_sudoku_input(aug_board)
                 encoded_inputs[output_idx] = encoded_input
-                encoded_labels[output_idx] = _encode_sudoku_example(aug_solution)
-                puzzle_identifiers[output_idx] = 0
+                encoded_labels[output_idx] = _encode_sudoku_label(aug_solution)
                 output_idx += 1
                 puzzle_indices[output_idx] = output_idx
                 if progress_every > 0 and output_idx % progress_every == 0:
@@ -204,7 +206,6 @@ def build_sudoku_dataset(
                     encoded_labels.flush()
                     puzzle_indices.flush()
                     group_indices.flush()
-                    puzzle_identifiers.flush()
                     _progress(
                         f"[{split_name}] wrote {_format_count(output_idx)} / {_format_count(num_examples)} examples",
                         progress_every,
@@ -217,23 +218,25 @@ def build_sudoku_dataset(
         encoded_labels.flush()
         puzzle_indices.flush()
         group_indices.flush()
-        puzzle_identifiers.flush()
         metadata = {
             "kind": "sudoku",
             "task_type": "classification",
             "seq_len": 81,
             "grid_height": 9,
             "grid_width": 9,
-            "vocab_size": 11,
+            "vocab_size": 9,
+            "input_vocab_size": 10,
             "num_puzzle_identifiers": 1,
             "num_examples": num_examples,
             "total_groups": selected_examples,
             "total_puzzles": num_examples,
             "mean_puzzle_examples": 1.0,
             "sets": ["all"],
-            "pad_id": 0,
-            "ignore_label_id": 0,
+            "pad_id": None,
+            "ignore_label_id": None,
             "blank_identifier_id": 0,
+            "input_blank_id": 0,
+            "label_digit_offset": 1,
         }
         (split_dir / "dataset.json").write_text(json.dumps(metadata))
         _progress(f"[{split_name}] finished {split_dir}", progress_every)

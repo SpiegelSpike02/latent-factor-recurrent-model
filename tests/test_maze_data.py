@@ -116,6 +116,7 @@ class MazeDatasetTests(unittest.TestCase):
                 kind="arc",
                 task_type="classification",
                 vocab_size=128,
+                input_vocab_size=128,
                 num_puzzle_identifiers=8,
                 total_groups=1,
                 total_puzzles=1,

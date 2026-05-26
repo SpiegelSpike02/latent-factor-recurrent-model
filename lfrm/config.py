@@ -70,6 +70,7 @@ class URMConfig:
 @dataclass(frozen=True)
 class ModelConfig:
     vocab_size: int
+    input_vocab_size: int | None = None
     model_type: str = "brc"
     num_puzzle_identifiers: int = 1
     seq_len: int = 81
