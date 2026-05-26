@@ -39,3 +39,6 @@ lfrm/scripts/debug_single_brc_act.py
 *.swp
 *.swo
 .DS_Store
+
+# Local external checkouts / experiments
+TinyRecursiveModels/

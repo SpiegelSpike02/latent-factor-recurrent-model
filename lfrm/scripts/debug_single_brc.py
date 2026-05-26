@@ -156,7 +156,7 @@ def main() -> None:
     prev_pred = None
     prev_q = None
     print(
-        "step loss cur_q probe_q cur_ctx probe_ctx exact n max early stable reset carry entropy conf eta clip descent dz dQ energy qchg",
+        "step loss cur_q probe_q cur_ctx probe_ctx exact n max early stable e_dq flip margin cstr reset carry entropy conf eta clip descent dz dQ energy qchg",
         flush=True,
     )
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -218,6 +218,10 @@ def main() -> None:
                     f"{row['max_step_reset_rate']:.2f} "
                     f"{row['early_stop_rate']:.2f} "
                     f"{row['stability_rate']:.2f} "
+                    f"{row['early_stop_energy_q_delta']:.2e} "
+                    f"{row['early_stop_flip_rate']:.2f} "
+                    f"{row['early_stop_margin_min']:.2f} "
+                    f"{row['early_stop_constraint_rate']:.2f} "
                     f"{row['reset_rate']:.2f} "
                     f"{row['carry_step']:.1f} "
                     f"{row['probe_entropy']:.2f} "

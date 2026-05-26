@@ -242,6 +242,12 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC early_stop_min_steps must be at least 1")
         if brc.early_stop_patience < 1:
             raise ValueError("BRC early_stop_patience must be at least 1")
+        if brc.early_stop_energy_q_delta_threshold < 0.0:
+            raise ValueError("BRC early_stop_energy_q_delta_threshold must be non-negative")
+        if brc.early_stop_flip_threshold < 0.0:
+            raise ValueError("BRC early_stop_flip_threshold must be non-negative")
+        if brc.early_stop_margin_threshold < 0.0:
+            raise ValueError("BRC early_stop_margin_threshold must be non-negative")
         self.config = config
         self.runtime = runtime
         self.brc = brc
@@ -785,8 +791,8 @@ class BRCModel(nnx.Module):
         new_q = self._normalize_q(q_new_logits)
         query_mask = (~self.context_mask(inputs)).astype(jnp.float32)
         query_normalizer = jnp.maximum(jnp.sum(query_mask, axis=-1), 1.0)
-        distribution_delta_cell = 0.5 * jnp.sum(jnp.abs(new_q - old_q), axis=-1)
-        distribution_delta = jnp.sum(distribution_delta_cell * query_mask, axis=-1) / query_normalizer
+        energy_q_delta_cell = 0.5 * jnp.sum(jnp.abs(new_q - old_q), axis=-1)
+        energy_q_delta = jnp.sum(energy_q_delta_cell * query_mask, axis=-1) / query_normalizer
         old_pred = jnp.argmax(old_q, axis=-1)
         new_pred = jnp.argmax(new_q, axis=-1)
         flip_rate = jnp.sum((old_pred != new_pred).astype(jnp.float32) * query_mask, axis=-1) / query_normalizer
@@ -806,14 +812,14 @@ class BRCModel(nnx.Module):
         stable = (
             bool(self.brc.early_stop_enabled)
             & (new_steps >= int(self.brc.early_stop_min_steps))
-            & (distribution_delta <= float(self.brc.early_stop_energy_q_delta_threshold))
+            & (energy_q_delta <= float(self.brc.early_stop_energy_q_delta_threshold))
             & (flip_rate <= float(self.brc.early_stop_flip_threshold))
             & (margin_min >= float(self.brc.early_stop_margin_threshold))
             & constraint_ok
         )
         diagnostics = {
             "early_stop_energy_grad_rms": jnp.mean(energy_grad_rms.astype(jnp.float32)),
-            "early_stop_energy_q_delta": jnp.mean(distribution_delta.astype(jnp.float32)),
+            "early_stop_energy_q_delta": jnp.mean(energy_q_delta.astype(jnp.float32)),
             "early_stop_flip_rate": jnp.mean(flip_rate.astype(jnp.float32)),
             "early_stop_margin_min": jnp.mean(margin_min.astype(jnp.float32)),
             "early_stop_constraint_rate": jnp.mean(constraint_ok.astype(jnp.float32)),
