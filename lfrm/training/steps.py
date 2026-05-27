@@ -473,7 +473,7 @@ def brc_carry_loss_and_metrics(
 ) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
     if dropout_key is None:
         dropout_key = jax.random.key(0)
-    step_key, terminal_key = jax.random.split(dropout_key)
+    step_key, terminal_key, attractor_key = jax.random.split(dropout_key, 3)
     new_carry, logits, diagnostics = model.forward_carry_step(
         carry,
         batch,
@@ -518,16 +518,52 @@ def brc_carry_loss_and_metrics(
         )
     else:
         fixed_point_update_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    if (
+        float(model.brc.wrong_attractor_rank_weight) != 0.0
+        or float(model.brc.wrong_attractor_direction_weight) != 0.0
+        or float(model.brc.wrong_attractor_nonzero_weight) != 0.0
+        or float(model.brc.corrupted_recovery_weight) != 0.0
+    ):
+        attractor_losses = model.attractor_recovery_losses(
+            inputs,
+            targets,
+            loss_mask,
+            new_carry["q"],
+            new_carry["trajectory"],
+            new_carry["trajectory_count"],
+            new_carry["hidden"],
+            train=train,
+            dropout_key=attractor_key,
+        )
+    else:
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
+        attractor_losses = {
+            "wrong_attractor_rank_loss": zero,
+            "wrong_attractor_direction_loss": zero,
+            "wrong_attractor_nonzero_loss": zero,
+            "wrong_attractor_active_rate": zero,
+            "wrong_attractor_direction_cosine": zero,
+            "wrong_attractor_energy_gap": zero,
+            "corrupted_recovery_loss": zero,
+            "corrupted_recovery_rank_loss": zero,
+            "corrupted_recovery_direction_cosine": zero,
+            "corrupted_recovery_energy_gap": zero,
+        }
     loss = (
         ce_loss
         + float(model.brc.path_energy_weight) * path_energy_loss
         + float(model.brc.fixed_point_update_weight) * fixed_point_update_loss
+        + float(model.brc.wrong_attractor_rank_weight) * attractor_losses["wrong_attractor_rank_loss"]
+        + float(model.brc.wrong_attractor_direction_weight) * attractor_losses["wrong_attractor_direction_loss"]
+        + float(model.brc.wrong_attractor_nonzero_weight) * attractor_losses["wrong_attractor_nonzero_loss"]
+        + float(model.brc.corrupted_recovery_weight) * attractor_losses["corrupted_recovery_loss"]
     )
     metrics = {
         "loss": loss,
         "ce_loss": ce_loss,
         "path_energy_loss": path_energy_loss,
         "fixed_point_update_loss": fixed_point_update_loss,
+        **attractor_losses,
         "accuracy": accuracy,
         "query_accuracy": query_accuracy,
         "exact_accuracy": exact_accuracy,

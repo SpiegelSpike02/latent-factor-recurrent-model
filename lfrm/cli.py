@@ -41,7 +41,17 @@ GROUPED_NESTED_KEYS = {
             "descent_step_size",
             "descent_rms_clip",
         },
-        "objective": {"path_energy_weight", "fixed_point_update_weight", "fixed_point_label_smoothing"},
+        "objective": {
+            "path_energy_weight",
+            "fixed_point_update_weight",
+            "fixed_point_label_smoothing",
+            "wrong_attractor_rank_weight",
+            "wrong_attractor_direction_weight",
+            "wrong_attractor_nonzero_weight",
+            "wrong_attractor_rank_margin",
+            "wrong_attractor_grad_floor",
+            "corrupted_recovery_weight",
+        },
         "early_stop": {
             "early_stop_enabled",
             "early_stop_min_steps",
@@ -345,6 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-path-energy-weight", type=float, default=1e-4)
     parser.add_argument("--brc-fixed-point-update-weight", type=float, default=0.0)
     parser.add_argument("--brc-fixed-point-label-smoothing", type=float, default=1e-3)
+    parser.add_argument("--brc-wrong-attractor-rank-weight", type=float, default=0.0)
+    parser.add_argument("--brc-wrong-attractor-direction-weight", type=float, default=0.0)
+    parser.add_argument("--brc-wrong-attractor-nonzero-weight", type=float, default=0.0)
+    parser.add_argument("--brc-wrong-attractor-rank-margin", type=float, default=1.0)
+    parser.add_argument("--brc-wrong-attractor-grad-floor", type=float, default=0.5)
+    parser.add_argument("--brc-corrupted-recovery-weight", type=float, default=0.0)
     parser.add_argument("--brc-early-stop-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--brc-early-stop-min-steps", type=int, default=4)
     parser.add_argument("--brc-early-stop-patience", type=int, default=2)
@@ -506,6 +522,12 @@ def build_config(
             path_energy_weight=args.brc_path_energy_weight,
             fixed_point_update_weight=args.brc_fixed_point_update_weight,
             fixed_point_label_smoothing=args.brc_fixed_point_label_smoothing,
+            wrong_attractor_rank_weight=args.brc_wrong_attractor_rank_weight,
+            wrong_attractor_direction_weight=args.brc_wrong_attractor_direction_weight,
+            wrong_attractor_nonzero_weight=args.brc_wrong_attractor_nonzero_weight,
+            wrong_attractor_rank_margin=args.brc_wrong_attractor_rank_margin,
+            wrong_attractor_grad_floor=args.brc_wrong_attractor_grad_floor,
+            corrupted_recovery_weight=args.brc_corrupted_recovery_weight,
             early_stop_enabled=args.brc_early_stop_enabled,
             early_stop_min_steps=args.brc_early_stop_min_steps,
             early_stop_patience=args.brc_early_stop_patience,

@@ -238,6 +238,19 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC descent_rms_clip must be positive")
         if brc.fixed_point_label_smoothing < 0.0 or brc.fixed_point_label_smoothing >= 1.0:
             raise ValueError("BRC fixed_point_label_smoothing must be in [0, 1)")
+        if min(
+            brc.path_energy_weight,
+            brc.fixed_point_update_weight,
+            brc.wrong_attractor_rank_weight,
+            brc.wrong_attractor_direction_weight,
+            brc.wrong_attractor_nonzero_weight,
+            brc.corrupted_recovery_weight,
+        ) < 0.0:
+            raise ValueError("BRC objective weights must be non-negative")
+        if brc.wrong_attractor_rank_margin < 0.0:
+            raise ValueError("BRC wrong_attractor_rank_margin must be non-negative")
+        if brc.wrong_attractor_grad_floor < 0.0:
+            raise ValueError("BRC wrong_attractor_grad_floor must be non-negative")
         if brc.early_stop_min_steps < 1:
             raise ValueError("BRC early_stop_min_steps must be at least 1")
         if brc.early_stop_patience < 1:
@@ -566,22 +579,45 @@ class BRCModel(nnx.Module):
         energy_context: Array,
         step_index: Array,
     ) -> tuple[Array, dict[str, Array]]:
-        del tokens
+        del tokens, step_index
         current_logits = self._center_q_logits(q_logits)
+        return self._energy_descent_from_context(current_logits, energy_context)
+
+    def _energy_per_cell_from_context(
+        self,
+        candidate_q: Array,
+        energy_context: Array,
+    ) -> Array:
+        uniform = jnp.full_like(candidate_q, 1.0 / float(self.q_vocab_size))
+        trajectory_condition = self.energy_state_to_hidden(
+            maybe_cast(candidate_q - uniform, self.dtype)
+        ).astype(jnp.float32)
+        energy_input = self.energy_norm(
+            (energy_context.astype(jnp.float32) + trajectory_condition).astype(self.dtype)
+        )
+        energy_hidden = jax.nn.silu(
+            self.energy_hidden(maybe_cast(energy_input, self.dtype)).astype(jnp.float32)
+        )
+        return self.energy_head(maybe_cast(energy_hidden, self.dtype)).astype(jnp.float32)[..., 0]
+
+    def _energy_value_for_logits(
+        self,
+        q_logits: Array,
+        energy_context: Array,
+    ) -> Array:
+        candidate_q = jax.nn.softmax(self._center_q_logits(q_logits), axis=-1)
+        return self._energy_per_cell_from_context(candidate_q, energy_context)
+
+    def _energy_descent_from_context(
+        self,
+        current_logits: Array,
+        energy_context: Array,
+    ) -> tuple[Array, dict[str, Array]]:
+        current_logits = self._center_q_logits(current_logits)
         current_q = jax.nn.softmax(current_logits, axis=-1)
-        uniform = jnp.full_like(current_q, 1.0 / float(self.q_vocab_size))
 
         def energy_per_cell(candidate_q: Array) -> Array:
-            trajectory_condition = self.energy_state_to_hidden(
-                maybe_cast(candidate_q - uniform, self.dtype)
-            ).astype(jnp.float32)
-            energy_input = self.energy_norm(
-                (energy_context.astype(jnp.float32) + trajectory_condition).astype(self.dtype)
-            )
-            energy_hidden = jax.nn.silu(
-                self.energy_hidden(maybe_cast(energy_input, self.dtype)).astype(jnp.float32)
-            )
-            return self.energy_head(maybe_cast(energy_hidden, self.dtype)).astype(jnp.float32)[..., 0]
+            return self._energy_per_cell_from_context(candidate_q, energy_context)
 
         def total_energy(candidate_q: Array) -> Array:
             return jnp.sum(energy_per_cell(candidate_q))
@@ -766,6 +802,201 @@ class BRCModel(nnx.Module):
         mask = loss_mask.astype(jnp.float32)
         cell_energy = diagnostics["path_energy"][..., 0].astype(jnp.float32)
         return jnp.sum(cell_energy * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+
+    def _energy_context_for_state(
+        self,
+        tokens: Array,
+        trajectory: Array,
+        trajectory_count: Array,
+        hidden_state: Array,
+        base_embeddings: Array,
+        step_index: Array,
+        *,
+        train: bool,
+        dropout_key: Array | None,
+        stop_hidden_between_steps: bool = True,
+    ) -> tuple[Array, Array]:
+        context_condition, trajectory_condition = self._typed_conditions(
+            tokens,
+            jax.lax.stop_gradient(trajectory),
+            jax.lax.stop_gradient(trajectory_count),
+            base_embeddings,
+            step_index,
+            train=train,
+            dropout_key=dropout_key,
+        )
+        hidden_state = jax.lax.stop_gradient(hidden_state) if stop_hidden_between_steps else hidden_state
+        hidden_state = self._hidden_h_cycle(
+            hidden_state,
+            context_condition,
+            trajectory_condition,
+        )
+        return self._energy_context(
+            hidden_state,
+            context_condition,
+            trajectory_condition,
+        ), hidden_state
+
+    def _masked_per_example_mean(self, values: Array, mask: Array) -> Array:
+        mask_f = mask.astype(jnp.float32)
+        return jnp.sum(values.astype(jnp.float32) * mask_f, axis=-1) / jnp.maximum(jnp.sum(mask_f, axis=-1), 1.0)
+
+    def _masked_direction_cosine(
+        self,
+        direction: Array,
+        target_direction: Array,
+        mask: Array,
+    ) -> Array:
+        mask_f = mask.astype(jnp.float32)[..., None]
+        dot = jnp.sum(direction.astype(jnp.float32) * target_direction.astype(jnp.float32) * mask_f, axis=(1, 2))
+        direction_norm = jnp.sqrt(jnp.sum(jnp.square(direction.astype(jnp.float32)) * mask_f, axis=(1, 2)) + 1e-12)
+        target_norm = jnp.sqrt(jnp.sum(jnp.square(target_direction.astype(jnp.float32)) * mask_f, axis=(1, 2)) + 1e-12)
+        return dot / (direction_norm * target_norm + 1e-12)
+
+    def _energy_recovery_terms(
+        self,
+        tokens: Array,
+        targets: Array,
+        loss_mask: Array,
+        q_logits: Array,
+        trajectory: Array,
+        trajectory_count: Array,
+        hidden_state: Array,
+        base_embeddings: Array,
+        step_index: Array,
+        *,
+        train: bool,
+        dropout_key: Array | None,
+        wrong_only: bool,
+    ) -> dict[str, Array]:
+        energy_context, _hidden = self._energy_context_for_state(
+            tokens,
+            trajectory,
+            trajectory_count,
+            hidden_state,
+            base_embeddings,
+            step_index,
+            train=train,
+            dropout_key=dropout_key,
+            stop_hidden_between_steps=True,
+        )
+        current_logits = self._center_q_logits(q_logits)
+        next_logits, diagnostics = self._energy_descent_from_context(current_logits, energy_context)
+        target_logits = self.target_q_logits(targets)
+        current_energy_cell = diagnostics["energy_value"][..., 0].astype(jnp.float32)
+        target_energy_cell = self._energy_value_for_logits(target_logits, energy_context).astype(jnp.float32)
+        mask = loss_mask.astype(bool)
+        example_mask = jnp.sum(mask.astype(jnp.float32), axis=-1) > 0
+        if wrong_only:
+            pred = jnp.argmax(self._normalize_q(current_logits), axis=-1)
+            exact = jnp.all(jnp.where(mask, pred == targets, True), axis=-1)
+            example_mask = example_mask & (~exact)
+        example_weight = example_mask.astype(jnp.float32)
+        normalizer = jnp.maximum(jnp.sum(example_weight), 1.0)
+        current_energy = self._masked_per_example_mean(current_energy_cell, mask)
+        target_energy = self._masked_per_example_mean(target_energy_cell, mask)
+        rank_loss = jnp.sum(
+            jax.nn.relu(float(self.brc.wrong_attractor_rank_margin) + target_energy - current_energy)
+            * example_weight
+        ) / normalizer
+
+        logit_step = self._center_q_logits(next_logits - current_logits)
+        target_delta = self._center_q_logits(target_logits - current_logits)
+        cosine = self._masked_direction_cosine(logit_step, target_delta, mask)
+        direction_loss = jnp.sum((1.0 - cosine) * example_weight) / normalizer
+
+        grad_rms = self._masked_per_example_mean(diagnostics["energy_grad_rms"][..., 0], mask)
+        nonzero_loss = jnp.sum(
+            jnp.square(jax.nn.relu(float(self.brc.wrong_attractor_grad_floor) - grad_rms))
+            * example_weight
+        ) / normalizer
+        active_rate = jnp.mean(example_weight)
+        return {
+            "rank_loss": rank_loss.astype(jnp.float32),
+            "direction_loss": direction_loss.astype(jnp.float32),
+            "nonzero_loss": nonzero_loss.astype(jnp.float32),
+            "active_rate": active_rate.astype(jnp.float32),
+            "direction_cosine": (jnp.sum(cosine * example_weight) / normalizer).astype(jnp.float32),
+            "energy_gap": (jnp.sum((current_energy - target_energy) * example_weight) / normalizer).astype(jnp.float32),
+        }
+
+    def attractor_recovery_losses(
+        self,
+        tokens: Array,
+        targets: Array,
+        loss_mask: Array,
+        q_logits: Array,
+        trajectory: Array,
+        trajectory_count: Array,
+        hidden_state: Array,
+        *,
+        train: bool,
+        dropout_key: Array | None,
+    ) -> dict[str, Array]:
+        """Auxiliary losses that remove wrong low-energy attractors.
+
+        The carry state is treated as replay from the model's own trajectory.
+        A synthetic high-confidence wrong state is added as corrupted recovery.
+        """
+        base_embeddings, _context = self.context_memory(tokens)
+        step_index = jnp.minimum(trajectory_count, self.total_steps - 1)
+        carry_terms = self._energy_recovery_terms(
+            tokens,
+            targets,
+            loss_mask,
+            q_logits,
+            trajectory,
+            trajectory_count,
+            hidden_state,
+            base_embeddings,
+            step_index,
+            train=train,
+            dropout_key=dropout_key,
+            wrong_only=True,
+        )
+
+        wrong_labels = jnp.mod(targets.astype(jnp.int32) + 1, self.q_vocab_size)
+        smoothing = float(self.brc.fixed_point_label_smoothing)
+        wrong_distribution = (
+            (1.0 - smoothing) * jax.nn.one_hot(wrong_labels, self.q_vocab_size, dtype=jnp.float32)
+            + smoothing / float(self.q_vocab_size)
+        )
+        wrong_logits = self._center_q_logits(jnp.log(jnp.maximum(wrong_distribution, self.output_logit_eps)))
+        wrong_trajectory = self.initial_trajectory(tokens, wrong_logits)
+        wrong_trajectory_count = jnp.full((tokens.shape[0],), self.trajectory_length, dtype=jnp.int32)
+        wrong_hidden = self.initial_hidden_state(
+            tokens,
+            wrong_logits,
+            base_embeddings,
+            train=train,
+            dropout_key=dropout_key,
+        )
+        corrupted_terms = self._energy_recovery_terms(
+            tokens,
+            targets,
+            loss_mask,
+            wrong_logits,
+            wrong_trajectory,
+            wrong_trajectory_count,
+            wrong_hidden,
+            base_embeddings,
+            jnp.asarray(self.total_steps - 1, dtype=jnp.int32),
+            train=train,
+            dropout_key=dropout_key,
+            wrong_only=False,
+        )
+        return {
+            "wrong_attractor_rank_loss": carry_terms["rank_loss"],
+            "wrong_attractor_direction_loss": carry_terms["direction_loss"],
+            "wrong_attractor_nonzero_loss": carry_terms["nonzero_loss"],
+            "wrong_attractor_active_rate": carry_terms["active_rate"],
+            "wrong_attractor_direction_cosine": carry_terms["direction_cosine"],
+            "wrong_attractor_energy_gap": carry_terms["energy_gap"],
+            "corrupted_recovery_loss": corrupted_terms["direction_loss"],
+            "corrupted_recovery_rank_loss": corrupted_terms["rank_loss"],
+            "corrupted_recovery_direction_cosine": corrupted_terms["direction_cosine"],
+            "corrupted_recovery_energy_gap": corrupted_terms["energy_gap"],
+        }
 
     def _sudoku_constraint_ok(self, prediction_digits: Array, inputs: Array) -> Array:
         given_mask = inputs > self.sudoku_blank_token_id

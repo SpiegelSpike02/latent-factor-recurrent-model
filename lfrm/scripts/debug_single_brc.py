@@ -202,6 +202,17 @@ def main() -> None:
                     "descent_rms": _metric(host_metrics, "descent_rms"),
                     "logit_step_rms": _metric(host_metrics, "logit_step_rms"),
                     "path_energy": _metric(host_metrics, "path_energy"),
+                    "fixed_point_update_loss": _metric(host_metrics, "fixed_point_update_loss"),
+                    "wrong_attractor_rank_loss": _metric(host_metrics, "wrong_attractor_rank_loss"),
+                    "wrong_attractor_direction_loss": _metric(host_metrics, "wrong_attractor_direction_loss"),
+                    "wrong_attractor_nonzero_loss": _metric(host_metrics, "wrong_attractor_nonzero_loss"),
+                    "wrong_attractor_active_rate": _metric(host_metrics, "wrong_attractor_active_rate"),
+                    "wrong_attractor_direction_cosine": _metric(host_metrics, "wrong_attractor_direction_cosine"),
+                    "wrong_attractor_energy_gap": _metric(host_metrics, "wrong_attractor_energy_gap"),
+                    "corrupted_recovery_loss": _metric(host_metrics, "corrupted_recovery_loss"),
+                    "corrupted_recovery_rank_loss": _metric(host_metrics, "corrupted_recovery_rank_loss"),
+                    "corrupted_recovery_direction_cosine": _metric(host_metrics, "corrupted_recovery_direction_cosine"),
+                    "corrupted_recovery_energy_gap": _metric(host_metrics, "corrupted_recovery_energy_gap"),
                     **probe,
                 }
                 log_file.write(json.dumps(row, sort_keys=True) + "\n")
