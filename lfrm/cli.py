@@ -38,6 +38,7 @@ GROUPED_NESTED_KEYS = {
             "refine_steps",
             "block_depth",
             "step_loss_schedule",
+            "update_rule",
             "descent_step_size",
             "descent_rms_clip",
         },
@@ -350,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
     parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
+    parser.add_argument("--brc-update-rule", choices=("energy", "velocity"), default="energy")
     parser.add_argument("--brc-descent-step-size", type=float, default=0.3)
     parser.add_argument("--brc-descent-rms-clip", type=float, default=1.0)
     parser.add_argument("--brc-path-energy-weight", type=float, default=1e-4)
@@ -517,6 +519,7 @@ def build_config(
             rms_norm_eps=args.brc_rms_norm_eps,
             rope_theta=args.brc_rope_theta,
             step_loss_schedule=args.brc_step_loss_schedule,
+            update_rule=args.brc_update_rule,
             descent_step_size=args.brc_descent_step_size,
             descent_rms_clip=args.brc_descent_rms_clip,
             path_energy_weight=args.brc_path_energy_weight,

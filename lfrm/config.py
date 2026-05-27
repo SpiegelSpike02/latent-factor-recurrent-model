@@ -44,6 +44,7 @@ class BRCConfig:
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     step_loss_schedule: str = "uniform"
+    update_rule: str = "energy"
     descent_step_size: float = 0.3
     descent_rms_clip: float = 1.0
     path_energy_weight: float = 1e-4

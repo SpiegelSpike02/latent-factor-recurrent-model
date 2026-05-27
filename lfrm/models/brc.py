@@ -232,6 +232,8 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC axial RoPE head dimension must be divisible by 4")
         if brc.step_loss_schedule not in ("uniform", "linear", "quadratic"):
             raise ValueError("BRC step_loss_schedule must be 'uniform', 'linear', or 'quadratic'")
+        if brc.update_rule not in ("energy", "velocity"):
+            raise ValueError("BRC update_rule must be 'energy' or 'velocity'")
         if brc.descent_step_size <= 0.0:
             raise ValueError("BRC descent_step_size must be positive")
         if brc.descent_rms_clip <= 0.0:
@@ -383,6 +385,32 @@ class BRCModel(nnx.Module):
         self.energy_head = nnx.Linear(
             self.hidden_dim,
             1,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.velocity_state_to_hidden = nnx.Linear(
+            self.q_vocab_size,
+            self.hidden_dim,
+            use_bias=False,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.velocity_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
+        self.velocity_hidden = nnx.Linear(
+            self.hidden_dim,
+            self.hidden_dim,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.velocity_head = nnx.Linear(
+            self.hidden_dim,
+            self.q_vocab_size,
             dtype=self.dtype,
             param_dtype=jnp.float32,
             kernel_init=casted_linear_init,
@@ -608,6 +636,58 @@ class BRCModel(nnx.Module):
         candidate_q = jax.nn.softmax(self._center_q_logits(q_logits), axis=-1)
         return self._energy_per_cell_from_context(candidate_q, energy_context)
 
+    def _direct_velocity_step_from_context(
+        self,
+        current_logits: Array,
+        energy_context: Array,
+    ) -> tuple[Array, dict[str, Array]]:
+        current_logits = self._center_q_logits(current_logits)
+        current_q = jax.nn.softmax(current_logits, axis=-1)
+        uniform = jnp.full_like(current_q, 1.0 / float(self.q_vocab_size))
+        state_condition = self.velocity_state_to_hidden(
+            maybe_cast(current_q - uniform, self.dtype)
+        ).astype(jnp.float32)
+        velocity_input = self.velocity_norm(
+            (energy_context.astype(jnp.float32) + state_condition).astype(self.dtype)
+        )
+        velocity_hidden = jax.nn.silu(
+            self.velocity_hidden(maybe_cast(velocity_input, self.dtype)).astype(jnp.float32)
+        )
+        raw_velocity = self.velocity_head(maybe_cast(velocity_hidden, self.dtype)).astype(jnp.float32)
+        velocity = self._center_q_logits(raw_velocity)
+        raw_logit_step = float(self.brc.descent_step_size) * velocity
+        raw_step_rms = jnp.sqrt(jnp.mean(jnp.square(raw_logit_step), axis=-1, keepdims=True) + 1e-12)
+        clip_scale = jnp.minimum(1.0, float(self.brc.descent_rms_clip) / raw_step_rms)
+        logit_step = raw_logit_step * clip_scale
+        next_logits = self._center_q_logits(current_logits + logit_step)
+        next_q = jax.nn.softmax(next_logits, axis=-1)
+
+        distribution_tv_delta = 0.5 * jnp.sum(jnp.abs(next_q - current_q), axis=-1, keepdims=True)
+        velocity_rms = jnp.sqrt(jnp.mean(jnp.square(velocity), axis=-1, keepdims=True) + 1e-12)
+        logit_step_rms = jnp.sqrt(jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True) + 1e-12)
+        path_energy = jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True)
+        descent_step_size = jnp.broadcast_to(
+            jnp.asarray(float(self.brc.descent_step_size), dtype=jnp.float32),
+            (*current_logits.shape[:-1], 1),
+        )
+        diagnostics = {
+            "update_step_size": descent_step_size,
+            "update_clip_scale": clip_scale,
+            "update_rms": velocity_rms,
+            "velocity_rms": velocity_rms,
+            "velocity_clip_scale": clip_scale,
+            "energy_update_rms": jnp.zeros_like(velocity_rms),
+            "energy_value": jnp.zeros_like(velocity_rms),
+            "energy_grad_rms": jnp.zeros_like(velocity_rms),
+            "descent_step_size": descent_step_size,
+            "descent_clip_scale": clip_scale,
+            "descent_rms": velocity_rms,
+            "logit_step_rms": logit_step_rms,
+            "distribution_tv_delta": distribution_tv_delta,
+            "path_energy": path_energy,
+        }
+        return next_logits, diagnostics
+
     def _energy_descent_from_context(
         self,
         current_logits: Array,
@@ -644,6 +724,12 @@ class BRCModel(nnx.Module):
         logit_step_rms = jnp.sqrt(jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True) + 1e-12)
         path_energy = jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True)
         diagnostics = {
+            "update_step_size": descent_step_size,
+            "update_clip_scale": descent_clip_scale,
+            "update_rms": descent_rms,
+            "velocity_rms": jnp.zeros_like(descent_rms),
+            "velocity_clip_scale": jnp.ones_like(descent_clip_scale),
+            "energy_update_rms": descent_rms,
             "energy_value": energy_value,
             "energy_grad_rms": energy_grad_rms,
             "descent_step_size": descent_step_size,
@@ -707,6 +793,12 @@ class BRCModel(nnx.Module):
         stop_hidden_between_steps: bool = True,
     ) -> tuple[Array, Array, dict[str, Array]]:
         update_diagnostics = {
+            "update_step_size": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "update_clip_scale": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "update_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "velocity_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "velocity_clip_scale": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
+            "energy_update_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
             "descent_step_size": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
             "descent_clip_scale": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
             "energy_value": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
@@ -738,12 +830,11 @@ class BRCModel(nnx.Module):
             context_condition,
             trajectory_condition,
         )
-        q, update_diagnostics = self._energy_descent_step(
-            tokens,
-            q,
-            energy_context,
-            step_index,
-        )
+        del step_index
+        if self.brc.update_rule == "velocity":
+            q, update_diagnostics = self._direct_velocity_step_from_context(q, energy_context)
+        else:
+            q, update_diagnostics = self._energy_descent_from_context(q, energy_context)
         return (
             q,
             hidden_state,
@@ -771,7 +862,7 @@ class BRCModel(nnx.Module):
     ) -> Array:
         """Penalize nonzero update at the smoothed target fixed point.
 
-        This auxiliary fixed-point probe asks the energy-descent update to vanish
+        This auxiliary fixed-point probe asks the configured q update to vanish
         when q is already the smoothed target distribution. It does not change
         the main q trajectory state.
         """
@@ -881,7 +972,10 @@ class BRCModel(nnx.Module):
             stop_hidden_between_steps=True,
         )
         current_logits = self._center_q_logits(q_logits)
-        next_logits, diagnostics = self._energy_descent_from_context(current_logits, energy_context)
+        if self.brc.update_rule == "velocity":
+            next_logits, diagnostics = self._direct_velocity_step_from_context(current_logits, energy_context)
+        else:
+            next_logits, diagnostics = self._energy_descent_from_context(current_logits, energy_context)
         target_logits = self.target_q_logits(targets)
         current_energy_cell = diagnostics["energy_value"][..., 0].astype(jnp.float32)
         target_energy_cell = self._energy_value_for_logits(target_logits, energy_context).astype(jnp.float32)
@@ -895,10 +989,15 @@ class BRCModel(nnx.Module):
         normalizer = jnp.maximum(jnp.sum(example_weight), 1.0)
         current_energy = self._masked_per_example_mean(current_energy_cell, mask)
         target_energy = self._masked_per_example_mean(target_energy_cell, mask)
-        rank_loss = jnp.sum(
-            jax.nn.relu(float(self.brc.wrong_attractor_rank_margin) + target_energy - current_energy)
-            * example_weight
-        ) / normalizer
+        if self.brc.update_rule == "energy":
+            rank_loss = jnp.sum(
+                jax.nn.relu(float(self.brc.wrong_attractor_rank_margin) + target_energy - current_energy)
+                * example_weight
+            ) / normalizer
+            energy_gap = jnp.sum((current_energy - target_energy) * example_weight) / normalizer
+        else:
+            rank_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            energy_gap = jnp.asarray(0.0, dtype=jnp.float32)
 
         logit_step = self._center_q_logits(next_logits - current_logits)
         target_delta = self._center_q_logits(target_logits - current_logits)
@@ -917,7 +1016,7 @@ class BRCModel(nnx.Module):
             "nonzero_loss": nonzero_loss.astype(jnp.float32),
             "active_rate": active_rate.astype(jnp.float32),
             "direction_cosine": (jnp.sum(cosine * example_weight) / normalizer).astype(jnp.float32),
-            "energy_gap": (jnp.sum((current_energy - target_energy) * example_weight) / normalizer).astype(jnp.float32),
+            "energy_gap": energy_gap.astype(jnp.float32),
         }
 
     def attractor_recovery_losses(
@@ -1189,6 +1288,12 @@ class BRCModel(nnx.Module):
             "stability_rate": jnp.mean(early_stop.astype(jnp.float32)),
             "stable_steps": jnp.mean(stable_steps.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
+            "update_step_size": jnp.mean(update_diagnostics["update_step_size"].astype(jnp.float32)),
+            "update_clip_scale": jnp.mean(update_diagnostics["update_clip_scale"].astype(jnp.float32)),
+            "update_rms": jnp.mean(update_diagnostics["update_rms"].astype(jnp.float32)),
+            "velocity_rms": jnp.mean(update_diagnostics["velocity_rms"].astype(jnp.float32)),
+            "velocity_clip_scale": jnp.mean(update_diagnostics["velocity_clip_scale"].astype(jnp.float32)),
+            "energy_update_rms": jnp.mean(update_diagnostics["energy_update_rms"].astype(jnp.float32)),
             "descent_step_size": jnp.mean(update_diagnostics["descent_step_size"].astype(jnp.float32)),
             "descent_clip_scale": jnp.mean(update_diagnostics["descent_clip_scale"].astype(jnp.float32)),
             "energy_value": jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
@@ -1247,6 +1352,12 @@ class BRCModel(nnx.Module):
             return next_carry, (
                 logits,
                 q_top1_probability,
+                jnp.mean(update_diagnostics["update_step_size"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["update_clip_scale"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["update_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["velocity_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["velocity_clip_scale"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["energy_update_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["descent_step_size"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["descent_clip_scale"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
@@ -1287,6 +1398,12 @@ class BRCModel(nnx.Module):
             diagnostics = {
                 "q_top1_probability": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
+                "update_step_size": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "update_clip_scale": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "velocity_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "velocity_clip_scale": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "energy_update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "descent_step_size": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "descent_clip_scale": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_value": jnp.zeros((self.total_steps,), dtype=jnp.float32),
@@ -1300,6 +1417,12 @@ class BRCModel(nnx.Module):
         (
             step_logits,
             q_top1_probability,
+            update_step_size,
+            update_clip_scale,
+            update_rms,
+            velocity_rms,
+            velocity_clip_scale,
+            energy_update_rms,
             descent_step_size,
             descent_clip_scale,
             energy_value,
@@ -1312,6 +1435,12 @@ class BRCModel(nnx.Module):
         diagnostics = {
             "q_top1_probability": q_top1_probability,
             "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
+            "update_step_size": update_step_size,
+            "update_clip_scale": update_clip_scale,
+            "update_rms": update_rms,
+            "velocity_rms": velocity_rms,
+            "velocity_clip_scale": velocity_clip_scale,
+            "energy_update_rms": energy_update_rms,
             "descent_step_size": descent_step_size,
             "descent_clip_scale": descent_clip_scale,
             "energy_value": energy_value,
