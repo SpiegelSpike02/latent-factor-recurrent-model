@@ -331,7 +331,7 @@ def brc_loss_and_metrics(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     if dropout_key is None:
         dropout_key = jax.random.key(0)
-    augment_key, solve_key, terminal_key = jax.random.split(dropout_key, 3)
+    augment_key, solve_key, terminal_key, attractor_key = jax.random.split(dropout_key, 4)
     if model.config.task_type == "sudoku":
         inputs, targets = _permute_sudoku_digits(
             batch["inputs"],
@@ -385,11 +385,55 @@ def brc_loss_and_metrics(
         )
     else:
         fixed_point_update_loss = zero
+    if (
+        float(model.brc.wrong_attractor_rank_weight) != 0.0
+        or float(model.brc.wrong_attractor_direction_weight) != 0.0
+        or float(model.brc.wrong_attractor_nonzero_weight) != 0.0
+        or float(model.brc.corrupted_recovery_weight) != 0.0
+    ):
+        base_embeddings, _context = model.context_memory(inputs)
+        probe_trajectory = model.initial_trajectory(inputs, final_logits)
+        probe_trajectory_count = jnp.full((inputs.shape[0],), model.trajectory_length, dtype=jnp.int32)
+        probe_hidden = model.initial_hidden_state(
+            inputs,
+            final_logits,
+            base_embeddings,
+            train=train,
+            dropout_key=attractor_key,
+        )
+        attractor_losses = model.attractor_recovery_losses(
+            inputs,
+            targets,
+            loss_mask,
+            final_logits,
+            probe_trajectory,
+            probe_trajectory_count,
+            probe_hidden,
+            train=train,
+            dropout_key=attractor_key,
+        )
+    else:
+        attractor_losses = {
+            "wrong_attractor_rank_loss": zero,
+            "wrong_attractor_direction_loss": zero,
+            "wrong_attractor_nonzero_loss": zero,
+            "wrong_attractor_active_rate": zero,
+            "wrong_attractor_direction_cosine": zero,
+            "wrong_attractor_energy_gap": zero,
+            "corrupted_recovery_loss": zero,
+            "corrupted_recovery_rank_loss": zero,
+            "corrupted_recovery_direction_cosine": zero,
+            "corrupted_recovery_energy_gap": zero,
+        }
     solution_loss = per_step_loss[-1]
     loss = (
         step_ce_loss
         + float(model.brc.path_energy_weight) * path_energy_loss
         + float(model.brc.fixed_point_update_weight) * fixed_point_update_loss
+        + float(model.brc.wrong_attractor_rank_weight) * attractor_losses["wrong_attractor_rank_loss"]
+        + float(model.brc.wrong_attractor_direction_weight) * attractor_losses["wrong_attractor_direction_loss"]
+        + float(model.brc.wrong_attractor_nonzero_weight) * attractor_losses["wrong_attractor_nonzero_loss"]
+        + float(model.brc.corrupted_recovery_weight) * attractor_losses["corrupted_recovery_loss"]
     )
 
     predictions = _output_predictions_to_tokens(model, final_logits)
@@ -430,6 +474,7 @@ def brc_loss_and_metrics(
         "mean_ce_loss": jnp.mean(per_step_loss),
         "path_energy_loss": path_energy_loss,
         "fixed_point_update_loss": fixed_point_update_loss,
+        **attractor_losses,
         "final_target_probability": target_probability,
         "accuracy": cell_accuracy,
         "query_accuracy": query_accuracy,
