@@ -393,14 +393,17 @@ class GridModelTests(unittest.TestCase):
         )
         read_state = jnp.zeros((1, 4, 16), dtype=jnp.float32)
 
-        next_logits, diagnostics = model._energy_descent_from_read_state(current_logits, read_state)
+        next_logits, diagnostics, update_distributions = model._energy_descent_from_read_state(current_logits, read_state)
         current_distribution = model._distribution_from_logits(current_logits)
         next_distribution = model._distribution_from_logits(next_logits)
+        cached_current_distribution, cached_next_distribution = update_distributions
 
         self.assertTrue(bool(jnp.all(jnp.isfinite(next_logits))))
         self.assertTrue(bool(jnp.allclose(jnp.mean(next_logits, axis=-1), 0.0, atol=1e-6)))
         self.assertTrue(bool(jnp.allclose(jnp.sum(next_distribution, axis=-1), 1.0, atol=1e-6)))
         self.assertTrue(bool(jnp.all(next_distribution > 0.0)))
+        self.assertTrue(bool(jnp.allclose(cached_current_distribution, current_distribution, atol=1e-6)))
+        self.assertTrue(bool(jnp.allclose(cached_next_distribution, next_distribution, atol=1e-6)))
         expected_path_energy = jnp.mean(jnp.square(next_distribution - current_distribution), axis=-1, keepdims=True)
         self.assertTrue(bool(jnp.allclose(diagnostics["path_energy"], expected_path_energy, rtol=1e-5, atol=1e-6)))
 

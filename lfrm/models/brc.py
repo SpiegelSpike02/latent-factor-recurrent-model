@@ -538,7 +538,8 @@ class BRCModel(nnx.Module):
     ) -> tuple[Array, dict[str, Array]]:
         del tokens, step_index
         current_logits = self._center_logits(z_logits)
-        return self._energy_descent_from_read_state(current_logits, read_state)
+        next_logits, diagnostics, _distributions = self._energy_descent_from_read_state(current_logits, read_state)
+        return next_logits, diagnostics
 
     def _energy_per_cell_from_read_state(
         self,
@@ -566,7 +567,7 @@ class BRCModel(nnx.Module):
         self,
         current_logits: Array,
         read_state: Array,
-    ) -> tuple[Array, dict[str, Array]]:
+    ) -> tuple[Array, dict[str, Array], tuple[Array, Array]]:
         current_logits = self._center_logits(current_logits)
         current_distribution = jax.nn.softmax(current_logits, axis=-1)
         raw_velocity = self.velocity_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
@@ -598,16 +599,14 @@ class BRCModel(nnx.Module):
             "logit_step_rms": logit_step_rms,
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
-            "_current_distribution": current_distribution,
-            "_next_distribution": next_distribution,
         }
-        return next_logits, diagnostics
+        return next_logits, diagnostics, (current_distribution, next_distribution)
 
     def _energy_descent_from_read_state(
         self,
         current_logits: Array,
         read_state: Array,
-    ) -> tuple[Array, dict[str, Array]]:
+    ) -> tuple[Array, dict[str, Array], tuple[Array, Array]]:
         current_logits = self._center_logits(current_logits)
         current_distribution = jax.nn.softmax(current_logits, axis=-1)
 
@@ -645,10 +644,8 @@ class BRCModel(nnx.Module):
             "logit_step_rms": logit_step_rms,
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
-            "_current_distribution": current_distribution,
-            "_next_distribution": next_distribution,
         }
-        return next_logits, diagnostics
+        return next_logits, diagnostics, (current_distribution, next_distribution)
 
     def _hidden_h_cycle(
         self,
@@ -690,7 +687,7 @@ class BRCModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
         stop_hidden_between_steps: bool = True,
-    ) -> tuple[Array, Array, dict[str, Array]]:
+    ) -> tuple[Array, Array, dict[str, Array], tuple[Array, Array]]:
         update_diagnostics = {
             "update_step_size": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
             "update_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
@@ -721,13 +718,14 @@ class BRCModel(nnx.Module):
         read_state = self._update_read_state(hidden_state)
         del step_index
         if self.brc.update_rule == "velocity":
-            z, update_diagnostics = self._velocity_step_from_read_state(z, read_state)
+            z, update_diagnostics, update_distributions = self._velocity_step_from_read_state(z, read_state)
         else:
-            z, update_diagnostics = self._energy_descent_from_read_state(z, read_state)
+            z, update_diagnostics, update_distributions = self._energy_descent_from_read_state(z, read_state)
         return (
             z,
             hidden_state,
             update_diagnostics,
+            update_distributions,
         )
 
     def target_z_logits(self, targets: Array) -> Array:
@@ -765,7 +763,7 @@ class BRCModel(nnx.Module):
             dropout_key=dropout_key,
         )
         final_step = jnp.asarray(self.total_steps - 1, dtype=jnp.int32)
-        _next_z, _next_hidden, diagnostics = self._commit_step(
+        _next_z, _next_hidden, diagnostics, _distributions = self._commit_step(
             tokens,
             target_logits,
             hidden,
@@ -849,9 +847,9 @@ class BRCModel(nnx.Module):
         )
         current_logits = self._center_logits(z_logits)
         if self.brc.update_rule == "velocity":
-            next_logits, diagnostics = self._velocity_step_from_read_state(current_logits, read_state)
+            next_logits, diagnostics, update_distributions = self._velocity_step_from_read_state(current_logits, read_state)
         else:
-            next_logits, diagnostics = self._energy_descent_from_read_state(current_logits, read_state)
+            next_logits, diagnostics, update_distributions = self._energy_descent_from_read_state(current_logits, read_state)
         target_logits = self.target_z_logits(targets)
         current_energy_cell = diagnostics["energy_value"][..., 0].astype(jnp.float32)
         mask = loss_mask.astype(bool)
@@ -877,8 +875,7 @@ class BRCModel(nnx.Module):
             energy_gap = jnp.asarray(0.0, dtype=jnp.float32)
 
         if self.brc.update_rule == "energy":
-            current_distribution = diagnostics["_current_distribution"]
-            next_distribution = diagnostics["_next_distribution"]
+            current_distribution, next_distribution = update_distributions
             update_direction = next_distribution - current_distribution
             target_direction = target_distribution - current_distribution
         else:
@@ -991,13 +988,13 @@ class BRCModel(nnx.Module):
         inputs: Array,
         new_steps: Array,
         update_diagnostics: dict[str, Array],
+        update_distributions: tuple[Array, Array] | None,
     ) -> tuple[Array, dict[str, Array]]:
-        old_distribution = update_diagnostics.get("_current_distribution")
-        new_distribution = update_diagnostics.get("_next_distribution")
-        if old_distribution is None:
+        if update_distributions is None:
             old_distribution = self._distribution_from_logits(old_z)
-        if new_distribution is None:
             new_distribution = self._distribution_from_logits(new_z)
+        else:
+            old_distribution, new_distribution = update_distributions
         query_mask = (~self.context_mask(inputs)).astype(jnp.float32)
         query_normalizer = jnp.maximum(jnp.sum(query_mask, axis=-1), 1.0)
         distribution_delta_cell = 0.5 * jnp.sum(jnp.abs(new_distribution - old_distribution), axis=-1)
@@ -1112,7 +1109,7 @@ class BRCModel(nnx.Module):
             dropout_key=dropout_key,
         )
         hidden = jnp.where(reset_state, reset_hidden, carry["hidden"])
-        next_z, next_hidden, update_diagnostics = self._commit_step(
+        next_z, next_hidden, update_diagnostics, update_distributions = self._commit_step(
             inputs,
             z,
             hidden,
@@ -1131,6 +1128,7 @@ class BRCModel(nnx.Module):
             inputs,
             new_steps,
             update_diagnostics,
+            update_distributions,
         )
         stable_steps = jnp.where(early_stop, stable_steps + 1, 0)
         stable_reset = stable_steps >= int(self.brc.early_stop_patience)
@@ -1183,7 +1181,7 @@ class BRCModel(nnx.Module):
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key = scan_inputs
             z, hidden_state = carry
-            next_z, next_hidden, update_diagnostics = self._commit_step(
+            next_z, next_hidden, update_diagnostics, _update_distributions = self._commit_step(
                 tokens,
                 z,
                 hidden_state,
