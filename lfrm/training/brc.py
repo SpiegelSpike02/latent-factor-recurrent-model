@@ -69,7 +69,7 @@ def build_brc_step_carry_train_step_runner():
     # Step-carry is a truncated execution path for BRC. It carries z/H between
     # optimizer updates and lets deterministic energy-stability early stop reset
     # samples without training a learned halt head.
-    return nnx.jit(train_step)
+    return nnx.jit(train_step, donate_argnums=(2,))
 
 
 def build_eval_step_runner(

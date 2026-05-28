@@ -598,6 +598,8 @@ class BRCModel(nnx.Module):
             "logit_step_rms": logit_step_rms,
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
+            "_current_distribution": current_distribution,
+            "_next_distribution": next_distribution,
         }
         return next_logits, diagnostics
 
@@ -612,11 +614,9 @@ class BRCModel(nnx.Module):
         def energy_per_cell(candidate_distribution: Array) -> Array:
             return self._energy_per_cell_from_read_state(candidate_distribution, read_state)
 
-        def total_energy(candidate_distribution: Array) -> Array:
-            return jnp.sum(energy_per_cell(candidate_distribution))
-
-        energy_value = energy_per_cell(current_distribution)[..., None]
-        energy_grad = self._center_logits(jax.grad(total_energy)(current_distribution))
+        energy_cells, energy_vjp = jax.vjp(energy_per_cell, current_distribution)
+        energy_value = energy_cells[..., None]
+        energy_grad = self._center_logits(energy_vjp(jnp.ones_like(energy_cells))[0])
         descent_direction = -energy_grad
         logit_step = float(self.brc.update_step_size) * descent_direction
         update_step_size = jnp.broadcast_to(
@@ -645,6 +645,8 @@ class BRCModel(nnx.Module):
             "logit_step_rms": logit_step_rms,
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
+            "_current_distribution": current_distribution,
+            "_next_distribution": next_distribution,
         }
         return next_logits, diagnostics
 
@@ -852,7 +854,6 @@ class BRCModel(nnx.Module):
             next_logits, diagnostics = self._energy_descent_from_read_state(current_logits, read_state)
         target_logits = self.target_z_logits(targets)
         current_energy_cell = diagnostics["energy_value"][..., 0].astype(jnp.float32)
-        target_energy_cell = self._energy_value_for_logits(target_logits, read_state).astype(jnp.float32)
         mask = loss_mask.astype(bool)
         example_mask = jnp.sum(mask.astype(jnp.float32), axis=-1) > 0
         if wrong_only:
@@ -861,9 +862,11 @@ class BRCModel(nnx.Module):
             example_mask = example_mask & (~exact)
         example_weight = example_mask.astype(jnp.float32)
         normalizer = jnp.maximum(jnp.sum(example_weight), 1.0)
-        current_energy = self._masked_per_example_mean(current_energy_cell, mask)
-        target_energy = self._masked_per_example_mean(target_energy_cell, mask)
         if self.brc.update_rule == "energy":
+            target_distribution = self._distribution_from_logits(target_logits)
+            target_energy_cell = self._energy_per_cell_from_read_state(target_distribution, read_state).astype(jnp.float32)
+            current_energy = self._masked_per_example_mean(current_energy_cell, mask)
+            target_energy = self._masked_per_example_mean(target_energy_cell, mask)
             rank_loss = jnp.sum(
                 jax.nn.relu(float(self.brc.wrong_attractor_rank_margin) + target_energy - current_energy)
                 * example_weight
@@ -874,9 +877,8 @@ class BRCModel(nnx.Module):
             energy_gap = jnp.asarray(0.0, dtype=jnp.float32)
 
         if self.brc.update_rule == "energy":
-            current_distribution = self._distribution_from_logits(current_logits)
-            next_distribution = self._distribution_from_logits(next_logits)
-            target_distribution = self._distribution_from_logits(target_logits)
+            current_distribution = diagnostics["_current_distribution"]
+            next_distribution = diagnostics["_next_distribution"]
             update_direction = next_distribution - current_distribution
             target_direction = target_distribution - current_distribution
         else:
@@ -990,8 +992,12 @@ class BRCModel(nnx.Module):
         new_steps: Array,
         update_diagnostics: dict[str, Array],
     ) -> tuple[Array, dict[str, Array]]:
-        old_distribution = self._distribution_from_logits(old_z)
-        new_distribution = self._distribution_from_logits(new_z)
+        old_distribution = update_diagnostics.get("_current_distribution")
+        new_distribution = update_diagnostics.get("_next_distribution")
+        if old_distribution is None:
+            old_distribution = self._distribution_from_logits(old_z)
+        if new_distribution is None:
+            new_distribution = self._distribution_from_logits(new_z)
         query_mask = (~self.context_mask(inputs)).astype(jnp.float32)
         query_normalizer = jnp.maximum(jnp.sum(query_mask, axis=-1), 1.0)
         distribution_delta_cell = 0.5 * jnp.sum(jnp.abs(new_distribution - old_distribution), axis=-1)
