@@ -46,7 +46,6 @@ class BRCConfig:
     step_loss_schedule: str = "uniform"
     update_rule: str = "energy"
     update_step_size: float = 0.3
-    update_rms_clip: float = 1.0
     path_energy_weight: float = 1e-4
     fixed_point_update_weight: float = 0.0
     fixed_point_label_smoothing: float = 1e-3

@@ -24,23 +24,39 @@ def stablemax_cross_entropy_with_integer_labels(logits: jax.Array, targets: jax.
     return log_normalizer - target_log_positive
 
 
-def token_cross_entropy(model: object, logits: jax.Array, targets: jax.Array) -> jax.Array:
+def outputs_are_probabilities(model: object) -> bool:
+    return (
+        getattr(getattr(model, "config", None), "model_type", None) == "brc"
+        and getattr(getattr(model, "brc", None), "update_rule", None) == "energy"
+    )
+
+
+def output_probabilities(model: object, outputs: jax.Array) -> jax.Array:
+    if outputs_are_probabilities(model):
+        return outputs.astype(jnp.float32)
     loss_type = getattr(getattr(model, "config", None), "loss_type", "softmax")
     if loss_type == "softmax":
-        return optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-    if loss_type == "stablemax":
-        return stablemax_cross_entropy_with_integer_labels(logits, targets)
+        return jax.nn.softmax(outputs, axis=-1)
+    elif loss_type == "stablemax":
+        return stablemax(outputs, axis=-1)
     raise ValueError(f"Unsupported loss_type: {loss_type}")
 
 
-def target_probability(model: object, logits: jax.Array, targets: jax.Array) -> jax.Array:
+def token_cross_entropy(model: object, outputs: jax.Array, targets: jax.Array) -> jax.Array:
+    if outputs_are_probabilities(model):
+        probs = outputs.astype(jnp.float32)
+        target_probs = jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
+        return -jnp.log(target_probs + 1e-9)
     loss_type = getattr(getattr(model, "config", None), "loss_type", "softmax")
     if loss_type == "softmax":
-        probs = jax.nn.softmax(logits, axis=-1)
-    elif loss_type == "stablemax":
-        probs = stablemax(logits, axis=-1)
-    else:
-        raise ValueError(f"Unsupported loss_type: {loss_type}")
+        return optax.softmax_cross_entropy_with_integer_labels(outputs, targets)
+    if loss_type == "stablemax":
+        return stablemax_cross_entropy_with_integer_labels(outputs, targets)
+    raise ValueError(f"Unsupported loss_type: {loss_type}")
+
+
+def target_probability(model: object, outputs: jax.Array, targets: jax.Array) -> jax.Array:
+    probs = output_probabilities(model, outputs)
     return jnp.take_along_axis(probs, targets[..., None], axis=-1).squeeze(-1)
 
 

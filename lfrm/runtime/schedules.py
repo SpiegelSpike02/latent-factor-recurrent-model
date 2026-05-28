@@ -39,6 +39,8 @@ def eval_interval_updates(config: ExperimentConfig) -> int:
 
 def eval_update_steps(config: ExperimentConfig) -> frozenset[int]:
     total_updates = max(1, config.train.optimizer_updates)
+    if config.eval.nums == 0:
+        return frozenset()
     eval_nums = max(1, min(config.eval.nums, total_updates))
     return frozenset(
         max(1, math.ceil(total_updates * eval_index / eval_nums))
@@ -70,7 +72,7 @@ def apply_epoch_budget(config: ExperimentConfig, dataset) -> ExperimentConfig:
     )
     eval_config = replace(
         config.eval,
-        interval_updates=max(1, math.ceil(train.optimizer_updates / max(1, config.eval.nums))),
+        interval_updates=0 if config.eval.nums == 0 else max(1, math.ceil(train.optimizer_updates / config.eval.nums)),
     )
     return ExperimentConfig(
         task=config.task,

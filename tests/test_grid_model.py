@@ -27,6 +27,7 @@ from lfrm.config import (
 )
 from lfrm.runtime import (
     apply_epoch_budget,
+    eval_update_steps,
     resolve_resume_checkpoint,
     schedule_learning_rate,
     small_metric_items,
@@ -45,6 +46,7 @@ from lfrm.training import (
     stablemax_cross_entropy_with_integer_labels,
     trm_dense_unroll_loss_and_metrics,
 )
+from lfrm.training.losses import token_cross_entropy
 from lfrm.training.optim import scheduled_lr
 
 
@@ -68,7 +70,7 @@ class GridModelTests(unittest.TestCase):
             model=ModelConfig(vocab_size=11),
             optimizer=OptimizerConfig(),
             train=TrainConfig(batch_size=1024, epochs=10, log_epochs=1),
-            eval=EvalConfig(epochs=2),
+            eval=EvalConfig(nums=5),
             data=DataConfig(dataset_path="unused"),
             runtime=RuntimeConfig(),
             wandb=WandbConfig(),
@@ -80,6 +82,24 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(budgeted.train.optimizer_updates, 20)
         self.assertEqual(budgeted.train.log_interval_updates, 2)
         self.assertEqual(budgeted.eval.interval_updates, 4)
+
+    def test_eval_nums_zero_disables_eval_steps(self) -> None:
+        config = ExperimentConfig(
+            model=ModelConfig(vocab_size=11),
+            optimizer=OptimizerConfig(),
+            train=TrainConfig(batch_size=10, epochs=50, log_epochs=1),
+            eval=EvalConfig(nums=0),
+            data=DataConfig(dataset_path="unused"),
+            runtime=RuntimeConfig(),
+            wandb=WandbConfig(),
+        )
+        dataset = SimpleNamespace(
+            spec=SimpleNamespace(total_groups=1000, mean_puzzle_examples=1.0)
+        )
+        budgeted = apply_epoch_budget(config, dataset)
+        self.assertEqual(budgeted.train.optimizer_updates, 5000)
+        self.assertEqual(budgeted.eval.interval_updates, 0)
+        self.assertEqual(eval_update_steps(budgeted), frozenset())
 
     def test_small_metric_items_drops_large_leaves(self) -> None:
         metrics = {
@@ -362,7 +382,6 @@ class GridModelTests(unittest.TestCase):
                     mlp_ratio=1,
                     update_rule="energy",
                     update_step_size=0.5,
-                    update_rms_clip=0.25,
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -381,9 +400,49 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.all(jnp.isfinite(next_logits))))
         self.assertTrue(bool(jnp.allclose(jnp.mean(next_logits, axis=-1), 0.0, atol=1e-6)))
         self.assertTrue(bool(jnp.allclose(jnp.sum(next_distribution, axis=-1), 1.0, atol=1e-6)))
-        self.assertTrue(bool(jnp.all(next_distribution >= 0.0)))
+        self.assertTrue(bool(jnp.all(next_distribution > 0.0)))
         expected_path_energy = jnp.mean(jnp.square(next_distribution - current_distribution), axis=-1, keepdims=True)
         self.assertTrue(bool(jnp.allclose(diagnostics["path_energy"], expected_path_energy, rtol=1e-5, atol=1e-6)))
+
+    def test_brc_energy_outputs_probabilities_for_loss(self) -> None:
+        model = BRCModel(
+            ModelConfig(
+                vocab_size=5,
+                model_type="brc",
+                task=TaskConfig(type="arc"),
+                seq_len=4,
+                grid_height=2,
+                grid_width=2,
+                d_model=16,
+                brc=BRCConfig(
+                    commit_steps=1,
+                    num_heads=4,
+                    mlp_ratio=1,
+                    update_rule="energy",
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(316),
+        )
+        tokens = jnp.zeros((1, 4), dtype=jnp.int32)
+        z = jnp.asarray([[[1.5, 0.5, -0.5, -1.0, -0.5]] * 4], dtype=jnp.float32)
+        outputs = model._z_to_token_logits(z, tokens, jnp.asarray(0, dtype=jnp.int32))
+        targets = jnp.asarray([[0, 1, 2, 3]], dtype=jnp.int32)
+        expected_loss = -jnp.log(jnp.take_along_axis(outputs, targets[..., None], axis=-1).squeeze(-1) + 1e-9)
+
+        self.assertTrue(bool(jnp.allclose(jnp.sum(outputs, axis=-1), 1.0, atol=1e-6)))
+        self.assertTrue(bool(jnp.all(outputs >= 0.0)))
+        self.assertTrue(bool(jnp.allclose(token_cross_entropy(model, outputs, targets), expected_loss, atol=1e-6)))
+
+        zero_target_outputs = jnp.asarray([[[0.0, 1.0, 0.0, 0.0, 0.0]]], dtype=jnp.float32)
+        zero_target = jnp.asarray([[0]], dtype=jnp.int32)
+
+        def zero_target_loss(probs):
+            return jnp.sum(token_cross_entropy(model, probs, zero_target))
+
+        zero_loss, zero_grad = jax.value_and_grad(zero_target_loss)(zero_target_outputs)
+        self.assertTrue(bool(jnp.isfinite(zero_loss)))
+        self.assertLess(float(zero_grad[0, 0, 0]), 0.0)
 
     def test_brc_energy_attractor_direction_uses_distribution_delta(self) -> None:
         model = BRCModel(
@@ -401,7 +460,6 @@ class GridModelTests(unittest.TestCase):
                     mlp_ratio=1,
                     update_rule="energy",
                     update_step_size=0.5,
-                    update_rms_clip=0.25,
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -937,7 +995,6 @@ class GridModelTests(unittest.TestCase):
                 "num_heads = 4\n"
                 "step_loss_schedule = \"quadratic\"\n"
                 "update_step_size = 0.4\n"
-                "update_rms_clip = 0.9\n"
                 "\n"
                 "[model.brc.objective]\n"
                 "path_energy_weight = 0.0001\n"
@@ -955,7 +1012,6 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_step_loss_schedule"], "quadratic")
             self.assertEqual(loaded["brc_update_step_size"], 0.4)
-            self.assertEqual(loaded["brc_update_rms_clip"], 0.9)
             self.assertEqual(loaded["brc_path_energy_weight"], 0.0001)
             self.assertEqual(loaded["brc_fixed_point_update_weight"], 0.0002)
             self.assertEqual(loaded["brc_fixed_point_label_smoothing"], 0.002)

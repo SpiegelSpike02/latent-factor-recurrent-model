@@ -21,7 +21,6 @@ refine_steps = 4
 block_depth = 2
 step_loss_schedule = "uniform"
 update_step_size = 0.3
-update_rms_clip = 1.0
 
 [model.brc.objective]
 path_energy_weight = 0.0

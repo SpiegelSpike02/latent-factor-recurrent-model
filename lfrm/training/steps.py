@@ -7,6 +7,7 @@ import optax
 from lfrm.models import BRCModel, TinyRecursiveModel, UnifiedReasoningModel
 from lfrm.training.factory import GridReasoningModel
 from lfrm.training.losses import (
+    output_probabilities,
     supervised_loss_mask,
     target_probability as token_target_probability,
     token_cross_entropy,
@@ -120,8 +121,8 @@ def _masked_probability(probability: jax.Array, mask: jax.Array) -> jax.Array:
     return jnp.sum(probability * mask_f32) / jnp.maximum(jnp.sum(mask_f32), 1.0)
 
 
-def _masked_logit_confidence(logits: jax.Array, mask: jax.Array) -> jax.Array:
-    confidence = jnp.max(jax.nn.softmax(logits.astype(jnp.float32), axis=-1), axis=-1)
+def _masked_output_confidence(model: object, outputs: jax.Array, mask: jax.Array) -> jax.Array:
+    confidence = jnp.max(output_probabilities(model, outputs), axis=-1)
     return _masked_probability(confidence, mask)
 
 
@@ -280,11 +281,11 @@ def brc_loss_and_metrics(
     target_probability = jnp.sum(target_probability_cells * loss_mask.astype(jnp.float32)) / normalizer
     context_target_probability = _masked_probability(target_probability_cells, context_mask)
     query_target_probability = _masked_probability(target_probability_cells, query_mask)
-    q_top1_probability = _masked_logit_confidence(final_logits, metric_loss_mask)
+    q_top1_probability = _masked_output_confidence(model, final_logits, metric_loss_mask)
     per_step_example_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=-1) / per_example_normalizer[None, :]
     oracle_step = _masked_example_mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32), example_mask)
     per_step_q_top1_probability = jnp.sum(
-        jnp.max(jax.nn.softmax(step_logits.astype(jnp.float32), axis=-1), axis=-1)
+        jnp.max(output_probabilities(model, step_logits), axis=-1)
         * step_loss_mask.astype(jnp.float32),
         axis=(1, 2),
     ) / normalizer
@@ -306,10 +307,8 @@ def brc_loss_and_metrics(
         "step_loss_weights": step_loss_weights,
         "q_top1_probability": q_top1_probability,
         "update_step_size": jnp.mean(diagnostics["update_step_size"]),
-        "update_clip_scale": jnp.mean(diagnostics["update_clip_scale"]),
         "update_rms": jnp.mean(diagnostics["update_rms"]),
         "velocity_rms": jnp.mean(diagnostics["velocity_rms"]),
-        "velocity_clip_scale": jnp.mean(diagnostics["velocity_clip_scale"]),
         "energy_update_rms": jnp.mean(diagnostics["energy_update_rms"]),
         "energy_value": jnp.mean(diagnostics["energy_value"]),
         "energy_grad_rms": jnp.mean(diagnostics["energy_grad_rms"]),
@@ -329,10 +328,8 @@ def brc_loss_and_metrics(
             "per_step_loss": per_step_loss,
             "per_step_q_top1_probability": per_step_q_top1_probability,
             "per_step_update_step_size": diagnostics["update_step_size"],
-            "per_step_update_clip_scale": diagnostics["update_clip_scale"],
             "per_step_update_rms": diagnostics["update_rms"],
             "per_step_velocity_rms": diagnostics["velocity_rms"],
-            "per_step_velocity_clip_scale": diagnostics["velocity_clip_scale"],
             "per_step_energy_update_rms": diagnostics["energy_update_rms"],
             "per_step_energy_value": diagnostics["energy_value"],
             "per_step_energy_grad_rms": diagnostics["energy_grad_rms"],
@@ -469,10 +466,8 @@ def brc_carry_loss_and_metrics(
         "early_stop_margin_min": diagnostics["early_stop_margin_min"],
         "early_stop_constraint_rate": diagnostics["early_stop_constraint_rate"],
         "update_step_size": diagnostics["update_step_size"],
-        "update_clip_scale": diagnostics["update_clip_scale"],
         "update_rms": diagnostics["update_rms"],
         "velocity_rms": diagnostics["velocity_rms"],
-        "velocity_clip_scale": diagnostics["velocity_clip_scale"],
         "energy_update_rms": diagnostics["energy_update_rms"],
         "energy_value": diagnostics["energy_value"],
         "energy_grad_rms": diagnostics["energy_grad_rms"],

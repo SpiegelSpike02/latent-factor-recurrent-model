@@ -236,8 +236,6 @@ class BRCModel(nnx.Module):
             raise ValueError("BRC update_rule must be 'energy' or 'velocity'")
         if brc.update_step_size <= 0.0:
             raise ValueError("BRC update_step_size must be positive")
-        if brc.update_rms_clip <= 0.0:
-            raise ValueError("BRC update_rms_clip must be positive")
         if brc.fixed_point_label_smoothing < 0.0 or brc.fixed_point_label_smoothing >= 1.0:
             raise ValueError("BRC fixed_point_label_smoothing must be in [0, 1)")
         if min(
@@ -443,6 +441,8 @@ class BRCModel(nnx.Module):
 
     def _z_to_output_logits(self, z_logits: Array, tokens: Array) -> Array:
         del tokens
+        if self.brc.update_rule == "energy":
+            return self._distribution_from_logits(z_logits)
         return self._center_logits(z_logits)
 
     def initial_z(self, tokens: Array) -> Array:
@@ -562,17 +562,6 @@ class BRCModel(nnx.Module):
         candidate_distribution = jax.nn.softmax(self._center_logits(z_logits), axis=-1)
         return self._energy_per_cell_from_read_state(candidate_distribution, read_state)
 
-    def _project_simplex(self, values: Array) -> Array:
-        """Euclidean projection onto the per-cell probability simplex."""
-        sorted_values = jnp.sort(values, axis=-1)[..., ::-1]
-        cssv = jnp.cumsum(sorted_values, axis=-1) - 1.0
-        ranks = jnp.arange(1, values.shape[-1] + 1, dtype=values.dtype)
-        support = sorted_values - cssv / ranks > 0.0
-        support_count = jnp.sum(support.astype(jnp.int32), axis=-1, keepdims=True)
-        theta_index = jnp.maximum(support_count - 1, 0)
-        theta = jnp.take_along_axis(cssv, theta_index, axis=-1) / support_count.astype(values.dtype)
-        return jnp.maximum(values - theta, 0.0)
-
     def _velocity_step_from_read_state(
         self,
         current_logits: Array,
@@ -583,9 +572,7 @@ class BRCModel(nnx.Module):
         raw_velocity = self.velocity_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         velocity = self._center_logits(raw_velocity)
         raw_logit_step = float(self.brc.update_step_size) * velocity
-        raw_step_rms = jnp.sqrt(jnp.mean(jnp.square(raw_logit_step), axis=-1, keepdims=True) + 1e-12)
-        clip_scale = jnp.minimum(1.0, float(self.brc.update_rms_clip) / raw_step_rms)
-        logit_step = raw_logit_step * clip_scale
+        logit_step = raw_logit_step
         next_logits = self._center_logits(current_logits + logit_step)
         next_distribution = jax.nn.softmax(next_logits, axis=-1)
 
@@ -603,10 +590,8 @@ class BRCModel(nnx.Module):
         )
         diagnostics = {
             "update_step_size": update_step_size,
-            "update_clip_scale": clip_scale,
             "update_rms": velocity_rms,
             "velocity_rms": velocity_rms,
-            "velocity_clip_scale": clip_scale,
             "energy_update_rms": jnp.zeros_like(velocity_rms),
             "energy_value": jnp.zeros_like(velocity_rms),
             "energy_grad_rms": jnp.zeros_like(velocity_rms),
@@ -633,17 +618,13 @@ class BRCModel(nnx.Module):
         energy_value = energy_per_cell(current_distribution)[..., None]
         energy_grad = self._center_logits(jax.grad(total_energy)(current_distribution))
         descent_direction = -energy_grad
-        raw_distribution_step = float(self.brc.update_step_size) * descent_direction
-        raw_step_rms = jnp.sqrt(jnp.mean(jnp.square(raw_distribution_step), axis=-1, keepdims=True) + 1e-12)
-        clip_scale = jnp.minimum(1.0, float(self.brc.update_rms_clip) / raw_step_rms)
-        distribution_step = raw_distribution_step * clip_scale
+        logit_step = float(self.brc.update_step_size) * descent_direction
         update_step_size = jnp.broadcast_to(
             jnp.asarray(float(self.brc.update_step_size), dtype=jnp.float32),
             (*current_logits.shape[:-1], 1),
         )
-        next_distribution = self._project_simplex(current_distribution + distribution_step)
-        next_logits = self._logits_from_distribution(next_distribution)
-        logit_step = self._center_logits(next_logits - current_logits)
+        next_logits = self._center_logits(current_logits + logit_step)
+        next_distribution = jax.nn.softmax(next_logits, axis=-1)
 
         distribution_tv_delta = 0.5 * jnp.sum(
             jnp.abs(next_distribution - current_distribution),
@@ -656,10 +637,8 @@ class BRCModel(nnx.Module):
         path_energy = jnp.mean(jnp.square(next_distribution - current_distribution), axis=-1, keepdims=True)
         diagnostics = {
             "update_step_size": update_step_size,
-            "update_clip_scale": clip_scale,
             "update_rms": update_rms,
             "velocity_rms": jnp.zeros_like(update_rms),
-            "velocity_clip_scale": jnp.ones_like(clip_scale),
             "energy_update_rms": update_rms,
             "energy_value": energy_value,
             "energy_grad_rms": energy_grad_rms,
@@ -712,10 +691,8 @@ class BRCModel(nnx.Module):
     ) -> tuple[Array, Array, dict[str, Array]]:
         update_diagnostics = {
             "update_step_size": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "update_clip_scale": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
             "update_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
             "velocity_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "velocity_clip_scale": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
             "energy_update_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
             "energy_value": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
             "energy_grad_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
@@ -1170,10 +1147,8 @@ class BRCModel(nnx.Module):
             "stable_steps": jnp.mean(stable_steps.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
             "update_step_size": jnp.mean(update_diagnostics["update_step_size"].astype(jnp.float32)),
-            "update_clip_scale": jnp.mean(update_diagnostics["update_clip_scale"].astype(jnp.float32)),
             "update_rms": jnp.mean(update_diagnostics["update_rms"].astype(jnp.float32)),
             "velocity_rms": jnp.mean(update_diagnostics["velocity_rms"].astype(jnp.float32)),
-            "velocity_clip_scale": jnp.mean(update_diagnostics["velocity_clip_scale"].astype(jnp.float32)),
             "energy_update_rms": jnp.mean(update_diagnostics["energy_update_rms"].astype(jnp.float32)),
             "energy_value": jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
             "energy_grad_rms": jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
@@ -1222,10 +1197,8 @@ class BRCModel(nnx.Module):
                 logits,
                 q_top1_probability,
                 jnp.mean(update_diagnostics["update_step_size"].astype(jnp.float32)),
-                jnp.mean(update_diagnostics["update_clip_scale"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["update_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["velocity_rms"].astype(jnp.float32)),
-                jnp.mean(update_diagnostics["velocity_clip_scale"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_update_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
@@ -1263,10 +1236,8 @@ class BRCModel(nnx.Module):
                 "q_top1_probability": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
                 "update_step_size": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "update_clip_scale": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "velocity_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "velocity_clip_scale": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_value": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_grad_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
@@ -1279,10 +1250,8 @@ class BRCModel(nnx.Module):
             step_logits,
             q_top1_probability,
             update_step_size,
-            update_clip_scale,
             update_rms,
             velocity_rms,
-            velocity_clip_scale,
             energy_update_rms,
             energy_value,
             energy_grad_rms,
@@ -1294,10 +1263,8 @@ class BRCModel(nnx.Module):
             "q_top1_probability": q_top1_probability,
             "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
             "update_step_size": update_step_size,
-            "update_clip_scale": update_clip_scale,
             "update_rms": update_rms,
             "velocity_rms": velocity_rms,
-            "velocity_clip_scale": velocity_clip_scale,
             "energy_update_rms": energy_update_rms,
             "energy_value": energy_value,
             "energy_grad_rms": energy_grad_rms,

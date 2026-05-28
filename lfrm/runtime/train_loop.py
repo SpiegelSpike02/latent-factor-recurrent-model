@@ -65,10 +65,8 @@ PER_STEP_SCALAR_SERIES = (
     ("per_step_accuracy", "accuracy_by_step"),
     ("per_step_q_top1_probability", "q_top1_probability_by_step"),
     ("per_step_update_step_size", "update_step_size_by_step"),
-    ("per_step_update_clip_scale", "update_clip_scale_by_step"),
     ("per_step_update_rms", "update_rms_by_step"),
     ("per_step_velocity_rms", "velocity_rms_by_step"),
-    ("per_step_velocity_clip_scale", "velocity_clip_scale_by_step"),
     ("per_step_energy_update_rms", "energy_update_rms_by_step"),
     ("per_step_energy_value", "energy_value_by_step"),
     ("per_step_energy_grad_rms", "energy_grad_rms_by_step"),
@@ -89,8 +87,8 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("log_epochs must be positive")
     if config.train.train_mode not in ("act", "dense_unroll", "step_carry"):
         raise ValueError("train_mode must be 'act', 'dense_unroll', or 'step_carry'")
-    if config.eval.nums <= 0:
-        raise ValueError("eval nums must be positive")
+    if config.eval.nums < 0:
+        raise ValueError("eval nums must be non-negative; use 0 to disable eval")
     if not config.eval.full_dataset:
         raise ValueError("eval.full_dataset=false is not supported; eval is always full-dataset")
     if config.optimizer.lr_warmup_steps <= 0:

@@ -24,6 +24,7 @@ lfrm-build-sudoku = "lfrm.scripts.build_sudoku_dataset:main"
 lfrm-build-maze = "lfrm.scripts.build_maze_dataset:main"
 lfrm-build-arc = "lfrm.scripts.build_arc_dataset:main"
 lfrm-debug-single-brc = "lfrm.scripts.debug_single_brc:main"
+lfrm-short-brc-sweep = "lfrm.scripts.short_brc_sweep:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["lfrm"]

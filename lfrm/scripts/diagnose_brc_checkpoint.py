@@ -160,7 +160,6 @@ def build_diagnostic_runner(model):
                 f"{name}/energy_value": jnp.mean(diagnostics["energy_value"].astype(jnp.float32)),
                 f"{name}/energy_grad_rms": jnp.mean(diagnostics["energy_grad_rms"].astype(jnp.float32)),
                 f"{name}/update_rms": jnp.mean(diagnostics["update_rms"].astype(jnp.float32)),
-                f"{name}/update_clip_scale": jnp.mean(diagnostics["update_clip_scale"].astype(jnp.float32)),
                 f"{name}/distribution_tv_delta": jnp.mean(diagnostics["distribution_tv_delta"].astype(jnp.float32)),
                 f"{name}/path_energy": jnp.mean(diagnostics["path_energy"].astype(jnp.float32)),
             }
@@ -273,7 +272,6 @@ def _print_table(results: dict[str, float]) -> None:
         "logit_step_rms_query",
         "distribution_tv_delta",
         "direction_cosine_to_target",
-        "update_clip_scale",
         "energy_value",
     ]
     print("\nscenario " + " ".join(f"{name:>23}" for name in columns))

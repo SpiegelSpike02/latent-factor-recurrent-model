@@ -54,7 +54,7 @@ disallowed: direct output logits, large key-value memory, slot-style answer cach
 
 Sudoku has fixed rules, so the main inference state is `B`, not `z`. The code
 keeps verifier-guided latent fitting optional and conservative through low inner
-step counts, gradient clipping, update clipping, and a prior penalty.
+step counts, gradient clipping, and a prior penalty.
 
 For the Sudoku MVP, verifier-guided latent fitting is not the main path.
 `meta_outer_loss` is currently disabled in the default BRC config; z fitting is a

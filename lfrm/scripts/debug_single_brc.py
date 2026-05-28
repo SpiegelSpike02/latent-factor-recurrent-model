@@ -156,7 +156,7 @@ def main() -> None:
     prev_pred = None
     prev_q = None
     print(
-        "step loss cur_q probe_q cur_ctx probe_ctx exact n max early stable e_dq flip margin cstr reset carry entropy conf eta clip update dz dQ energy qchg",
+        "step loss cur_q probe_q cur_ctx probe_ctx exact n max early stable e_dq flip margin cstr reset carry entropy conf eta update dz dQ energy qchg",
         flush=True,
     )
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -199,7 +199,6 @@ def main() -> None:
                     "reset_rate": _metric(host_metrics, "reset_rate"),
                     "carry_step": _metric(host_metrics, "carry_step"),
                     "update_step_size": _metric(host_metrics, "update_step_size"),
-                    "update_clip_scale": _metric(host_metrics, "update_clip_scale"),
                     "update_rms": _metric(host_metrics, "update_rms"),
                     "logit_step_rms": _metric(host_metrics, "logit_step_rms"),
                     "path_energy": _metric(host_metrics, "path_energy"),
@@ -240,7 +239,6 @@ def main() -> None:
                     f"{row['probe_entropy']:.2f} "
                     f"{row['probe_q_top1_probability']:.2f} "
                     f"{row['update_step_size']:.2f} "
-                    f"{row['update_clip_scale']:.2f} "
                     f"{row['update_rms']:.2f} "
                     f"{row['logit_step_rms']:.2f} "
                     f"{row['probe_distribution_tv_delta']:.3e} "

@@ -40,7 +40,6 @@ GROUPED_NESTED_KEYS = {
             "step_loss_schedule",
             "update_rule",
             "update_step_size",
-            "update_rms_clip",
         },
         "objective": {
             "path_energy_weight",
@@ -172,7 +171,6 @@ ALLOWED_NESTED_KEYS = {
         "rope_theta",
         "step_loss_schedule",
         "update_step_size",
-        "update_rms_clip",
         "path_energy_weight",
         "fixed_point_update_weight",
         "fixed_point_label_smoothing",
@@ -300,7 +298,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--eval-nums",
         type=int,
         default=10,
-        help="Number of eval/checkpoint points per training run. The loop derives optimizer-update intervals internally.",
+        help="Number of eval/checkpoint points per training run. Use 0 to disable eval/checkpoint points.",
     )
     parser.add_argument("--eval-diagnostics", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--eval-full-dataset", action=argparse.BooleanOptionalAction, default=True)
@@ -353,7 +351,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
     parser.add_argument("--brc-update-rule", choices=("energy", "velocity"), default="energy")
     parser.add_argument("--brc-update-step-size", type=float, default=0.3)
-    parser.add_argument("--brc-update-rms-clip", type=float, default=1.0)
     parser.add_argument("--brc-path-energy-weight", type=float, default=1e-4)
     parser.add_argument("--brc-fixed-point-update-weight", type=float, default=0.0)
     parser.add_argument("--brc-fixed-point-label-smoothing", type=float, default=1e-3)
@@ -521,7 +518,6 @@ def build_config(
             step_loss_schedule=args.brc_step_loss_schedule,
             update_rule=args.brc_update_rule,
             update_step_size=args.brc_update_step_size,
-            update_rms_clip=args.brc_update_rms_clip,
             path_energy_weight=args.brc_path_energy_weight,
             fixed_point_update_weight=args.brc_fixed_point_update_weight,
             fixed_point_label_smoothing=args.brc_fixed_point_label_smoothing,

@@ -20,15 +20,14 @@ commit_steps = 48
 refine_steps = 4
 block_depth = 2
 step_loss_schedule = "uniform"
-update_rule = "velocity"
+update_rule = "energy"
 update_step_size = 0.3
-update_rms_clip = 1.0
 
 [model.brc.objective]
 path_energy_weight = 0.0
 fixed_point_update_weight = 1e-3
 fixed_point_label_smoothing = 3e-3
-wrong_attractor_rank_weight = 0.0
+wrong_attractor_rank_weight = 1e-3
 wrong_attractor_direction_weight = 5e-2
 wrong_attractor_nonzero_weight = 1e-2
 wrong_attractor_rank_margin = 1.0
