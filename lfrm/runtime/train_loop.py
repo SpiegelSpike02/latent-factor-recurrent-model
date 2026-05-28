@@ -57,6 +57,7 @@ from lfrm.training.metrics import (
     optional_summary_log,
     scalar_metric_names,
 )
+from lfrm.training.optim import uses_sparse_puzzle_embedding
 
 
 PER_STEP_SCALAR_SERIES = (
@@ -104,8 +105,8 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("prefetch_workers must be positive")
     if (
         config.runtime.data_parallel_devices != 1
+        and uses_sparse_puzzle_embedding(config)
         and config.optimizer.puzzle_embed_coalesce_updates
-        and config.optimizer.puzzle_embed_learning_rate > 0.0
     ):
         print(
             "[runtime] sparse puzzle embedding updates are replicated before coalescing "
