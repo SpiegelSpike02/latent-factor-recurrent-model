@@ -94,5 +94,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-core-c48-r4-d2-b768"
+name = "sudoku-brc-energy-eta03-c48-r4-d2-b768"
 mode = "online"
