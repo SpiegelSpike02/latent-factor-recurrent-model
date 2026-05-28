@@ -21,8 +21,8 @@ refine_steps = 4
 block_depth = 2
 step_loss_schedule = "uniform"
 update_rule = "velocity"
-descent_step_size = 0.3
-descent_rms_clip = 1.0
+update_step_size = 0.3
+update_rms_clip = 1.0
 
 [model.brc.objective]
 path_energy_weight = 0.0
@@ -32,14 +32,14 @@ wrong_attractor_rank_weight = 0.0
 wrong_attractor_direction_weight = 5e-2
 wrong_attractor_nonzero_weight = 1e-2
 wrong_attractor_rank_margin = 1.0
-wrong_attractor_grad_floor = 0.5
+wrong_attractor_update_floor = 0.5
 corrupted_recovery_weight = 2e-2
 
 [model.brc.early_stop]
 early_stop_enabled = true
 early_stop_min_steps = 4
 early_stop_patience = 2
-early_stop_energy_q_delta_threshold = 1e-3
+early_stop_distribution_delta_threshold = 1e-3
 early_stop_flip_threshold = 0.0
 early_stop_margin_threshold = 0.5
 early_stop_require_constraints = true

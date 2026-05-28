@@ -34,6 +34,7 @@ from lfrm.runtime import (
 )
 from lfrm.models import BRCModel, TinyRecursiveModel
 from lfrm.training import (
+    build_brc_step_carry_train_step_runner,
     build_train_step_runner,
     build_trm_act_train_step_runner,
     create_model,
@@ -307,20 +308,131 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(logits.shape, (2, 1, 81, 9))
         self.assertEqual(final_only_logits.shape, (1, 81, 9))
         self.assertTrue(bool(jnp.allclose(final_only_logits, logits[-1], rtol=1e-5, atol=1e-5)))
-        q = jax.nn.softmax(
-            jnp.arange(2 * 81 * 9, dtype=jnp.float32).reshape(2, 81, 9) / 100.0,
-            axis=-1,
-        )
+        z = jnp.arange(2 * 81 * 9, dtype=jnp.float32).reshape(2, 81, 9) / 100.0
         self.assertTrue(
             bool(
                 jnp.allclose(
-                    model._q_to_token_logits(q, tokens, jnp.asarray(0, dtype=jnp.int32)),
-                    model._q_to_token_logits(q, tokens, jnp.asarray(1, dtype=jnp.int32)),
+                    model._z_to_token_logits(z, tokens, jnp.asarray(0, dtype=jnp.int32)),
+                    model._z_to_token_logits(z, tokens, jnp.asarray(1, dtype=jnp.int32)),
                 )
             )
         )
         self.assertEqual(diagnostics["q_top1_probability"].shape, (2,))
         self.assertEqual(final_only_diagnostics["q_top1_probability"].shape, (2,))
+
+    def test_brc_initial_z_is_uniform(self) -> None:
+        model = BRCModel(
+            ModelConfig(
+                vocab_size=9,
+                input_vocab_size=10,
+                model_type="brc",
+                seq_len=81,
+                grid_height=9,
+                grid_width=9,
+                d_model=16,
+                rollout_steps=3,
+                brc=BRCConfig(
+                    commit_steps=3,
+                    num_heads=4,
+                    mlp_ratio=1,
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(312),
+        )
+        tokens = jnp.zeros((1, 81), dtype=jnp.int32)
+        initial_z = model.initial_z(tokens)
+        self.assertTrue(bool(jnp.allclose(initial_z, jnp.zeros_like(initial_z))))
+        q_view = model._distribution_from_logits(initial_z)
+        self.assertTrue(bool(jnp.allclose(q_view, jnp.full_like(q_view, 1.0 / 9.0))))
+
+    def test_brc_energy_step_updates_probability_simplex(self) -> None:
+        model = BRCModel(
+            ModelConfig(
+                vocab_size=5,
+                model_type="brc",
+                task=TaskConfig(type="arc"),
+                seq_len=4,
+                grid_height=2,
+                grid_width=2,
+                d_model=16,
+                brc=BRCConfig(
+                    commit_steps=1,
+                    num_heads=4,
+                    mlp_ratio=1,
+                    update_rule="energy",
+                    update_step_size=0.5,
+                    update_rms_clip=0.25,
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(313),
+        )
+        current_logits = jnp.asarray(
+            [[[1.5, 0.5, -0.5, -1.0, -0.5]] * 4],
+            dtype=jnp.float32,
+        )
+        read_state = jnp.zeros((1, 4, 16), dtype=jnp.float32)
+
+        next_logits, diagnostics = model._energy_descent_from_read_state(current_logits, read_state)
+        current_distribution = model._distribution_from_logits(current_logits)
+        next_distribution = model._distribution_from_logits(next_logits)
+
+        self.assertTrue(bool(jnp.all(jnp.isfinite(next_logits))))
+        self.assertTrue(bool(jnp.allclose(jnp.mean(next_logits, axis=-1), 0.0, atol=1e-6)))
+        self.assertTrue(bool(jnp.allclose(jnp.sum(next_distribution, axis=-1), 1.0, atol=1e-6)))
+        self.assertTrue(bool(jnp.all(next_distribution >= 0.0)))
+        expected_path_energy = jnp.mean(jnp.square(next_distribution - current_distribution), axis=-1, keepdims=True)
+        self.assertTrue(bool(jnp.allclose(diagnostics["path_energy"], expected_path_energy, rtol=1e-5, atol=1e-6)))
+
+    def test_brc_energy_attractor_direction_uses_distribution_delta(self) -> None:
+        model = BRCModel(
+            ModelConfig(
+                vocab_size=5,
+                model_type="brc",
+                task=TaskConfig(type="arc"),
+                seq_len=4,
+                grid_height=2,
+                grid_width=2,
+                d_model=16,
+                brc=BRCConfig(
+                    commit_steps=1,
+                    num_heads=4,
+                    mlp_ratio=1,
+                    update_rule="energy",
+                    update_step_size=0.5,
+                    update_rms_clip=0.25,
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(314),
+        )
+        tokens = jnp.zeros((1, 4), dtype=jnp.int32)
+        targets = jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32)
+        loss_mask = jnp.ones((1, 4), dtype=jnp.float32)
+        current_logits = jnp.asarray(
+            [[[1.5, 0.5, -0.5, -1.0, -0.5]] * 4],
+            dtype=jnp.float32,
+        )
+        hidden = jnp.zeros((1, 4, 16), dtype=jnp.float32)
+        base_embeddings, _context = model.context_memory(tokens)
+
+        terms = model._attractor_recovery_terms(
+            tokens,
+            targets,
+            loss_mask,
+            current_logits,
+            hidden,
+            base_embeddings,
+            jnp.asarray(0, dtype=jnp.int32),
+            train=False,
+            dropout_key=jax.random.key(315),
+            wrong_only=False,
+        )
+
+        self.assertTrue(bool(jnp.isfinite(terms["direction_loss"])))
+        self.assertGreaterEqual(float(terms["direction_cosine"]), -1.0)
+        self.assertLessEqual(float(terms["direction_cosine"]), 1.0)
 
     def test_brc_losses_are_finite(self) -> None:
         model = BRCModel(
@@ -354,7 +466,7 @@ class GridModelTests(unittest.TestCase):
         _, metrics = loss_and_metrics(
             model,
             batch,
-            True,
+            False,
             jax.random.key(33),
         )
         legacy_keys = {
@@ -384,9 +496,10 @@ class GridModelTests(unittest.TestCase):
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
-        self.assertNotIn("per_step_loss", metrics)
-        self.assertNotIn("per_step_q_top1_probability", metrics)
+        self.assertEqual(metrics["per_step_loss"].shape, (2,))
+        self.assertEqual(metrics["per_step_q_top1_probability"].shape, (2,))
         self.assertEqual(metrics["step_loss_weights"].shape, (2,))
+
     def test_brc_arc_canvas_belief_loss_is_finite(self) -> None:
         model = BRCModel(
             ModelConfig(
@@ -418,7 +531,7 @@ class GridModelTests(unittest.TestCase):
             "labels": labels,
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
-        _, metrics = loss_and_metrics(model, batch, True, jax.random.key(37))
+        _, metrics = loss_and_metrics(model, batch, False, jax.random.key(37))
         for key in ("loss", "ce_loss", "accuracy", "exact_accuracy"):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
@@ -449,7 +562,7 @@ class GridModelTests(unittest.TestCase):
         model = create_model(config)
         self.assertNotIn("init_hidden", str(nnx.state(model, nnx.Param)))
         optimizer = create_optimizer(model, config)
-        train_step = build_train_step_runner()
+        train_step = build_brc_step_carry_train_step_runner()
         puzzle = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
         solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
         tokens = _sudoku_input_tokens(puzzle)
@@ -459,9 +572,10 @@ class GridModelTests(unittest.TestCase):
             "labels": labels,
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
+        carry = model.initial_carry(batch)
         before = model.context_to_hidden.kernel[...]
-        metrics = train_step(model, optimizer, batch, jax.random.key(34))
-        metrics = train_step(model, optimizer, batch, jax.random.key(35))
+        metrics, carry = train_step(model, optimizer, carry, batch, jax.random.key(34), jnp.asarray(0, dtype=jnp.int32))
+        metrics, carry = train_step(model, optimizer, carry, batch, jax.random.key(35), jnp.asarray(1, dtype=jnp.int32))
         after = model.context_to_hidden.kernel[...]
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
         self.assertGreater(float(jnp.sum(jnp.abs(after - before))), 0.0)
@@ -822,8 +936,8 @@ class GridModelTests(unittest.TestCase):
                 "hidden_state_dim = 16\n"
                 "num_heads = 4\n"
                 "step_loss_schedule = \"quadratic\"\n"
-                "descent_step_size = 0.4\n"
-                "descent_rms_clip = 0.9\n"
+                "update_step_size = 0.4\n"
+                "update_rms_clip = 0.9\n"
                 "\n"
                 "[model.brc.objective]\n"
                 "path_energy_weight = 0.0001\n"
@@ -840,8 +954,8 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["brc_hidden_state_dim"], 16)
             self.assertEqual(loaded["brc_num_heads"], 4)
             self.assertEqual(loaded["brc_step_loss_schedule"], "quadratic")
-            self.assertEqual(loaded["brc_descent_step_size"], 0.4)
-            self.assertEqual(loaded["brc_descent_rms_clip"], 0.9)
+            self.assertEqual(loaded["brc_update_step_size"], 0.4)
+            self.assertEqual(loaded["brc_update_rms_clip"], 0.9)
             self.assertEqual(loaded["brc_path_energy_weight"], 0.0001)
             self.assertEqual(loaded["brc_fixed_point_update_weight"], 0.0002)
             self.assertEqual(loaded["brc_fixed_point_label_smoothing"], 0.002)

@@ -120,13 +120,13 @@ def build_diagnostic_runner(model):
         query_mask = query_mask & example_cell_mask
         supervised_mask = cell_mask & example_cell_mask
         base_embeddings, _context = model.context_memory(tokens)
-        target_logits = model.target_q_logits(targets)
+        target_logits = model.target_z_logits(targets)
 
-        def eval_state(name: str, old_q: jax.Array, new_q: jax.Array, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
-            old_logits = model._center_q_logits(old_q)
-            new_logits = model._center_q_logits(new_q)
-            old_dist = model._normalize_q(old_logits)
-            new_dist = model._normalize_q(new_logits)
+        def eval_state(name: str, old_z: jax.Array, new_z: jax.Array, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
+            old_logits = model._center_logits(old_z)
+            new_logits = model._center_logits(new_z)
+            old_dist = model._distribution_from_logits(old_logits)
+            new_dist = model._distribution_from_logits(new_logits)
             pred = jnp.argmax(new_dist, axis=-1)
             correct = (pred == targets) & supervised_mask
             query_correct = (pred == targets) & query_mask
@@ -135,7 +135,7 @@ def build_diagnostic_runner(model):
             margin = top2[..., 1] - top2[..., 0]
             target_prob = jnp.take_along_axis(new_dist, targets[..., None], axis=-1)[..., 0]
             logit_step = new_logits - old_logits
-            target_delta = model._center_q_logits(target_logits - old_logits)
+            target_delta = model._center_logits(target_logits - old_logits)
             flip = jnp.argmax(old_dist, axis=-1) != pred
             if model.config.task_type == "sudoku":
                 constraint_ok = model._sudoku_constraint_ok(pred, tokens)
@@ -159,16 +159,14 @@ def build_diagnostic_runner(model):
                 f"{name}/direction_cosine_to_target": _direction_cosine(logit_step, target_delta, query_mask),
                 f"{name}/energy_value": jnp.mean(diagnostics["energy_value"].astype(jnp.float32)),
                 f"{name}/energy_grad_rms": jnp.mean(diagnostics["energy_grad_rms"].astype(jnp.float32)),
-                f"{name}/descent_rms": jnp.mean(diagnostics["descent_rms"].astype(jnp.float32)),
-                f"{name}/descent_clip_scale": jnp.mean(diagnostics["descent_clip_scale"].astype(jnp.float32)),
+                f"{name}/update_rms": jnp.mean(diagnostics["update_rms"].astype(jnp.float32)),
+                f"{name}/update_clip_scale": jnp.mean(diagnostics["update_clip_scale"].astype(jnp.float32)),
                 f"{name}/distribution_tv_delta": jnp.mean(diagnostics["distribution_tv_delta"].astype(jnp.float32)),
                 f"{name}/path_energy": jnp.mean(diagnostics["path_energy"].astype(jnp.float32)),
             }
 
         def one_commit(
-            q: jax.Array,
-            trajectory: jax.Array,
-            trajectory_count: jax.Array,
+            z: jax.Array,
             hidden: jax.Array,
             step_index: jax.Array,
             *,
@@ -176,9 +174,7 @@ def build_diagnostic_runner(model):
         ) -> tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
             return model._commit_step(
                 tokens,
-                q,
-                trajectory,
-                trajectory_count,
+                z,
                 hidden,
                 base_embeddings,
                 step_index,
@@ -187,45 +183,40 @@ def build_diagnostic_runner(model):
                 stop_hidden_between_steps=stop_hidden,
             )
 
-        def rollout(initial_q: jax.Array):
-            trajectory = model.initial_trajectory(tokens, initial_q)
-            trajectory_count = model.initial_trajectory_count(tokens)
+        def rollout(initial_z: jax.Array):
             hidden = model.initial_hidden_state(
                 tokens,
-                initial_q,
+                initial_z,
                 base_embeddings,
                 train=False,
                 dropout_key=jax.random.key(0),
             )
 
             def scan_step(carry, step_index):
-                q, traj, traj_count, h = carry
-                q_next, h_next, diag = one_commit(q, traj, traj_count, h, step_index)
-                traj_next, traj_count_next = model._append_trajectory(traj, q_next, traj_count)
-                return (q_next, traj_next, traj_count_next, h_next), diag
+                z, h = carry
+                next_z, h_next, diag = one_commit(z, h, step_index)
+                return (next_z, h_next), diag
 
             final_carry, diagnostics = jax.lax.scan(
                 scan_step,
-                (initial_q, trajectory, trajectory_count, hidden),
+                (initial_z, hidden),
                 jnp.arange(model.total_steps, dtype=jnp.int32),
             )
             return final_carry, diagnostics
 
-        uniform_q = model.initial_q(tokens)
-        (plateau_q, plateau_trajectory, plateau_count, plateau_hidden), rollout_diagnostics = rollout(uniform_q)
+        uniform_z = model.initial_z(tokens)
+        (plateau_z, plateau_hidden), rollout_diagnostics = rollout(uniform_z)
         last_rollout_diag = jax.tree.map(lambda x: x[-1], rollout_diagnostics)
         results = {}
-        results.update(eval_state("uniform_rollout", uniform_q, plateau_q, last_rollout_diag))
+        results.update(eval_state("uniform_rollout", uniform_z, plateau_z, last_rollout_diag))
         results["uniform_rollout/mean_energy_grad_rms"] = jnp.mean(rollout_diagnostics["energy_grad_rms"].astype(jnp.float32))
         results["uniform_rollout/mean_distribution_tv_delta"] = jnp.mean(rollout_diagnostics["distribution_tv_delta"].astype(jnp.float32))
         results["uniform_rollout/final_step_energy_grad_rms"] = jnp.mean(last_rollout_diag["energy_grad_rms"].astype(jnp.float32))
 
         final_step = jnp.asarray(model.total_steps - 1, dtype=jnp.int32)
 
-        target_traj = model.initial_trajectory(tokens, target_logits)
-        target_count = jnp.full((tokens.shape[0],), model.trajectory_length, dtype=jnp.int32)
         target_hidden = model.initial_hidden_state(tokens, target_logits, base_embeddings, train=False, dropout_key=jax.random.key(0))
-        target_next, _target_hidden_next, target_diag = one_commit(target_logits, target_traj, target_count, target_hidden, final_step)
+        target_next, _target_hidden_next, target_diag = one_commit(target_logits, target_hidden, final_step)
         results.update(eval_state("target_fixed_point_probe", target_logits, target_next, target_diag))
 
         wrong_labels = jnp.mod(targets + 1, model.q_vocab_size)
@@ -234,42 +225,25 @@ def build_diagnostic_runner(model):
             * jax.nn.one_hot(wrong_labels, model.q_vocab_size, dtype=jnp.float32)
             + float(model.brc.fixed_point_label_smoothing) / float(model.q_vocab_size)
         )
-        wrong_logits = model._center_q_logits(jnp.log(jnp.maximum(wrong_distribution, model.output_logit_eps)))
-        wrong_traj = model.initial_trajectory(tokens, wrong_logits)
-        wrong_count = jnp.full((tokens.shape[0],), model.trajectory_length, dtype=jnp.int32)
+        wrong_logits = model._center_logits(jnp.log(jnp.maximum(wrong_distribution, model.output_logit_eps)))
         wrong_hidden = model.initial_hidden_state(tokens, wrong_logits, base_embeddings, train=False, dropout_key=jax.random.key(0))
-        wrong_next, _wrong_hidden_next, wrong_diag = one_commit(wrong_logits, wrong_traj, wrong_count, wrong_hidden, final_step)
+        wrong_next, _wrong_hidden_next, wrong_diag = one_commit(wrong_logits, wrong_hidden, final_step)
         results.update(eval_state("wrong_high_conf_probe", wrong_logits, wrong_next, wrong_diag))
 
         plateau_next, _plateau_hidden_next, plateau_diag = one_commit(
-            plateau_q,
-            plateau_trajectory,
-            plateau_count,
+            plateau_z,
             plateau_hidden,
             final_step,
         )
-        results.update(eval_state("plateau_carry_probe", plateau_q, plateau_next, plateau_diag))
+        results.update(eval_state("plateau_carry_probe", plateau_z, plateau_next, plateau_diag))
 
-        reset_hidden = model.initial_hidden_state(tokens, plateau_q, base_embeddings, train=False, dropout_key=jax.random.key(0))
+        reset_hidden = model.initial_hidden_state(tokens, plateau_z, base_embeddings, train=False, dropout_key=jax.random.key(0))
         plateau_reset_h_next, _reset_h_hidden_next, reset_h_diag = one_commit(
-            plateau_q,
-            plateau_trajectory,
-            plateau_count,
+            plateau_z,
             reset_hidden,
             final_step,
         )
-        results.update(eval_state("plateau_reset_h_probe", plateau_q, plateau_reset_h_next, reset_h_diag))
-
-        empty_traj = model.initial_trajectory(tokens, plateau_q)
-        empty_count = model.initial_trajectory_count(tokens)
-        plateau_reset_t_next, _reset_t_hidden_next, reset_t_diag = one_commit(
-            plateau_q,
-            empty_traj,
-            empty_count,
-            plateau_hidden,
-            final_step,
-        )
-        results.update(eval_state("plateau_reset_t_probe", plateau_q, plateau_reset_t_next, reset_t_diag))
+        results.update(eval_state("plateau_reset_h_probe", plateau_z, plateau_reset_h_next, reset_h_diag))
         return results
 
     return run
@@ -299,7 +273,7 @@ def _print_table(results: dict[str, float]) -> None:
         "logit_step_rms_query",
         "distribution_tv_delta",
         "direction_cosine_to_target",
-        "descent_clip_scale",
+        "update_clip_scale",
         "energy_value",
     ]
     print("\nscenario " + " ".join(f"{name:>23}" for name in columns))

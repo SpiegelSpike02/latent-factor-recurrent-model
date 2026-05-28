@@ -80,11 +80,11 @@ def _probe(
 ):
     inputs = batch_host["inputs"]
     labels = batch_host["labels"]
-    q_logits = carry_host["q"]
-    q_shifted = q_logits - np.max(q_logits, axis=-1, keepdims=True)
-    q = np.exp(q_shifted)
-    q = q / np.maximum(np.sum(q, axis=-1, keepdims=True), 1e-12)
-    pred = np.argmax(q, axis=-1).astype(np.int32)
+    z_logits = carry_host["z"]
+    z_shifted = z_logits - np.max(z_logits, axis=-1, keepdims=True)
+    q_view = np.exp(z_shifted)
+    q_view = q_view / np.maximum(np.sum(q_view, axis=-1, keepdims=True), 1e-12)
+    pred = np.argmax(q_view, axis=-1).astype(np.int32)
     loss_mask = np.ones_like(labels, dtype=bool)
     context_mask = (inputs > 0) & loss_mask
     query_mask = (inputs == 0) & loss_mask
@@ -92,8 +92,8 @@ def _probe(
     query_acc = float(np.mean(pred[query_mask] == labels[query_mask])) if np.any(query_mask) else 0.0
     exact_per_example = np.all((pred == labels) | ~loss_mask, axis=-1)
     exact = float(np.mean(exact_per_example)) if exact_per_example.size else 1.0
-    entropy = float(-np.mean(np.sum(q[loss_mask] * np.log(np.maximum(q[loss_mask], 1e-12)), axis=-1)))
-    confidence = float(np.mean(np.max(q[loss_mask], axis=-1)))
+    entropy = float(-np.mean(np.sum(q_view[loss_mask] * np.log(np.maximum(q_view[loss_mask], 1e-12)), axis=-1)))
+    confidence = float(np.mean(np.max(q_view[loss_mask], axis=-1)))
     query_changed = 0.0
     all_changed = 0.0
     if prev_pred is not None:
@@ -101,7 +101,7 @@ def _probe(
         query_changed = float(np.mean(pred[query_mask] != prev_pred[query_mask])) if np.any(query_mask) else 0.0
     distribution_tv_delta = 0.0
     if prev_q is not None:
-        distribution_tv_delta = float(np.mean(0.5 * np.sum(np.abs(q - prev_q), axis=-1)))
+        distribution_tv_delta = float(np.mean(0.5 * np.sum(np.abs(q_view - prev_q), axis=-1)))
     return {
         "probe_context_accuracy": context_acc,
         "probe_query_accuracy": query_acc,
@@ -112,7 +112,7 @@ def _probe(
         "probe_changed": all_changed,
         "probe_query_changed": query_changed,
         "probe_distribution_tv_delta": distribution_tv_delta,
-    }, pred, q
+    }, pred, q_view
 
 
 def _metric(metrics: dict[str, object], name: str, default: float = 0.0) -> float:
@@ -156,7 +156,7 @@ def main() -> None:
     prev_pred = None
     prev_q = None
     print(
-        "step loss cur_q probe_q cur_ctx probe_ctx exact n max early stable e_dq flip margin cstr reset carry entropy conf eta clip descent dz dQ energy qchg",
+        "step loss cur_q probe_q cur_ctx probe_ctx exact n max early stable e_dq flip margin cstr reset carry entropy conf eta clip update dz dQ energy qchg",
         flush=True,
     )
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -191,15 +191,16 @@ def main() -> None:
                     "early_stop_rate": _metric(host_metrics, "early_stop_rate"),
                     "stability_rate": _metric(host_metrics, "stability_rate"),
                     "stable_steps": _metric(host_metrics, "stable_steps"),
-                    "early_stop_energy_q_delta": _metric(host_metrics, "early_stop_energy_q_delta"),
+                    "early_stop_update_rms": _metric(host_metrics, "early_stop_update_rms"),
+                    "early_stop_distribution_delta": _metric(host_metrics, "early_stop_distribution_delta"),
                     "early_stop_flip_rate": _metric(host_metrics, "early_stop_flip_rate"),
                     "early_stop_margin_min": _metric(host_metrics, "early_stop_margin_min"),
                     "early_stop_constraint_rate": _metric(host_metrics, "early_stop_constraint_rate"),
                     "reset_rate": _metric(host_metrics, "reset_rate"),
                     "carry_step": _metric(host_metrics, "carry_step"),
-                    "descent_step_size": _metric(host_metrics, "descent_step_size"),
-                    "descent_clip_scale": _metric(host_metrics, "descent_clip_scale"),
-                    "descent_rms": _metric(host_metrics, "descent_rms"),
+                    "update_step_size": _metric(host_metrics, "update_step_size"),
+                    "update_clip_scale": _metric(host_metrics, "update_clip_scale"),
+                    "update_rms": _metric(host_metrics, "update_rms"),
                     "logit_step_rms": _metric(host_metrics, "logit_step_rms"),
                     "path_energy": _metric(host_metrics, "path_energy"),
                     "fixed_point_update_loss": _metric(host_metrics, "fixed_point_update_loss"),
@@ -229,7 +230,8 @@ def main() -> None:
                     f"{row['max_step_reset_rate']:.2f} "
                     f"{row['early_stop_rate']:.2f} "
                     f"{row['stability_rate']:.2f} "
-                    f"{row['early_stop_energy_q_delta']:.2e} "
+                    f"{row['early_stop_update_rms']:.2e} "
+                    f"{row['early_stop_distribution_delta']:.2e} "
                     f"{row['early_stop_flip_rate']:.2f} "
                     f"{row['early_stop_margin_min']:.2f} "
                     f"{row['early_stop_constraint_rate']:.2f} "
@@ -237,9 +239,9 @@ def main() -> None:
                     f"{row['carry_step']:.1f} "
                     f"{row['probe_entropy']:.2f} "
                     f"{row['probe_q_top1_probability']:.2f} "
-                    f"{row['descent_step_size']:.2f} "
-                    f"{row['descent_clip_scale']:.2f} "
-                    f"{row['descent_rms']:.2f} "
+                    f"{row['update_step_size']:.2f} "
+                    f"{row['update_clip_scale']:.2f} "
+                    f"{row['update_rms']:.2f} "
                     f"{row['logit_step_rms']:.2f} "
                     f"{row['probe_distribution_tv_delta']:.3e} "
                     f"{row['path_energy']:.3e} "

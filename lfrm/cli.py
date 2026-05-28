@@ -39,8 +39,8 @@ GROUPED_NESTED_KEYS = {
             "block_depth",
             "step_loss_schedule",
             "update_rule",
-            "descent_step_size",
-            "descent_rms_clip",
+            "update_step_size",
+            "update_rms_clip",
         },
         "objective": {
             "path_energy_weight",
@@ -50,14 +50,14 @@ GROUPED_NESTED_KEYS = {
             "wrong_attractor_direction_weight",
             "wrong_attractor_nonzero_weight",
             "wrong_attractor_rank_margin",
-            "wrong_attractor_grad_floor",
+            "wrong_attractor_update_floor",
             "corrupted_recovery_weight",
         },
         "early_stop": {
             "early_stop_enabled",
             "early_stop_min_steps",
             "early_stop_patience",
-            "early_stop_energy_q_delta_threshold",
+            "early_stop_distribution_delta_threshold",
             "early_stop_flip_threshold",
             "early_stop_margin_threshold",
             "early_stop_require_constraints",
@@ -171,15 +171,15 @@ ALLOWED_NESTED_KEYS = {
         "rms_norm_eps",
         "rope_theta",
         "step_loss_schedule",
-        "descent_step_size",
-        "descent_rms_clip",
+        "update_step_size",
+        "update_rms_clip",
         "path_energy_weight",
         "fixed_point_update_weight",
         "fixed_point_label_smoothing",
         "early_stop_enabled",
         "early_stop_min_steps",
         "early_stop_patience",
-        "early_stop_energy_q_delta_threshold",
+        "early_stop_distribution_delta_threshold",
         "early_stop_flip_threshold",
         "early_stop_margin_threshold",
         "early_stop_require_constraints",
@@ -309,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--train-mode",
         choices=("act", "dense_unroll", "step_carry"),
         default="act",
-        help="Recurrent training path: ACT carry, BRC step-carry, or full-unroll dense CE.",
+        help="Recurrent training path. BRC supports only step_carry; TRM/URM support act or dense_unroll.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--halt-loss-weight", type=float, default=0.0)
@@ -352,8 +352,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
     parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
     parser.add_argument("--brc-update-rule", choices=("energy", "velocity"), default="energy")
-    parser.add_argument("--brc-descent-step-size", type=float, default=0.3)
-    parser.add_argument("--brc-descent-rms-clip", type=float, default=1.0)
+    parser.add_argument("--brc-update-step-size", type=float, default=0.3)
+    parser.add_argument("--brc-update-rms-clip", type=float, default=1.0)
     parser.add_argument("--brc-path-energy-weight", type=float, default=1e-4)
     parser.add_argument("--brc-fixed-point-update-weight", type=float, default=0.0)
     parser.add_argument("--brc-fixed-point-label-smoothing", type=float, default=1e-3)
@@ -361,12 +361,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brc-wrong-attractor-direction-weight", type=float, default=0.0)
     parser.add_argument("--brc-wrong-attractor-nonzero-weight", type=float, default=0.0)
     parser.add_argument("--brc-wrong-attractor-rank-margin", type=float, default=1.0)
-    parser.add_argument("--brc-wrong-attractor-grad-floor", type=float, default=0.5)
+    parser.add_argument("--brc-wrong-attractor-update-floor", type=float, default=0.5)
     parser.add_argument("--brc-corrupted-recovery-weight", type=float, default=0.0)
     parser.add_argument("--brc-early-stop-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--brc-early-stop-min-steps", type=int, default=4)
     parser.add_argument("--brc-early-stop-patience", type=int, default=2)
-    parser.add_argument("--brc-early-stop-energy-q-delta-threshold", type=float, default=1e-3)
+    parser.add_argument("--brc-early-stop-distribution-delta-threshold", type=float, default=1e-3)
     parser.add_argument("--brc-early-stop-flip-threshold", type=float, default=0.0)
     parser.add_argument("--brc-early-stop-margin-threshold", type=float, default=0.5)
     parser.add_argument("--brc-early-stop-require-constraints", action=argparse.BooleanOptionalAction, default=True)
@@ -520,8 +520,8 @@ def build_config(
             rope_theta=args.brc_rope_theta,
             step_loss_schedule=args.brc_step_loss_schedule,
             update_rule=args.brc_update_rule,
-            descent_step_size=args.brc_descent_step_size,
-            descent_rms_clip=args.brc_descent_rms_clip,
+            update_step_size=args.brc_update_step_size,
+            update_rms_clip=args.brc_update_rms_clip,
             path_energy_weight=args.brc_path_energy_weight,
             fixed_point_update_weight=args.brc_fixed_point_update_weight,
             fixed_point_label_smoothing=args.brc_fixed_point_label_smoothing,
@@ -529,12 +529,12 @@ def build_config(
             wrong_attractor_direction_weight=args.brc_wrong_attractor_direction_weight,
             wrong_attractor_nonzero_weight=args.brc_wrong_attractor_nonzero_weight,
             wrong_attractor_rank_margin=args.brc_wrong_attractor_rank_margin,
-            wrong_attractor_grad_floor=args.brc_wrong_attractor_grad_floor,
+            wrong_attractor_update_floor=args.brc_wrong_attractor_update_floor,
             corrupted_recovery_weight=args.brc_corrupted_recovery_weight,
             early_stop_enabled=args.brc_early_stop_enabled,
             early_stop_min_steps=args.brc_early_stop_min_steps,
             early_stop_patience=args.brc_early_stop_patience,
-            early_stop_energy_q_delta_threshold=args.brc_early_stop_energy_q_delta_threshold,
+            early_stop_distribution_delta_threshold=args.brc_early_stop_distribution_delta_threshold,
             early_stop_flip_threshold=args.brc_early_stop_flip_threshold,
             early_stop_margin_threshold=args.brc_early_stop_margin_threshold,
             early_stop_require_constraints=args.brc_early_stop_require_constraints,

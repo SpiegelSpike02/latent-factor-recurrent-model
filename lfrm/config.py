@@ -45,8 +45,8 @@ class BRCConfig:
     rope_theta: float = 10000.0
     step_loss_schedule: str = "uniform"
     update_rule: str = "energy"
-    descent_step_size: float = 0.3
-    descent_rms_clip: float = 1.0
+    update_step_size: float = 0.3
+    update_rms_clip: float = 1.0
     path_energy_weight: float = 1e-4
     fixed_point_update_weight: float = 0.0
     fixed_point_label_smoothing: float = 1e-3
@@ -54,12 +54,12 @@ class BRCConfig:
     wrong_attractor_direction_weight: float = 0.0
     wrong_attractor_nonzero_weight: float = 0.0
     wrong_attractor_rank_margin: float = 1.0
-    wrong_attractor_grad_floor: float = 0.5
+    wrong_attractor_update_floor: float = 0.5
     corrupted_recovery_weight: float = 0.0
     early_stop_enabled: bool = True
     early_stop_min_steps: int = 4
     early_stop_patience: int = 2
-    early_stop_energy_q_delta_threshold: float = 1e-3
+    early_stop_distribution_delta_threshold: float = 1e-3
     early_stop_flip_threshold: float = 0.0
     early_stop_margin_threshold: float = 0.5
     early_stop_require_constraints: bool = True

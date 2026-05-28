@@ -34,7 +34,6 @@ from lfrm.runtime.sharding import (
 )
 from lfrm.training import (
     build_ema_update_runner,
-    build_brc_dense_unroll_train_step_runner,
     build_brc_step_carry_train_step_runner,
     build_state_copy_runner,
     build_eval_step_runner,
@@ -73,9 +72,6 @@ PER_STEP_SCALAR_SERIES = (
     ("per_step_energy_update_rms", "energy_update_rms_by_step"),
     ("per_step_energy_value", "energy_value_by_step"),
     ("per_step_energy_grad_rms", "energy_grad_rms_by_step"),
-    ("per_step_descent_step_size", "descent_step_size_by_step"),
-    ("per_step_descent_clip_scale", "descent_clip_scale_by_step"),
-    ("per_step_descent_rms", "descent_rms_by_step"),
     ("per_step_logit_step_rms", "logit_step_rms_by_step"),
     ("per_step_distribution_tv_delta", "distribution_tv_delta_by_step"),
     ("per_step_path_energy", "path_energy_by_step"),
@@ -133,6 +129,8 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("train_mode is only supported for recurrent model types")
     if config.train.train_mode == "step_carry" and config.model.model_type != "brc":
         raise ValueError("train_mode='step_carry' is currently only implemented for model_type='brc'")
+    if config.model.model_type == "brc" and config.train.train_mode != "step_carry":
+        raise ValueError("BRC training supports only train_mode='step_carry'")
 
 
 def training_uses_carry(config: ExperimentConfig) -> bool:
@@ -140,7 +138,7 @@ def training_uses_carry(config: ExperimentConfig) -> bool:
 
 
 def halt_loss_weight_for_mode(config: ExperimentConfig) -> float:
-    if config.model.model_type == "brc" and config.train.train_mode in ("dense_unroll", "step_carry"):
+    if config.model.model_type == "brc":
         return 0.0
     return config.train.halt_loss_weight
 
@@ -161,12 +159,7 @@ def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size
 def build_step_runners(config: ExperimentConfig):
     halt_loss_weight = halt_loss_weight_for_mode(config)
     if config.model.model_type == "brc":
-        if config.train.train_mode == "dense_unroll":
-            train_step_fn = build_brc_dense_unroll_train_step_runner()
-        elif config.train.train_mode == "step_carry":
-            train_step_fn = build_brc_step_carry_train_step_runner()
-        else:
-            raise ValueError("BRC supports train_mode='step_carry' or 'dense_unroll'")
+        train_step_fn = build_brc_step_carry_train_step_runner()
         eval_step_fn = build_eval_step_runner(
             halt_loss_weight,
             config.train.terminal_residual_weight,

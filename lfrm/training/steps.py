@@ -148,170 +148,6 @@ def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
     return weights / jnp.maximum(jnp.sum(weights), 1e-6)
 
 
-def _brc_compact_training_rollout(
-    model: BRCModel,
-    inputs: jax.Array,
-    targets: jax.Array,
-    loss_mask: jax.Array,
-    initial_q: jax.Array,
-    dropout_key: jax.Array,
-) -> tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
-    """Run BRC training without materializing [steps, batch, cells, vocab] logits."""
-    base_embeddings, context = model.context_memory(inputs)
-    query_mask = (~context).astype(jnp.float32)
-    query_normalizer = jnp.maximum(jnp.sum(query_mask), 1.0)
-    loss_mask_f32 = loss_mask.astype(jnp.float32)
-    loss_normalizer = jnp.maximum(jnp.sum(loss_mask_f32), 1.0)
-    supervised_cells_per_example = jnp.sum(loss_mask_f32, axis=-1)
-    candidate_init = jnp.zeros_like(inputs)
-    early_index = jnp.asarray(0, dtype=jnp.int32)
-    rollout_steps = int(model.total_steps)
-    mid_index = jnp.asarray(rollout_steps // 2, dtype=jnp.int32)
-
-    def scan_step(carry, scan_inputs):
-        (
-            q,
-            trajectory,
-            trajectory_count,
-            hidden_state,
-            early_candidate,
-            mid_candidate,
-        ) = carry
-        step_index, step_dropout_key = scan_inputs
-        next_q, next_hidden, update_diagnostics = model._commit_step(
-            inputs,
-            q,
-            trajectory,
-            trajectory_count,
-            hidden_state,
-            base_embeddings,
-            step_index,
-            train=True,
-            dropout_key=step_dropout_key,
-            stop_hidden_between_steps=True,
-        )
-        logits = model._q_to_token_logits(next_q, inputs, step_index)
-        token_loss = token_cross_entropy(model, logits, targets)
-        per_step_loss = jnp.sum(token_loss * loss_mask_f32) / loss_normalizer
-        predictions = _output_predictions_to_tokens(model, logits)
-        early_candidate = jnp.where(step_index == early_index, predictions, early_candidate)
-        mid_candidate = jnp.where(step_index == mid_index, predictions, mid_candidate)
-        step_correct = (predictions == targets).astype(jnp.float32) * loss_mask_f32
-        step_exact = jnp.where(
-            supervised_cells_per_example > 0,
-            jnp.sum(step_correct, axis=-1) == supervised_cells_per_example,
-            True,
-        )
-        confidence = jnp.max(model._normalize_q(next_q), axis=-1)
-        q_top1_probability = jnp.sum(confidence * query_mask) / query_normalizer
-        next_trajectory, next_trajectory_count = model._append_trajectory(
-            trajectory,
-            next_q,
-            trajectory_count,
-        )
-        return (
-            next_q,
-            next_trajectory,
-            next_trajectory_count,
-            next_hidden,
-            early_candidate,
-            mid_candidate,
-        ), (
-            per_step_loss,
-            q_top1_probability,
-            step_exact.astype(jnp.float32),
-            jnp.mean(update_diagnostics["update_step_size"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["update_clip_scale"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["update_rms"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["velocity_rms"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["velocity_clip_scale"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["energy_update_rms"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["descent_step_size"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["descent_clip_scale"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["descent_rms"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["logit_step_rms"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["distribution_tv_delta"].astype(jnp.float32)),
-            jnp.mean(update_diagnostics["path_energy"].astype(jnp.float32)),
-        )
-
-    step_indices = jnp.arange(rollout_steps, dtype=jnp.int32)
-    step_dropout_keys = jax.random.split(dropout_key, rollout_steps)
-    initial_hidden = model.initial_hidden_state(
-        inputs,
-        initial_q,
-        base_embeddings,
-        train=True,
-        dropout_key=step_dropout_keys[0],
-    )
-    initial_carry = (
-        initial_q.astype(jnp.float32),
-        model.initial_trajectory(inputs, initial_q).astype(jnp.float32),
-        model.initial_trajectory_count(inputs),
-        initial_hidden,
-        candidate_init,
-        candidate_init,
-    )
-    (
-        q_final,
-        _trajectory_final,
-        _trajectory_count_final,
-        _hidden_final,
-        early_candidate,
-        mid_candidate,
-    ), scan_outputs = jax.lax.scan(
-        scan_step,
-        initial_carry,
-        (step_indices, step_dropout_keys),
-    )
-    (
-        per_step_loss,
-        q_top1_probability,
-        per_step_exact,
-        update_step_size,
-        update_clip_scale,
-        update_rms,
-        velocity_rms,
-        velocity_clip_scale,
-        energy_update_rms,
-        descent_step_size,
-        descent_clip_scale,
-        energy_value,
-        energy_grad_rms,
-        descent_rms,
-        logit_step_rms,
-        distribution_tv_delta,
-        path_energy,
-    ) = scan_outputs
-    final_step = jnp.asarray(rollout_steps - 1, dtype=jnp.int32)
-    final_logits = model._q_to_token_logits(q_final, inputs, final_step)
-    final_candidate = _output_predictions_to_tokens(model, final_logits)
-    diagnostics = {
-        "q_top1_probability": q_top1_probability,
-        "unroll_steps": jnp.asarray(rollout_steps, dtype=jnp.float32),
-        "early_candidate": early_candidate,
-        "mid_candidate": mid_candidate,
-        "final_candidate": final_candidate,
-        "per_step_exact": per_step_exact,
-        "update_step_size": update_step_size,
-        "update_clip_scale": update_clip_scale,
-        "update_rms": update_rms,
-        "velocity_rms": velocity_rms,
-        "velocity_clip_scale": velocity_clip_scale,
-        "energy_update_rms": energy_update_rms,
-        "descent_step_size": descent_step_size,
-        "descent_clip_scale": descent_clip_scale,
-        "energy_value": energy_value,
-        "energy_grad_rms": energy_grad_rms,
-        "descent_rms": descent_rms,
-        "logit_step_rms": logit_step_rms,
-        "distribution_tv_delta": distribution_tv_delta,
-        "path_energy": path_energy,
-    }
-    return final_logits, per_step_loss, diagnostics
-
-
 def _trm_step_loss_weights(model: GridReasoningModel, rollout_steps: int) -> jax.Array:
     recurrent_config = getattr(model, "trm", None) or getattr(model, "urm", None)
     return _normalized_step_loss_weights(getattr(recurrent_config, "step_loss_weights", None), rollout_steps)
@@ -329,6 +165,8 @@ def brc_loss_and_metrics(
     train: bool,
     dropout_key: jax.Array | None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
+    if train:
+        raise ValueError("BRC training uses step-carry only; dense BRC training has been removed")
     if dropout_key is None:
         dropout_key = jax.random.key(0)
     augment_key, solve_key, terminal_key, attractor_key = jax.random.split(dropout_key, 4)
@@ -347,30 +185,20 @@ def brc_loss_and_metrics(
     context_mask, query_mask = _brc_region_masks(model, inputs, loss_mask)
     metric_loss_mask = loss_mask
 
-    initial_q = model.initial_q(inputs)
+    initial_z = model.initial_z(inputs)
     normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32)), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32), axis=-1), 1.0)
-    if train:
-        final_logits, per_step_loss, diagnostics = _brc_compact_training_rollout(
-            model,
-            inputs,
-            targets,
-            loss_mask,
-            initial_q,
-            solve_key,
-        )
-    else:
-        step_logits, diagnostics = model.run_commit_steps(
-            inputs,
-            initial_q=initial_q,
-            train=train,
-            dropout_key=solve_key,
-        )
-        step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
-        step_loss_mask = loss_mask[None, :, :]
-        token_loss = token_cross_entropy(model, step_logits, step_targets)
-        per_step_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=(1, 2)) / normalizer
-        final_logits = step_logits[-1]
+    step_logits, diagnostics = model.run_commit_steps(
+        inputs,
+        initial_z=initial_z,
+        train=False,
+        dropout_key=solve_key,
+    )
+    step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
+    step_loss_mask = loss_mask[None, :, :]
+    token_loss = token_cross_entropy(model, step_logits, step_targets)
+    per_step_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=(1, 2)) / normalizer
+    final_logits = step_logits[-1]
     step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
     step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
     per_step_path_energy = diagnostics["path_energy"].astype(jnp.float32)
@@ -392,8 +220,6 @@ def brc_loss_and_metrics(
         or float(model.brc.corrupted_recovery_weight) != 0.0
     ):
         base_embeddings, _context = model.context_memory(inputs)
-        probe_trajectory = model.initial_trajectory(inputs, final_logits)
-        probe_trajectory_count = jnp.full((inputs.shape[0],), model.trajectory_length, dtype=jnp.int32)
         probe_hidden = model.initial_hidden_state(
             inputs,
             final_logits,
@@ -406,8 +232,6 @@ def brc_loss_and_metrics(
             targets,
             loss_mask,
             final_logits,
-            probe_trajectory,
-            probe_trajectory_count,
             probe_hidden,
             train=train,
             dropout_key=attractor_key,
@@ -457,16 +281,13 @@ def brc_loss_and_metrics(
     context_target_probability = _masked_probability(target_probability_cells, context_mask)
     query_target_probability = _masked_probability(target_probability_cells, query_mask)
     q_top1_probability = _masked_logit_confidence(final_logits, metric_loss_mask)
-    if train:
-        oracle_step = jnp.argmin(per_step_loss)
-    else:
-        per_step_example_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=-1) / per_example_normalizer[None, :]
-        oracle_step = _masked_example_mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32), example_mask)
-        per_step_q_top1_probability = jnp.sum(
-            jnp.max(jax.nn.softmax(step_logits.astype(jnp.float32), axis=-1), axis=-1)
-            * step_loss_mask.astype(jnp.float32),
-            axis=(1, 2),
-        ) / normalizer
+    per_step_example_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=-1) / per_example_normalizer[None, :]
+    oracle_step = _masked_example_mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32), example_mask)
+    per_step_q_top1_probability = jnp.sum(
+        jnp.max(jax.nn.softmax(step_logits.astype(jnp.float32), axis=-1), axis=-1)
+        * step_loss_mask.astype(jnp.float32),
+        axis=(1, 2),
+    ) / normalizer
     metrics = {
         "loss": loss,
         "ce_loss": step_ce_loss,
@@ -490,11 +311,8 @@ def brc_loss_and_metrics(
         "velocity_rms": jnp.mean(diagnostics["velocity_rms"]),
         "velocity_clip_scale": jnp.mean(diagnostics["velocity_clip_scale"]),
         "energy_update_rms": jnp.mean(diagnostics["energy_update_rms"]),
-        "descent_step_size": jnp.mean(diagnostics["descent_step_size"]),
-        "descent_clip_scale": jnp.mean(diagnostics["descent_clip_scale"]),
         "energy_value": jnp.mean(diagnostics["energy_value"]),
         "energy_grad_rms": jnp.mean(diagnostics["energy_grad_rms"]),
-        "descent_rms": jnp.mean(diagnostics["descent_rms"]),
         "logit_step_rms": jnp.mean(diagnostics["logit_step_rms"]),
         "distribution_tv_delta": jnp.mean(diagnostics["distribution_tv_delta"]),
         "path_energy": jnp.mean(diagnostics["path_energy"]),
@@ -506,27 +324,23 @@ def brc_loss_and_metrics(
                 "context_target_probability": context_target_probability,
             }
         )
-    if not train:
-        metrics.update(
-            {
-                "per_step_loss": per_step_loss,
-                "per_step_q_top1_probability": per_step_q_top1_probability,
-                "per_step_update_step_size": diagnostics["update_step_size"],
-                "per_step_update_clip_scale": diagnostics["update_clip_scale"],
-                "per_step_update_rms": diagnostics["update_rms"],
-                "per_step_velocity_rms": diagnostics["velocity_rms"],
-                "per_step_velocity_clip_scale": diagnostics["velocity_clip_scale"],
-                "per_step_energy_update_rms": diagnostics["energy_update_rms"],
-                "per_step_descent_step_size": diagnostics["descent_step_size"],
-                "per_step_descent_clip_scale": diagnostics["descent_clip_scale"],
-                "per_step_energy_value": diagnostics["energy_value"],
-                "per_step_energy_grad_rms": diagnostics["energy_grad_rms"],
-                "per_step_descent_rms": diagnostics["descent_rms"],
-                "per_step_logit_step_rms": diagnostics["logit_step_rms"],
-                "per_step_distribution_tv_delta": diagnostics["distribution_tv_delta"],
-                "per_step_path_energy": diagnostics["path_energy"],
-            }
-        )
+    metrics.update(
+        {
+            "per_step_loss": per_step_loss,
+            "per_step_q_top1_probability": per_step_q_top1_probability,
+            "per_step_update_step_size": diagnostics["update_step_size"],
+            "per_step_update_clip_scale": diagnostics["update_clip_scale"],
+            "per_step_update_rms": diagnostics["update_rms"],
+            "per_step_velocity_rms": diagnostics["velocity_rms"],
+            "per_step_velocity_clip_scale": diagnostics["velocity_clip_scale"],
+            "per_step_energy_update_rms": diagnostics["energy_update_rms"],
+            "per_step_energy_value": diagnostics["energy_value"],
+            "per_step_energy_grad_rms": diagnostics["energy_grad_rms"],
+            "per_step_logit_step_rms": diagnostics["logit_step_rms"],
+            "per_step_distribution_tv_delta": diagnostics["distribution_tv_delta"],
+            "per_step_path_energy": diagnostics["path_energy"],
+        }
+    )
     if model.config.task_type == "sudoku":
         context_consistency, conflicts = _sudoku_board_metrics(model, predictions, inputs)
         metrics.update(
@@ -603,9 +417,7 @@ def brc_carry_loss_and_metrics(
             inputs,
             targets,
             loss_mask,
-            new_carry["q"],
-            new_carry["trajectory"],
-            new_carry["trajectory_count"],
+            new_carry["z"],
             new_carry["hidden"],
             train=train,
             dropout_key=attractor_key,
@@ -651,8 +463,8 @@ def brc_carry_loss_and_metrics(
         "early_stop_rate": diagnostics["early_stop_rate"],
         "stability_rate": diagnostics["stability_rate"],
         "stable_steps": diagnostics["stable_steps"],
-        "early_stop_energy_grad_rms": diagnostics["early_stop_energy_grad_rms"],
-        "early_stop_energy_q_delta": diagnostics["early_stop_energy_q_delta"],
+        "early_stop_update_rms": diagnostics["early_stop_update_rms"],
+        "early_stop_distribution_delta": diagnostics["early_stop_distribution_delta"],
         "early_stop_flip_rate": diagnostics["early_stop_flip_rate"],
         "early_stop_margin_min": diagnostics["early_stop_margin_min"],
         "early_stop_constraint_rate": diagnostics["early_stop_constraint_rate"],
@@ -662,11 +474,8 @@ def brc_carry_loss_and_metrics(
         "velocity_rms": diagnostics["velocity_rms"],
         "velocity_clip_scale": diagnostics["velocity_clip_scale"],
         "energy_update_rms": diagnostics["energy_update_rms"],
-        "descent_step_size": diagnostics["descent_step_size"],
-        "descent_clip_scale": diagnostics["descent_clip_scale"],
         "energy_value": diagnostics["energy_value"],
         "energy_grad_rms": diagnostics["energy_grad_rms"],
-        "descent_rms": diagnostics["descent_rms"],
         "logit_step_rms": diagnostics["logit_step_rms"],
         "distribution_tv_delta": diagnostics["distribution_tv_delta"],
         "path_energy": diagnostics["path_energy"],
