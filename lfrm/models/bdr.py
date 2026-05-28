@@ -429,6 +429,10 @@ class BDRModel(nnx.Module):
         """Return the explicit answer distribution view from centered logits."""
         return jax.nn.softmax(z_logits.astype(jnp.float32), axis=-1)
 
+    def _top2_margin(self, distribution: Array) -> Array:
+        top2, _indices = jax.lax.top_k(distribution.astype(jnp.float32), 2)
+        return top2[..., :1] - top2[..., 1:2]
+
     def _logits_from_distribution(self, distribution: Array) -> Array:
         return self._center_logits(jnp.log(jnp.maximum(distribution, self.output_logit_eps)))
 
@@ -466,15 +470,13 @@ class BDRModel(nnx.Module):
         del tokens
         z_logits = self._center_logits(z_logits)
         q_view = self._distribution_from_logits(z_logits)
-        uniform = jnp.full_like(q_view, 1.0 / float(self.q_vocab_size))
         logit_direction = jnp.tanh(z_logits / 4.0)
-        current_direction = q_view - uniform
+        current_direction = q_view - (1.0 / float(self.q_vocab_size))
 
         entropy = -jnp.sum(q_view * jnp.log(jnp.maximum(q_view, 1e-8)), axis=-1, keepdims=True) / jnp.log(
             float(self.q_vocab_size)
         )
-        top2 = jnp.sort(q_view, axis=-1)[..., -2:]
-        margin = top2[..., 1:2] - top2[..., 0:1]
+        margin = self._top2_margin(q_view)
         step_progress = (step_index.astype(jnp.float32) + 1.0) / float(self.total_steps)
         step_progress = jnp.broadcast_to(step_progress, z_logits.shape[:1])
         progress = jnp.broadcast_to(step_progress[:, None, None], entropy.shape)
@@ -546,9 +548,8 @@ class BDRModel(nnx.Module):
         candidate_distribution: Array,
         read_state: Array,
     ) -> Array:
-        uniform = jnp.full_like(candidate_distribution, 1.0 / float(self.q_vocab_size))
         state_condition = self.energy_state_to_hidden(
-            maybe_cast(candidate_distribution - uniform, self.dtype)
+            maybe_cast(candidate_distribution - (1.0 / float(self.q_vocab_size)), self.dtype)
         ).astype(jnp.float32)
         energy_input = self.energy_norm(
             (read_state.astype(jnp.float32) + state_condition).astype(self.dtype)
@@ -688,17 +689,6 @@ class BDRModel(nnx.Module):
         dropout_key: Array | None,
         stop_hidden_between_steps: bool = True,
     ) -> tuple[Array, Array, dict[str, Array], tuple[Array, Array]]:
-        update_diagnostics = {
-            "update_step_size": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "update_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "velocity_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "energy_update_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "energy_value": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "energy_grad_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "logit_step_rms": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "distribution_tv_delta": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-            "path_energy": jnp.zeros((tokens.shape[0], tokens.shape[1], 1), dtype=jnp.float32),
-        }
         # The explicit z state is stopped before context construction; the
         # configured update rule then acts on logits using the refined H.
         context_condition, state_condition = self._typed_conditions(
@@ -974,8 +964,9 @@ class BDRModel(nnx.Module):
         given_digits = jnp.clip(inputs - 1, 0, self.q_vocab_size - 1)
         givens_ok = jnp.all(jnp.where(given_mask, prediction_digits == given_digits, True), axis=-1)
         grid = prediction_digits.reshape((prediction_digits.shape[0], self.config.grid_height, self.config.grid_width))
-        row_ok = jnp.all(jnp.all(jnp.sum(jax.nn.one_hot(grid, self.q_vocab_size), axis=2) == 1, axis=-1), axis=-1)
-        col_ok = jnp.all(jnp.all(jnp.sum(jax.nn.one_hot(grid, self.q_vocab_size), axis=1) == 1, axis=-1), axis=-1)
+        grid_one_hot = jax.nn.one_hot(grid, self.q_vocab_size)
+        row_ok = jnp.all(jnp.all(jnp.sum(grid_one_hot, axis=2) == 1, axis=-1), axis=-1)
+        col_ok = jnp.all(jnp.all(jnp.sum(grid_one_hot, axis=1) == 1, axis=-1), axis=-1)
         flat = prediction_digits
         box_values = jnp.take(flat, self.box_indices, axis=1)
         box_ok = jnp.all(jnp.all(jnp.sum(jax.nn.one_hot(box_values, self.q_vocab_size), axis=2) == 1, axis=-1), axis=-1)
@@ -1004,8 +995,7 @@ class BDRModel(nnx.Module):
         flip_rate = jnp.sum((old_pred != new_pred).astype(jnp.float32) * query_mask, axis=-1) / query_normalizer
         update_rms_cell = update_diagnostics["update_rms"][..., 0].astype(jnp.float32)
         update_rms = jnp.sum(update_rms_cell * query_mask, axis=-1) / query_normalizer
-        top2 = jnp.sort(new_distribution, axis=-1)[..., -2:]
-        margin = top2[..., 1] - top2[..., 0]
+        margin = self._top2_margin(new_distribution)[..., 0]
         margin_min = jnp.min(jnp.where(query_mask.astype(bool), margin, jnp.inf), axis=-1)
         has_query = jnp.sum(query_mask, axis=-1) > 0
         margin_min = jnp.where(has_query, margin_min, jnp.max(margin, axis=-1))
@@ -1119,7 +1109,11 @@ class BDRModel(nnx.Module):
             dropout_key=dropout_key,
             stop_hidden_between_steps=True,
         )
-        logits = self._z_to_token_logits(next_z, inputs, step_index)
+        if self.bdr.update_rule == "energy":
+            _current_distribution, next_distribution = update_distributions
+            logits = next_distribution
+        else:
+            logits = self._z_to_token_logits(next_z, inputs, step_index)
         new_steps = steps + 1
         is_last_step = new_steps >= self.total_steps
         early_stop, early_stop_diagnostics = self._early_stop(
@@ -1194,8 +1188,13 @@ class BDRModel(nnx.Module):
             next_carry = (next_z, next_hidden)
             if return_final_only:
                 return next_carry, None
-            logits = self._z_to_token_logits(next_z, tokens, step_index)
-            confidence = jnp.max(self._distribution_from_logits(next_z), axis=-1)
+            if self.bdr.update_rule == "energy":
+                _current_distribution, next_distribution = _update_distributions
+                logits = next_distribution
+                confidence = jnp.max(next_distribution, axis=-1)
+            else:
+                logits = self._z_to_token_logits(next_z, tokens, step_index)
+                confidence = jnp.max(self._distribution_from_logits(next_z), axis=-1)
             q_top1_probability = jnp.sum(confidence * query_mask) / query_normalizer
             return next_carry, (
                 logits,
