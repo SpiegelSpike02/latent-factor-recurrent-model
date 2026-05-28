@@ -23,7 +23,9 @@ lfrm-train = "lfrm.cli:main"
 lfrm-build-sudoku = "lfrm.scripts.build_sudoku_dataset:main"
 lfrm-build-maze = "lfrm.scripts.build_maze_dataset:main"
 lfrm-build-arc = "lfrm.scripts.build_arc_dataset:main"
+lfrm-compare-wandb-sudoku-runs = "lfrm.scripts.compare_wandb_sudoku_runs:main"
 lfrm-debug-single-bdr = "lfrm.scripts.debug_single_bdr:main"
+lfrm-export-wandb-runs = "lfrm.scripts.export_wandb_runs:main"
 lfrm-short-bdr-sweep = "lfrm.scripts.short_bdr_sweep:main"
 
 [tool.hatch.build.targets.wheel]

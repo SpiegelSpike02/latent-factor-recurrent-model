@@ -147,8 +147,10 @@ class BDRSolverBlock(nnx.Module):
         state_condition: Array,
         rope_cos: Array | None,
         rope_sin: Array | None,
+        route_condition: Array | None = None,
     ) -> Array:
-        route_condition = self.attn_context_norm(context_condition.astype(jnp.float32)).astype(jnp.float32)
+        if route_condition is None:
+            route_condition = self.normalized_attn_context(context_condition)
         state_hint = state_condition.astype(jnp.float32)
         # Attention routing is anchored by the hidden workspace and hard context.
         # The stopped z signal is only a value hint for update construction.
@@ -176,8 +178,10 @@ class BDRSolverBlock(nnx.Module):
         h: Array,
         context_condition: Array,
         state_condition: Array,
+        route_condition: Array | None = None,
     ) -> Array:
-        route_condition = self.local_context_norm(context_condition.astype(jnp.float32)).astype(jnp.float32)
+        if route_condition is None:
+            route_condition = self.normalized_local_context(context_condition)
         state_hint = state_condition.astype(jnp.float32)
         local_base = (
             self.local_norm(h.astype(jnp.float32)).astype(jnp.float32)
@@ -187,6 +191,12 @@ class BDRSolverBlock(nnx.Module):
         local_input = (local_base.astype(jnp.float32) + state_hint).astype(self.dtype)
         local = self.local_mlp(local_input).astype(jnp.float32)
         return (h.astype(jnp.float32) + self.local_scale * local).astype(self.dtype)
+
+    def normalized_attn_context(self, context_condition: Array) -> Array:
+        return self.attn_context_norm(context_condition.astype(jnp.float32)).astype(jnp.float32)
+
+    def normalized_local_context(self, context_condition: Array) -> Array:
+        return self.local_context_norm(context_condition.astype(jnp.float32)).astype(jnp.float32)
 
 
 class BDRModel(nnx.Module):
@@ -489,19 +499,13 @@ class BDRModel(nnx.Module):
             axis=-1,
         )
         embedding_table = maybe_cast(self.state_embed.embedding[: self.q_vocab_size], self.dtype)
-        logit_embedding = jnp.einsum(
+        state_embedding = jnp.einsum(
             "bnd,dk->bnk",
-            maybe_cast(logit_direction, self.dtype),
+            maybe_cast(logit_direction + current_direction, self.dtype),
             embedding_table,
             preferred_element_type=jnp.float32,
         )
-        direction_embedding = jnp.einsum(
-            "bnd,dk->bnk",
-            maybe_cast(current_direction, self.dtype),
-            embedding_table,
-            preferred_element_type=jnp.float32,
-        )
-        return logit_embedding + direction_embedding, scalar_features
+        return state_embedding, scalar_features
 
     def _typed_conditions(
         self,
@@ -573,7 +577,8 @@ class BDRModel(nnx.Module):
         current_distribution = jax.nn.softmax(current_logits, axis=-1)
         raw_velocity = self.velocity_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         velocity = self._center_logits(raw_velocity)
-        raw_logit_step = float(self.bdr.update_step_size) * velocity
+        update_step_size_scalar = float(self.bdr.update_step_size)
+        raw_logit_step = update_step_size_scalar * velocity
         logit_step = raw_logit_step
         next_logits = self._center_logits(current_logits + logit_step)
         next_distribution = jax.nn.softmax(next_logits, axis=-1)
@@ -584,10 +589,10 @@ class BDRModel(nnx.Module):
             keepdims=True,
         )
         velocity_rms = jnp.sqrt(jnp.mean(jnp.square(velocity), axis=-1, keepdims=True) + 1e-12)
-        logit_step_rms = jnp.sqrt(jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True) + 1e-12)
+        logit_step_rms = update_step_size_scalar * velocity_rms
         path_energy = jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True)
         update_step_size = jnp.broadcast_to(
-            jnp.asarray(float(self.bdr.update_step_size), dtype=jnp.float32),
+            jnp.asarray(update_step_size_scalar, dtype=jnp.float32),
             (*current_logits.shape[:-1], 1),
         )
         diagnostics = {
@@ -618,9 +623,10 @@ class BDRModel(nnx.Module):
         energy_value = energy_cells[..., None]
         energy_grad = self._center_logits(energy_vjp(jnp.ones_like(energy_cells))[0])
         descent_direction = -energy_grad
-        logit_step = float(self.bdr.update_step_size) * descent_direction
+        update_step_size_scalar = float(self.bdr.update_step_size)
+        logit_step = update_step_size_scalar * descent_direction
         update_step_size = jnp.broadcast_to(
-            jnp.asarray(float(self.bdr.update_step_size), dtype=jnp.float32),
+            jnp.asarray(update_step_size_scalar, dtype=jnp.float32),
             (*current_logits.shape[:-1], 1),
         )
         next_logits = self._center_logits(current_logits + logit_step)
@@ -632,8 +638,8 @@ class BDRModel(nnx.Module):
             keepdims=True,
         )
         energy_grad_rms = jnp.sqrt(jnp.mean(jnp.square(energy_grad), axis=-1, keepdims=True) + 1e-12)
-        update_rms = jnp.sqrt(jnp.mean(jnp.square(descent_direction), axis=-1, keepdims=True) + 1e-12)
-        logit_step_rms = jnp.sqrt(jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True) + 1e-12)
+        update_rms = energy_grad_rms
+        logit_step_rms = update_step_size_scalar * update_rms
         path_energy = jnp.mean(jnp.square(next_distribution - current_distribution), axis=-1, keepdims=True)
         diagnostics = {
             "update_step_size": update_step_size,
@@ -655,19 +661,27 @@ class BDRModel(nnx.Module):
         state_condition: Array,
     ) -> Array:
         hidden = hidden_state.astype(self.dtype)
+        local_route_conditions = tuple(block.normalized_local_context(context_condition) for block in self.solver_blocks)
+        attn_route_conditions = tuple(block.normalized_attn_context(context_condition) for block in self.solver_blocks)
         # Within an h-cycle, cheap local propagation runs for every refine step.
         # The expensive all-to-all attention is reserved for the cycle boundary,
         # immediately before z update / early-stop check.
-        for _ in range(self.refine_steps):
-            for block in self.solver_blocks:
-                hidden = block.local_think(hidden, context_condition, state_condition)
-        for block in self.solver_blocks:
+        def refine_body(_step: Array, carry: Array) -> Array:
+            del _step
+            refined = carry
+            for block, route_condition in zip(self.solver_blocks, local_route_conditions, strict=True):
+                refined = block.local_think(refined, context_condition, state_condition, route_condition)
+            return refined
+
+        hidden = jax.lax.fori_loop(0, self.refine_steps, refine_body, hidden)
+        for block, route_condition in zip(self.solver_blocks, attn_route_conditions, strict=True):
             hidden = block.global_communicate(
                 hidden,
                 context_condition,
                 state_condition,
                 self.rope_cos,
                 self.rope_sin,
+                route_condition,
             )
         return hidden
 
