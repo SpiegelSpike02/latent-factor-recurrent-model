@@ -9,15 +9,15 @@ model_type = "bdr"
 seq_len = 81
 grid_height = 9
 grid_width = 9
-d_model = 512
+d_model = 384
 dropout_rate = 0.0
 loss_type = "softmax"
 
 [model.bdr]
 
 [model.bdr.dynamics]
-commit_steps = 48
-refine_steps = 4
+commit_steps = 32
+refine_steps = 3
 block_depth = 2
 step_loss_schedule = "uniform"
 update_rule = "velocity"
@@ -25,12 +25,12 @@ update_step_size = 0.2
 
 [model.bdr.objective]
 path_energy_weight = 0.0
-fixed_point_update_weight = 1e-3
+fixed_point_update_weight = 0.0
 fixed_point_label_smoothing = 3e-3
-wrong_attractor_direction_weight = 5e-2
-wrong_attractor_nonzero_weight = 1e-2
+wrong_attractor_direction_weight = 0.0
+wrong_attractor_nonzero_weight = 0.0
 wrong_attractor_update_floor = 0.5
-corrupted_recovery_weight = 2e-2
+corrupted_recovery_weight = 0.0
 
 [model.bdr.early_stop]
 early_stop_enabled = true
@@ -42,9 +42,9 @@ early_stop_margin_threshold = 0.5
 early_stop_require_constraints = true
 
 [model.bdr.hidden]
-hidden_state_dim = 512
-num_heads = 8
-mlp_ratio = 4
+hidden_state_dim = 384
+num_heads = 6
+mlp_ratio = 3
 local_kernel = 3
 attn_scale = 1.0
 local_scale = 1.0
@@ -92,5 +92,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-bdr-velocity-eta02-c48-r4-d2-b768"
+name = "sudoku-bdr-velocity-fast-eta02-c32-r3-d2-h384-b768"
 mode = "online"
