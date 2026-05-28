@@ -240,7 +240,7 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(diagnostics["halt_logits"].shape, (2, 1))
         self.assertEqual(diagnostics["hidden_delta_mean"].shape, (2,))
         _, metrics = loss_and_metrics(model, batch, False, None, halt_loss_weight=0.1)
-        for key in ("loss", "halt_loss", "selected_lm_loss", "accuracy"):
+        for key in ("loss", "halt_loss", "selected_token_loss", "accuracy"):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
         with self.assertRaisesRegex(ValueError, "ACT carry mode"):
@@ -543,6 +543,9 @@ class GridModelTests(unittest.TestCase):
             jax.random.key(33),
         )
         legacy_keys = {
+            "ce_loss",
+            "final_ce_loss",
+            "mean_ce_loss",
             "blank_ce_loss",
             "step_weighted_ce_loss",
             "final_blank_ce_loss",
@@ -556,9 +559,9 @@ class GridModelTests(unittest.TestCase):
         self.assertFalse(legacy_keys & set(metrics))
         for key in (
             "loss",
-            "ce_loss",
-            "final_ce_loss",
-            "mean_ce_loss",
+            "token_loss",
+            "final_token_loss",
+            "mean_token_loss",
             "context_accuracy",
             "query_accuracy",
             "context_target_probability",
@@ -605,7 +608,7 @@ class GridModelTests(unittest.TestCase):
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
         _, metrics = loss_and_metrics(model, batch, False, jax.random.key(37))
-        for key in ("loss", "ce_loss", "accuracy", "exact_accuracy"):
+        for key in ("loss", "token_loss", "accuracy", "exact_accuracy"):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
 

@@ -19,7 +19,7 @@ from lfrm.training.factory import create_model, create_optimizer
 
 KEY_METRICS = (
     "loss",
-    "ce_loss",
+    "token_loss",
     "accuracy",
     "query_accuracy",
     "context_accuracy",

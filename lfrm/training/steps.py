@@ -162,6 +162,24 @@ def _trm_selected_step(halt_logits: jax.Array) -> jax.Array:
     return jnp.argmax(step_halted.astype(jnp.int32), axis=0)
 
 
+def _canonicalize_common_metric_names(metrics: dict[str, jax.Array]) -> dict[str, jax.Array]:
+    rename_pairs = (
+        ("ce_loss", "token_loss"),
+        ("lm_loss", "token_loss"),
+        ("final_ce_loss", "final_token_loss"),
+        ("final_lm_loss", "final_token_loss"),
+        ("mean_ce_loss", "mean_token_loss"),
+        ("mean_lm_loss", "mean_token_loss"),
+        ("selected_lm_loss", "selected_token_loss"),
+        ("q_halt_loss", "halt_loss"),
+    )
+    for old_name, new_name in rename_pairs:
+        if old_name in metrics:
+            value = metrics.pop(old_name)
+            metrics.setdefault(new_name, value)
+    return metrics
+
+
 def bdr_loss_and_metrics(
     model: BDRModel,
     batch: dict[str, jax.Array],
@@ -293,9 +311,9 @@ def bdr_loss_and_metrics(
     ) / normalizer
     metrics = {
         "loss": loss,
-        "ce_loss": step_ce_loss,
-        "final_ce_loss": solution_loss,
-        "mean_ce_loss": jnp.mean(per_step_loss),
+        "token_loss": step_ce_loss,
+        "final_token_loss": solution_loss,
+        "mean_token_loss": jnp.mean(per_step_loss),
         "path_energy_loss": path_energy_loss,
         "fixed_point_update_loss": fixed_point_update_loss,
         **attractor_losses,
@@ -349,7 +367,7 @@ def bdr_loss_and_metrics(
             }
         )
     metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
-    return loss, metrics
+    return loss, _canonicalize_common_metric_names(metrics)
 
 
 def bdr_carry_loss_and_metrics(
@@ -446,7 +464,7 @@ def bdr_carry_loss_and_metrics(
     )
     metrics = {
         "loss": loss,
-        "ce_loss": ce_loss,
+        "token_loss": ce_loss,
         "path_energy_loss": path_energy_loss,
         "fixed_point_update_loss": fixed_point_update_loss,
         **attractor_losses,
@@ -492,7 +510,7 @@ def bdr_carry_loss_and_metrics(
             }
         )
     metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
-    return loss, (metrics, new_carry)
+    return loss, (_canonicalize_common_metric_names(metrics), new_carry)
 
 
 def loss_and_metrics(
@@ -631,14 +649,14 @@ def loss_and_metrics(
 
     metrics = {
         "loss": loss,
-        "lm_loss": lm_loss_value,
+        "token_loss": lm_loss_value,
         "halt_loss": halt_loss,
-        "final_lm_loss": per_step_loss[-1],
+        "final_token_loss": per_step_loss[-1],
         "final_target_probability": target_probability,
         "accuracy": cell_accuracy,
         "exact_accuracy": exact_accuracy,
         "exact_count": exact_count,
-        "selected_lm_loss": selected_ce_loss,
+        "selected_token_loss": selected_ce_loss,
         "selected_accuracy": selected_accuracy,
         "selected_exact_accuracy": selected_exact_accuracy,
         "selected_step": _masked_example_mean(selected_step.astype(jnp.float32) + 1.0, example_mask),
@@ -675,7 +693,7 @@ def loss_and_metrics(
         "belief_entropy",
         "belief_confidence",
         "halt_loss",
-        "selected_lm_loss",
+        "selected_token_loss",
         "selected_accuracy",
         "selected_exact_accuracy",
         "selected_step",
@@ -683,7 +701,7 @@ def loss_and_metrics(
     ):
         if key in diagnostics:
             metrics[key] = diagnostics[key]
-    return loss, metrics
+    return loss, _canonicalize_common_metric_names(metrics)
 
 
 def trm_act_loss_and_metrics(
@@ -751,14 +769,13 @@ def trm_act_loss_and_metrics(
     )
     metrics = {
         "loss": loss,
-        "lm_loss": lm_loss_value,
-        "q_halt_loss": halt_loss,
+        "token_loss": lm_loss_value,
         "count": valid_halted_count,
         "accuracy": cell_accuracy,
         "exact_accuracy": exact_accuracy,
         "q_halt_accuracy": q_halt_accuracy,
         "steps": steps,
-        "final_lm_loss": lm_loss_value,
+        "final_token_loss": lm_loss_value,
         "halted_target_probability": target_probability,
         "current_accuracy": current_cell_accuracy,
         "current_exact_accuracy": current_exact_accuracy,
@@ -769,7 +786,7 @@ def trm_act_loss_and_metrics(
         "reset_rate": diagnostics["reset_rate"],
     }
     metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
-    return loss, (metrics, new_carry)
+    return loss, (_canonicalize_common_metric_names(metrics), new_carry)
 
 
 def trm_eval_loss_and_metrics(
@@ -865,20 +882,19 @@ def trm_eval_loss_and_metrics(
     count = jnp.sum(example_mask)
     metrics = {
         "loss": loss,
-        "lm_loss": final_lm_loss_value,
-        "q_halt_loss": halt_loss,
+        "token_loss": final_lm_loss_value,
         "count": count,
         "accuracy": final_cell_accuracy,
         "exact_accuracy": _masked_example_mean(final_exact_f32, example_mask),
         "q_halt_accuracy": q_halt_accuracy,
         "steps": jnp.asarray(step_logits.shape[0], dtype=jnp.float32),
         "halt_loss": halt_loss,
-        "final_lm_loss": final_lm_loss_value,
+        "final_token_loss": final_lm_loss_value,
         "final_accuracy": final_cell_accuracy,
         "final_exact_accuracy": _masked_example_mean(final_exact_f32, example_mask),
         "halted_target_probability": target_probability,
         "exact_count": final_exact_count,
-        "selected_lm_loss": selected_lm_loss_value,
+        "selected_token_loss": selected_lm_loss_value,
         "selected_accuracy": cell_accuracy,
         "selected_exact_accuracy": exact_accuracy,
         "selected_exact_count": selected_exact_count,
@@ -920,4 +936,4 @@ def trm_eval_loss_and_metrics(
             if key in ("path_precision", "path_recall", "path_f1")
         }
     )
-    return loss, metrics
+    return loss, _canonicalize_common_metric_names(metrics)

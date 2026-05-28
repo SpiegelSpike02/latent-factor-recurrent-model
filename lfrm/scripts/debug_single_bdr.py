@@ -183,7 +183,7 @@ def main() -> None:
                 row = {
                     "step": step,
                     "loss": _metric(host_metrics, "loss"),
-                    "ce_loss": _metric(host_metrics, "ce_loss"),
+                    "token_loss": _metric(host_metrics, "token_loss"),
                     "query_accuracy": _metric(host_metrics, "query_accuracy"),
                     "context_accuracy": _metric(host_metrics, "context_accuracy"),
                     "exact_accuracy": _metric(host_metrics, "exact_accuracy"),

@@ -64,12 +64,12 @@ def maybe_path_metrics(
 
 CORE_SCALAR_METRICS = (
     "loss",
-    "ce_loss",
-    "final_ce_loss",
-    "mean_ce_loss",
-    "active_ce_loss",
-    "lm_loss",
-    "q_halt_loss",
+    "token_loss",
+    "final_token_loss",
+    "mean_token_loss",
+    "active_token_loss",
+    "selected_token_loss",
+    "halt_loss",
     "accuracy",
     "context_accuracy",
     "query_accuracy",
@@ -78,11 +78,8 @@ CORE_SCALAR_METRICS = (
     "steps",
     "count",
     "completed_count",
-    "final_lm_loss",
     "final_accuracy",
     "final_exact_accuracy",
-    "mean_lm_loss",
-    "active_lm_loss",
     "completed_accuracy",
     "completed_context_accuracy",
     "completed_query_accuracy",
@@ -122,8 +119,6 @@ CORE_SCALAR_METRICS = (
     "path_energy",
     "path_energy_loss",
     "step_loss_weights",
-    "halt_loss",
-    "selected_lm_loss",
     "selected_accuracy",
     "selected_exact_accuracy",
     "selected_step",
@@ -155,9 +150,9 @@ CORE_SCALAR_METRICS = (
 )
 BDR_SCALAR_METRICS = (
     "loss",
-    "ce_loss",
-    "final_ce_loss",
-    "mean_ce_loss",
+    "token_loss",
+    "final_token_loss",
+    "mean_token_loss",
     "accuracy",
     "context_accuracy",
     "query_accuracy",
@@ -225,6 +220,16 @@ INTEGER_SCALAR_METRICS = {
     "final_exact_count",
 }
 LEGACY_METRIC_NAMES = {
+    "ce_loss",
+    "final_ce_loss",
+    "mean_ce_loss",
+    "active_ce_loss",
+    "lm_loss",
+    "final_lm_loss",
+    "mean_lm_loss",
+    "active_lm_loss",
+    "selected_lm_loss",
+    "q_halt_loss",
     "blank_ce_loss",
     "final_blank_ce_loss",
     "mean_blank_ce_loss",
@@ -259,9 +264,9 @@ BDR_CONSOLE_GROUPS = (
         "objective",
         (
             "loss",
-            "ce_loss",
-            "final_ce_loss",
-            "mean_ce_loss",
+            "token_loss",
+            "final_token_loss",
+            "mean_token_loss",
             "fixed_point_update_loss",
             "wrong_attractor_rank_loss",
             "wrong_attractor_direction_loss",
@@ -338,10 +343,10 @@ BDR_CONSOLE_GROUPS = (
     ),
 )
 TRM_CONSOLE_GROUPS = (
-    ("objective", ("loss", "lm_loss", "q_halt_loss")),
+    ("objective", ("loss", "token_loss", "halt_loss")),
     ("official", ("accuracy", "exact_accuracy", "q_halt_accuracy", "steps", "count")),
     ("current", ("current_accuracy", "current_exact_accuracy", "halted_target_probability", "reset_rate")),
-    ("final", ("final_lm_loss", "final_accuracy", "final_exact_accuracy")),
+    ("final", ("final_token_loss", "final_accuracy", "final_exact_accuracy")),
     (
         "path",
         (
@@ -355,7 +360,7 @@ TRM_CONSOLE_GROUPS = (
             "final_path_f1",
         ),
     ),
-    ("halt", ("selected_step", "oracle_step", "act_step", "halted_rate", "selected_accuracy", "selected_exact_accuracy")),
+    ("halt", ("selected_step", "oracle_step", "act_step", "halted_rate", "selected_token_loss", "selected_accuracy", "selected_exact_accuracy")),
     ("dynamics", ("unroll_steps", "terminal_belief_delta", "terminal_belief_mse")),
 )
 METRIC_GROUPS = BDR_CONSOLE_GROUPS

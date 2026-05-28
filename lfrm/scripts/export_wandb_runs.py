@@ -17,7 +17,7 @@ RUN_PREFIXES = ("sudoku-bdr", "maze-bdr", "sudoku-brc", "maze-brc", "arc")
 
 SUMMARY_KEYS = (
     "train/loss",
-    "train/ce_loss",
+    "train/token_loss",
     "train/query_accuracy",
     "train/query_target_probability",
     "train/exact_accuracy",
@@ -43,7 +43,7 @@ SUMMARY_KEYS = (
 HISTORY_KEYS = (
     "_step",
     "train/loss",
-    "train/ce_loss",
+    "train/token_loss",
     "train/query_accuracy",
     "train/query_target_probability",
     "train/exact_accuracy",
