@@ -427,17 +427,26 @@ class TinyRecursiveModel(nnx.Module):
         return hidden_states
 
     def _h_cycle_step(self, y_state: Array, z_state: Array, input_embeddings: Array) -> tuple[Array, Array]:
-        for _ in range(self.trm.l_cycles):
-            z_state = self._recurrent_level(z_state, y_state + input_embeddings)
+        def l_cycle_body(_: int, z: Array) -> Array:
+            return self._recurrent_level(z, y_state + input_embeddings)
+
+        z_state = jax.lax.fori_loop(0, self.trm.l_cycles, l_cycle_body, z_state)
         return self._recurrent_level(y_state, z_state), z_state
 
     def _act_step(self, state: State, input_embeddings: Array) -> State:
         y_state = state["y"]
         z_state = state["z"]
-        for _ in range(self.trm.h_cycles - 1):
-            y_state, z_state = self._h_cycle_step(y_state, z_state, input_embeddings)
-            y_state = jax.lax.stop_gradient(y_state)
-            z_state = jax.lax.stop_gradient(z_state)
+
+        def h_cycle_body(_: int, carry: tuple[Array, Array]) -> tuple[Array, Array]:
+            y, z = self._h_cycle_step(carry[0], carry[1], input_embeddings)
+            return jax.lax.stop_gradient(y), jax.lax.stop_gradient(z)
+
+        y_state, z_state = jax.lax.fori_loop(
+            0,
+            self.trm.h_cycles - 1,
+            h_cycle_body,
+            (y_state, z_state),
+        )
         y_state, z_state = self._h_cycle_step(y_state, z_state, input_embeddings)
         return {"y": y_state, "z": z_state}
 

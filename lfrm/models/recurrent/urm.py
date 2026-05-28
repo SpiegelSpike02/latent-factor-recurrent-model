@@ -208,14 +208,16 @@ class UnifiedReasoningModel(nnx.Module):
 
     def _inner_update(self, hidden: Array, input_embeddings: Array, *, train: bool, dropout_key: Array) -> Array:
         def latent_update(h: Array) -> Array:
-            for _ in range(self.urm.l_cycles):
-                h = self._run_layers(h, input_embeddings)
-            return h
+            def l_cycle_body(_: int, carry: Array) -> Array:
+                return self._run_layers(carry, input_embeddings)
+
+            return jax.lax.fori_loop(0, self.urm.l_cycles, l_cycle_body, h)
+
+        def h_cycle_body(_: int, carry: Array) -> Array:
+            return jax.lax.stop_gradient(latent_update(carry))
 
         h = hidden
-        for _ in range(self.urm.h_cycles - 1):
-            h = jax.lax.stop_gradient(latent_update(h))
-
+        h = jax.lax.fori_loop(0, self.urm.h_cycles - 1, h_cycle_body, h)
         h = latent_update(h)
         h = self.dropout(h, deterministic=not train, rngs=dropout_key)
         return h
