@@ -103,11 +103,6 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("prefetch_depth must be positive")
     if config.runtime.prefetch_workers <= 0:
         raise ValueError("prefetch_workers must be positive")
-    if config.runtime.train_dispatch_chunk != 1:
-        raise ValueError(
-            "runtime.train_dispatch_chunk is reserved for a future scanned train runner; "
-            "set it to 1 for the current optimized path"
-        )
     if (
         config.runtime.data_parallel_devices != 1
         and config.optimizer.puzzle_embed_coalesce_updates
@@ -232,7 +227,6 @@ def print_run_overview(
             ("data_sharding", data_sharding),
             ("prefetch_depth", config.runtime.prefetch_depth),
             ("prefetch_workers", config.runtime.prefetch_workers),
-            ("train_dispatch_chunk", config.runtime.train_dispatch_chunk),
             ("eval_diagnostics", config.eval.diagnostics),
             ("profile_enabled", config.runtime.profile_enabled),
             ("profile_start_step", config.runtime.profile_start_step),

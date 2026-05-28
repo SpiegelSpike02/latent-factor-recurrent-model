@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
-from .common import Array, casted_linear_init, compute_dtype, maybe_cast, trunc_normal_init
+from .common import Array, casted_linear_init, compute_dtype, gather_embedding_rows, maybe_cast, trunc_normal_init
 from .recurrent.layers import (
     dot_product_attention,
     multi_head_attention_with_rope,
@@ -470,6 +470,9 @@ class BDRModel(nnx.Module):
             + self.col_embed(self.col_ids)
             + self.box_embed(self.box_ids)
         )
+
+    def _embed_tokens(self, embedding: nnx.Embed, token_ids: Array) -> Array:
+        return maybe_cast(gather_embedding_rows(embedding.embedding, token_ids.astype(jnp.int32)), self.dtype)
 
     def _state_features(
         self,
@@ -1055,8 +1058,8 @@ class BDRModel(nnx.Module):
         context = self.context_mask(tokens)
         token_ids = jnp.clip(tokens, 0, self.input_vocab_size - 1)
         base_embeddings = (
-            self.puzzle_embed(token_ids.astype(jnp.int32))
-            + self.context_embed(context.astype(jnp.int32))
+            self._embed_tokens(self.puzzle_embed, token_ids)
+            + self._embed_tokens(self.context_embed, context.astype(jnp.int32))
         )
         if self.bdr.position_encoding == "learned":
             base_embeddings = base_embeddings + self._position_embeddings()[None, :, :]
@@ -1075,7 +1078,7 @@ class BDRModel(nnx.Module):
             "reset": jnp.ones((batch_size,), dtype=bool),
             "current_inputs": jnp.zeros_like(batch["inputs"]),
             "current_labels": jnp.zeros_like(batch["labels"]),
-            "current_example_mask": jnp.zeros((batch_size,), dtype=jnp.float32),
+            "current_example_mask": jnp.zeros_like(batch["inputs"][:, 0], dtype=jnp.float32),
         }
 
     def forward_carry_step(
@@ -1093,10 +1096,10 @@ class BDRModel(nnx.Module):
         reset_state = reset[:, None, None]
         inputs = jnp.where(reset_cells, batch["inputs"], carry["current_inputs"])
         labels = jnp.where(reset_cells, batch["labels"], carry["current_labels"])
-        batch_example_mask = batch.get(
-            "example_mask",
-            jnp.ones((inputs.shape[0],), dtype=jnp.float32),
-        ).astype(jnp.float32)
+        if "example_mask" in batch:
+            batch_example_mask = batch["example_mask"].astype(jnp.float32)
+        else:
+            batch_example_mask = jnp.ones_like(reset, dtype=jnp.float32)
         example_mask = jnp.where(reset, batch_example_mask, carry["current_example_mask"])
         steps = jnp.where(reset, 0, carry["steps"])
 

@@ -128,7 +128,6 @@ ALLOWED_SECTION_KEYS = {
         "data_parallel_devices",
         "prefetch_depth",
         "prefetch_workers",
-        "train_dispatch_chunk",
         "profile_enabled",
         "profile_start_step",
         "profile_steps",
@@ -420,15 +419,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of background workers used for batch sampling and device placement.",
     )
     parser.add_argument(
-        "--train-dispatch-chunk",
-        type=int,
-        default=1,
-        help=(
-            "Reserved optimizer-update chunk size for future JAX scan dispatch. "
-            "Currently only train_dispatch_chunk=1 is supported."
-        ),
-    )
-    parser.add_argument(
         "--profile-enabled",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -599,7 +589,6 @@ def build_config(
         data_parallel_devices=args.data_parallel_devices,
         prefetch_depth=args.prefetch_depth,
         prefetch_workers=args.prefetch_workers,
-        train_dispatch_chunk=args.train_dispatch_chunk,
         profile_enabled=args.profile_enabled,
         profile_start_step=args.profile_start_step,
         profile_steps=args.profile_steps,

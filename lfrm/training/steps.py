@@ -30,7 +30,9 @@ def _maybe_path_metrics(
 
 
 def _example_mask(batch: dict[str, jax.Array], targets: jax.Array) -> jax.Array:
-    return batch.get("example_mask", jnp.ones((targets.shape[0],), dtype=jnp.float32)).astype(jnp.float32)
+    if "example_mask" in batch:
+        return batch["example_mask"].astype(jnp.float32)
+    return jnp.ones_like(targets[:, 0], dtype=jnp.float32)
 
 
 def _apply_example_mask(loss_mask: jax.Array, example_mask: jax.Array) -> jax.Array:
