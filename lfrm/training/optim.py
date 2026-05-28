@@ -44,8 +44,8 @@ def scheduled_lr(
     *,
     peak_value: float,
     min_ratio: float,
-    mid_ratio: float,
-    mid_fraction: float,
+    mid_ratio: float = 0.0,
+    mid_fraction: float = 0.0,
     warmup_steps: int,
     optimizer_updates: int,
 ):

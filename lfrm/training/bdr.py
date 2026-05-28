@@ -3,9 +3,9 @@ from __future__ import annotations
 import jax
 from flax import nnx
 
-from lfrm.models import BRCModel
+from lfrm.models import BDRModel
 from lfrm.training.factory import GridReasoningModel
-from lfrm.training.steps import brc_carry_loss_and_metrics, loss_and_metrics
+from lfrm.training.steps import bdr_carry_loss_and_metrics, loss_and_metrics
 
 
 def build_train_step_runner(
@@ -36,9 +36,9 @@ def build_train_step_runner(
     return nnx.jit(train_step_with_weight)
 
 
-def build_brc_step_carry_train_step_runner():
+def build_bdr_step_carry_train_step_runner():
     def train_step(
-        model: BRCModel,
+        model: BDRModel,
         optimizer: nnx.Optimizer,
         carry: dict[str, jax.Array],
         batch: dict[str, jax.Array],
@@ -48,7 +48,7 @@ def build_brc_step_carry_train_step_runner():
         dropout_key = jax.random.fold_in(dropout_key, optimizer_step)
 
         def objective(model, carry, batch, train, dropout_key):
-            return brc_carry_loss_and_metrics(
+            return bdr_carry_loss_and_metrics(
                 model,
                 carry,
                 batch,
@@ -66,7 +66,7 @@ def build_brc_step_carry_train_step_runner():
         optimizer.update(model, grads)
         return metrics, new_carry
 
-    # Step-carry is a truncated execution path for BRC. It carries z/H between
+    # Step-carry is a truncated execution path for BDR. It carries z/H between
     # optimizer updates and lets deterministic energy-stability early stop reset
     # samples without training a learned halt head.
     return nnx.jit(train_step, donate_argnums=(2,))

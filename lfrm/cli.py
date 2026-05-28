@@ -9,7 +9,7 @@ from lfrm.config import (
     EMAConfig,
     ExperimentConfig,
     EvalConfig,
-    BRCConfig,
+    BDRConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
@@ -28,11 +28,11 @@ from lfrm.runtime import (
 
 CONFIG_SECTIONS = ("data", "task", "model", "optimizer", "train", "eval", "runtime", "wandb")
 NESTED_SECTIONS = {
-    "model": {"trm", "brc", "urm"},
+    "model": {"trm", "bdr", "urm"},
     "train": {"ema", "objective"},
 }
 GROUPED_NESTED_KEYS = {
-    "brc": {
+    "bdr": {
         "dynamics": {
             "commit_steps",
             "refine_steps",
@@ -87,7 +87,7 @@ ALLOWED_SECTION_KEYS = {
         "dropout_rate",
         "loss_type",
         "trm",
-        "brc",
+        "bdr",
         "urm",
     },
     "optimizer": {
@@ -156,7 +156,7 @@ ALLOWED_NESTED_KEYS = {
         "no_act_continue",
         "step_loss_weights",
     },
-    "brc": {
+    "bdr": {
         "commit_steps",
         "refine_steps",
         "block_depth",
@@ -170,10 +170,17 @@ ALLOWED_NESTED_KEYS = {
         "rms_norm_eps",
         "rope_theta",
         "step_loss_schedule",
+        "update_rule",
         "update_step_size",
         "path_energy_weight",
         "fixed_point_update_weight",
         "fixed_point_label_smoothing",
+        "wrong_attractor_rank_weight",
+        "wrong_attractor_direction_weight",
+        "wrong_attractor_nonzero_weight",
+        "wrong_attractor_rank_margin",
+        "wrong_attractor_update_floor",
+        "corrupted_recovery_weight",
         "early_stop_enabled",
         "early_stop_min_steps",
         "early_stop_patience",
@@ -263,8 +270,8 @@ def load_toml_config(path: str | None) -> dict[str, object]:
                 normalized_key = "task_type"
             flat[normalized_key] = value
 
-    if flat.get("model_type", "brc") not in ("trm", "brc", "urm"):
-        raise ValueError("Only model_type=trm, brc, or urm is supported")
+    if flat.get("model_type", "bdr") not in ("trm", "bdr", "urm"):
+        raise ValueError("Only model_type=trm, bdr, or urm is supported")
     if flat.get("task_type", "sudoku") not in ("sudoku", "maze", "arc"):
         raise ValueError("Only task_type='sudoku', 'maze', or 'arc' is supported")
     if flat.get("loss_type", "softmax") not in ("softmax", "stablemax"):
@@ -307,14 +314,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--train-mode",
         choices=("act", "dense_unroll", "step_carry"),
         default="act",
-        help="Recurrent training path. BRC supports only step_carry; TRM/URM support act or dense_unroll.",
+        help="Recurrent training path. BDR supports only step_carry; TRM/URM support act or dense_unroll.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--halt-loss-weight", type=float, default=0.0)
     parser.add_argument("--terminal-residual-weight", type=float, default=0.0)
     parser.add_argument("--ema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ema-decay", type=float, default=0.999)
-    parser.add_argument("--model-type", choices=("trm", "brc", "urm"), default="brc")
+    parser.add_argument("--model-type", choices=("trm", "bdr", "urm"), default="bdr")
     parser.add_argument("--task-type", choices=("sudoku", "maze", "arc"), default="sudoku")
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--rollout-steps", type=int, default=6)
@@ -336,37 +343,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
-    parser.add_argument("--brc-commit-steps", type=int, default=6)
-    parser.add_argument("--brc-refine-steps", type=int, default=2)
-    parser.add_argument("--brc-block-depth", type=int, default=1)
-    parser.add_argument("--brc-hidden-state-dim", type=int, default=0)
-    parser.add_argument("--brc-num-heads", type=int, default=4)
-    parser.add_argument("--brc-mlp-ratio", type=int, default=2)
-    parser.add_argument("--brc-local-kernel", type=int, default=3)
-    parser.add_argument("--brc-attn-scale", type=float, default=0.2)
-    parser.add_argument("--brc-local-scale", type=float, default=0.2)
-    parser.add_argument("--brc-position-encoding", choices=("rope", "learned", "none"), default="rope")
-    parser.add_argument("--brc-rms-norm-eps", type=float, default=1e-5)
-    parser.add_argument("--brc-rope-theta", type=float, default=10000.0)
-    parser.add_argument("--brc-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
-    parser.add_argument("--brc-update-rule", choices=("energy", "velocity"), default="energy")
-    parser.add_argument("--brc-update-step-size", type=float, default=0.3)
-    parser.add_argument("--brc-path-energy-weight", type=float, default=1e-4)
-    parser.add_argument("--brc-fixed-point-update-weight", type=float, default=0.0)
-    parser.add_argument("--brc-fixed-point-label-smoothing", type=float, default=1e-3)
-    parser.add_argument("--brc-wrong-attractor-rank-weight", type=float, default=0.0)
-    parser.add_argument("--brc-wrong-attractor-direction-weight", type=float, default=0.0)
-    parser.add_argument("--brc-wrong-attractor-nonzero-weight", type=float, default=0.0)
-    parser.add_argument("--brc-wrong-attractor-rank-margin", type=float, default=1.0)
-    parser.add_argument("--brc-wrong-attractor-update-floor", type=float, default=0.5)
-    parser.add_argument("--brc-corrupted-recovery-weight", type=float, default=0.0)
-    parser.add_argument("--brc-early-stop-enabled", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--brc-early-stop-min-steps", type=int, default=4)
-    parser.add_argument("--brc-early-stop-patience", type=int, default=2)
-    parser.add_argument("--brc-early-stop-distribution-delta-threshold", type=float, default=1e-3)
-    parser.add_argument("--brc-early-stop-flip-threshold", type=float, default=0.0)
-    parser.add_argument("--brc-early-stop-margin-threshold", type=float, default=0.5)
-    parser.add_argument("--brc-early-stop-require-constraints", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--bdr-commit-steps", type=int, default=6)
+    parser.add_argument("--bdr-refine-steps", type=int, default=2)
+    parser.add_argument("--bdr-block-depth", type=int, default=1)
+    parser.add_argument("--bdr-hidden-state-dim", type=int, default=0)
+    parser.add_argument("--bdr-num-heads", type=int, default=4)
+    parser.add_argument("--bdr-mlp-ratio", type=int, default=2)
+    parser.add_argument("--bdr-local-kernel", type=int, default=3)
+    parser.add_argument("--bdr-attn-scale", type=float, default=0.2)
+    parser.add_argument("--bdr-local-scale", type=float, default=0.2)
+    parser.add_argument("--bdr-position-encoding", choices=("rope", "learned", "none"), default="rope")
+    parser.add_argument("--bdr-rms-norm-eps", type=float, default=1e-5)
+    parser.add_argument("--bdr-rope-theta", type=float, default=10000.0)
+    parser.add_argument("--bdr-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
+    parser.add_argument("--bdr-update-rule", choices=("energy", "velocity"), default="energy")
+    parser.add_argument("--bdr-update-step-size", type=float, default=0.3)
+    parser.add_argument("--bdr-path-energy-weight", type=float, default=1e-4)
+    parser.add_argument("--bdr-fixed-point-update-weight", type=float, default=0.0)
+    parser.add_argument("--bdr-fixed-point-label-smoothing", type=float, default=1e-3)
+    parser.add_argument("--bdr-wrong-attractor-rank-weight", type=float, default=0.0)
+    parser.add_argument("--bdr-wrong-attractor-direction-weight", type=float, default=0.0)
+    parser.add_argument("--bdr-wrong-attractor-nonzero-weight", type=float, default=0.0)
+    parser.add_argument("--bdr-wrong-attractor-rank-margin", type=float, default=1.0)
+    parser.add_argument("--bdr-wrong-attractor-update-floor", type=float, default=0.5)
+    parser.add_argument("--bdr-corrupted-recovery-weight", type=float, default=0.0)
+    parser.add_argument("--bdr-early-stop-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--bdr-early-stop-min-steps", type=int, default=4)
+    parser.add_argument("--bdr-early-stop-patience", type=int, default=2)
+    parser.add_argument("--bdr-early-stop-distribution-delta-threshold", type=float, default=1e-3)
+    parser.add_argument("--bdr-early-stop-flip-threshold", type=float, default=0.0)
+    parser.add_argument("--bdr-early-stop-margin-threshold", type=float, default=0.5)
+    parser.add_argument("--bdr-early-stop-require-constraints", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
     parser.add_argument("--urm-l-cycles", type=int, default=6)
@@ -502,38 +509,38 @@ def build_config(
             no_act_continue=args.trm_no_act_continue,
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
-        brc=BRCConfig(
-            commit_steps=args.brc_commit_steps,
-            refine_steps=args.brc_refine_steps,
-            block_depth=args.brc_block_depth,
-            hidden_state_dim=args.brc_hidden_state_dim,
-            num_heads=args.brc_num_heads,
-            mlp_ratio=args.brc_mlp_ratio,
-            local_kernel=args.brc_local_kernel,
-            attn_scale=args.brc_attn_scale,
-            local_scale=args.brc_local_scale,
-            position_encoding=args.brc_position_encoding,
-            rms_norm_eps=args.brc_rms_norm_eps,
-            rope_theta=args.brc_rope_theta,
-            step_loss_schedule=args.brc_step_loss_schedule,
-            update_rule=args.brc_update_rule,
-            update_step_size=args.brc_update_step_size,
-            path_energy_weight=args.brc_path_energy_weight,
-            fixed_point_update_weight=args.brc_fixed_point_update_weight,
-            fixed_point_label_smoothing=args.brc_fixed_point_label_smoothing,
-            wrong_attractor_rank_weight=args.brc_wrong_attractor_rank_weight,
-            wrong_attractor_direction_weight=args.brc_wrong_attractor_direction_weight,
-            wrong_attractor_nonzero_weight=args.brc_wrong_attractor_nonzero_weight,
-            wrong_attractor_rank_margin=args.brc_wrong_attractor_rank_margin,
-            wrong_attractor_update_floor=args.brc_wrong_attractor_update_floor,
-            corrupted_recovery_weight=args.brc_corrupted_recovery_weight,
-            early_stop_enabled=args.brc_early_stop_enabled,
-            early_stop_min_steps=args.brc_early_stop_min_steps,
-            early_stop_patience=args.brc_early_stop_patience,
-            early_stop_distribution_delta_threshold=args.brc_early_stop_distribution_delta_threshold,
-            early_stop_flip_threshold=args.brc_early_stop_flip_threshold,
-            early_stop_margin_threshold=args.brc_early_stop_margin_threshold,
-            early_stop_require_constraints=args.brc_early_stop_require_constraints,
+        bdr=BDRConfig(
+            commit_steps=args.bdr_commit_steps,
+            refine_steps=args.bdr_refine_steps,
+            block_depth=args.bdr_block_depth,
+            hidden_state_dim=args.bdr_hidden_state_dim,
+            num_heads=args.bdr_num_heads,
+            mlp_ratio=args.bdr_mlp_ratio,
+            local_kernel=args.bdr_local_kernel,
+            attn_scale=args.bdr_attn_scale,
+            local_scale=args.bdr_local_scale,
+            position_encoding=args.bdr_position_encoding,
+            rms_norm_eps=args.bdr_rms_norm_eps,
+            rope_theta=args.bdr_rope_theta,
+            step_loss_schedule=args.bdr_step_loss_schedule,
+            update_rule=args.bdr_update_rule,
+            update_step_size=args.bdr_update_step_size,
+            path_energy_weight=args.bdr_path_energy_weight,
+            fixed_point_update_weight=args.bdr_fixed_point_update_weight,
+            fixed_point_label_smoothing=args.bdr_fixed_point_label_smoothing,
+            wrong_attractor_rank_weight=args.bdr_wrong_attractor_rank_weight,
+            wrong_attractor_direction_weight=args.bdr_wrong_attractor_direction_weight,
+            wrong_attractor_nonzero_weight=args.bdr_wrong_attractor_nonzero_weight,
+            wrong_attractor_rank_margin=args.bdr_wrong_attractor_rank_margin,
+            wrong_attractor_update_floor=args.bdr_wrong_attractor_update_floor,
+            corrupted_recovery_weight=args.bdr_corrupted_recovery_weight,
+            early_stop_enabled=args.bdr_early_stop_enabled,
+            early_stop_min_steps=args.bdr_early_stop_min_steps,
+            early_stop_patience=args.bdr_early_stop_patience,
+            early_stop_distribution_delta_threshold=args.bdr_early_stop_distribution_delta_threshold,
+            early_stop_flip_threshold=args.bdr_early_stop_flip_threshold,
+            early_stop_margin_threshold=args.bdr_early_stop_margin_threshold,
+            early_stop_require_constraints=args.bdr_early_stop_require_constraints,
         ),
         urm=URMConfig(
             recurrent_steps=args.urm_recurrent_steps,

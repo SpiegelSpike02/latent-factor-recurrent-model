@@ -16,7 +16,7 @@ from .recurrent.layers import (
 )
 
 
-class BRCLocalConvSwiGLU(nnx.Module):
+class BDRLocalConvSwiGLU(nnx.Module):
     def __init__(
         self,
         config: ModelConfig,
@@ -26,9 +26,9 @@ class BRCLocalConvSwiGLU(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ) -> None:
-        brc = config.brc_config
-        if brc.local_kernel < 1 or brc.local_kernel % 2 == 0:
-            raise ValueError("BRC local_kernel must be a positive odd integer")
+        bdr = config.bdr_config
+        if bdr.local_kernel < 1 or bdr.local_kernel % 2 == 0:
+            raise ValueError("BDR local_kernel must be a positive odd integer")
         self.config = config
         self.hidden_dim = hidden_dim
         self.dtype = dtype
@@ -45,7 +45,7 @@ class BRCLocalConvSwiGLU(nnx.Module):
         self.depthwise = nnx.Conv(
             intermediate_size,
             intermediate_size,
-            kernel_size=(brc.local_kernel, brc.local_kernel),
+            kernel_size=(bdr.local_kernel, bdr.local_kernel),
             padding="SAME",
             feature_group_count=intermediate_size,
             use_bias=True,
@@ -79,7 +79,7 @@ class BRCLocalConvSwiGLU(nnx.Module):
         return self.down(jax.nn.silu(x))
 
 
-class BRCSolverBlock(nnx.Module):
+class BDRSolverBlock(nnx.Module):
     def __init__(
         self,
         config: ModelConfig,
@@ -106,16 +106,16 @@ class BRCSolverBlock(nnx.Module):
             out_kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        brc = config.brc_config
-        self.attn_norm = unscaled_rms_norm(hidden_dim, brc.rms_norm_eps, dtype, rngs)
-        self.attn_context_norm = unscaled_rms_norm(hidden_dim, brc.rms_norm_eps, dtype, rngs)
-        self.local_norm = unscaled_rms_norm(hidden_dim, brc.rms_norm_eps, dtype, rngs)
-        self.local_context_norm = unscaled_rms_norm(hidden_dim, brc.rms_norm_eps, dtype, rngs)
-        self.attn_scale = float(brc.attn_scale)
-        self.local_scale = float(brc.local_scale)
+        bdr = config.bdr_config
+        self.attn_norm = unscaled_rms_norm(hidden_dim, bdr.rms_norm_eps, dtype, rngs)
+        self.attn_context_norm = unscaled_rms_norm(hidden_dim, bdr.rms_norm_eps, dtype, rngs)
+        self.local_norm = unscaled_rms_norm(hidden_dim, bdr.rms_norm_eps, dtype, rngs)
+        self.local_context_norm = unscaled_rms_norm(hidden_dim, bdr.rms_norm_eps, dtype, rngs)
+        self.attn_scale = float(bdr.attn_scale)
+        self.local_scale = float(bdr.local_scale)
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.local_mlp = BRCLocalConvSwiGLU(
+        self.local_mlp = BDRLocalConvSwiGLU(
             config,
             hidden_dim,
             mlp_ratio,
@@ -167,7 +167,7 @@ class BRCSolverBlock(nnx.Module):
             dtype=self.dtype,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
-            name="BRC state-conditioned attention",
+            name="BDR state-conditioned attention",
         )
         return (h.astype(jnp.float32) + self.attn_scale * attn.astype(jnp.float32)).astype(self.dtype)
 
@@ -189,12 +189,12 @@ class BRCSolverBlock(nnx.Module):
         return (h.astype(jnp.float32) + self.local_scale * local).astype(self.dtype)
 
 
-class BRCModel(nnx.Module):
+class BDRModel(nnx.Module):
     """Z-state recurrent solver for fixed-size grid reasoning tasks.
 
     The recurrent state stores centered answer logits ``z``. Its softmax is the
     per-cell explicit answer distribution view, which is read as a typed
-    hypothesis hint; BRC does not learn a separate per-cell confidence state.
+    hypothesis hint; BDR does not learn a separate per-cell confidence state.
     """
 
     def __init__(
@@ -204,69 +204,69 @@ class BRCModel(nnx.Module):
         *,
         rngs: nnx.Rngs,
     ) -> None:
-        if config.model_type != "brc":
-            raise ValueError("BRCModel requires model_type='brc'")
+        if config.model_type != "bdr":
+            raise ValueError("BDRModel requires model_type='bdr'")
         if config.grid_height * config.grid_width != config.seq_len:
             raise ValueError("grid_height * grid_width must equal seq_len")
         if config.task_type == "sudoku" and config.vocab_size != 9:
-            raise ValueError("BRC Sudoku expects output vocab_size=9")
-        brc = config.brc_config
-        if brc.commit_steps < 1:
-            raise ValueError("BRC commit_steps must be at least 1")
-        if min(brc.refine_steps, brc.block_depth) < 1:
-            raise ValueError("BRC refine_steps and block_depth must be at least 1")
-        hidden_dim = int(brc.hidden_state_dim) if brc.hidden_state_dim > 0 else config.d_model
+            raise ValueError("BDR Sudoku expects output vocab_size=9")
+        bdr = config.bdr_config
+        if bdr.commit_steps < 1:
+            raise ValueError("BDR commit_steps must be at least 1")
+        if min(bdr.refine_steps, bdr.block_depth) < 1:
+            raise ValueError("BDR refine_steps and block_depth must be at least 1")
+        hidden_dim = int(bdr.hidden_state_dim) if bdr.hidden_state_dim > 0 else config.d_model
         if hidden_dim < 1:
-            raise ValueError("BRC hidden_state_dim must be positive or 0 for d_model")
-        if brc.num_heads < 1:
-            raise ValueError("BRC num_heads must be at least 1")
-        if hidden_dim % brc.num_heads != 0:
-            raise ValueError("BRC hidden state dimension must be divisible by num_heads")
-        if brc.mlp_ratio < 1:
-            raise ValueError("BRC mlp_ratio must be at least 1")
-        if brc.local_kernel < 1 or brc.local_kernel % 2 == 0:
-            raise ValueError("BRC local_kernel must be a positive odd integer")
-        if brc.position_encoding not in ("rope", "learned", "none"):
-            raise ValueError("BRC position_encoding must be 'rope', 'learned', or 'none'")
-        if brc.position_encoding == "rope" and (hidden_dim // brc.num_heads) % 4 != 0:
-            raise ValueError("BRC axial RoPE head dimension must be divisible by 4")
-        if brc.step_loss_schedule not in ("uniform", "linear", "quadratic"):
-            raise ValueError("BRC step_loss_schedule must be 'uniform', 'linear', or 'quadratic'")
-        if brc.update_rule not in ("energy", "velocity"):
-            raise ValueError("BRC update_rule must be 'energy' or 'velocity'")
-        if brc.update_step_size <= 0.0:
-            raise ValueError("BRC update_step_size must be positive")
-        if brc.fixed_point_label_smoothing < 0.0 or brc.fixed_point_label_smoothing >= 1.0:
-            raise ValueError("BRC fixed_point_label_smoothing must be in [0, 1)")
+            raise ValueError("BDR hidden_state_dim must be positive or 0 for d_model")
+        if bdr.num_heads < 1:
+            raise ValueError("BDR num_heads must be at least 1")
+        if hidden_dim % bdr.num_heads != 0:
+            raise ValueError("BDR hidden state dimension must be divisible by num_heads")
+        if bdr.mlp_ratio < 1:
+            raise ValueError("BDR mlp_ratio must be at least 1")
+        if bdr.local_kernel < 1 or bdr.local_kernel % 2 == 0:
+            raise ValueError("BDR local_kernel must be a positive odd integer")
+        if bdr.position_encoding not in ("rope", "learned", "none"):
+            raise ValueError("BDR position_encoding must be 'rope', 'learned', or 'none'")
+        if bdr.position_encoding == "rope" and (hidden_dim // bdr.num_heads) % 4 != 0:
+            raise ValueError("BDR axial RoPE head dimension must be divisible by 4")
+        if bdr.step_loss_schedule not in ("uniform", "linear", "quadratic"):
+            raise ValueError("BDR step_loss_schedule must be 'uniform', 'linear', or 'quadratic'")
+        if bdr.update_rule not in ("energy", "velocity"):
+            raise ValueError("BDR update_rule must be 'energy' or 'velocity'")
+        if bdr.update_step_size <= 0.0:
+            raise ValueError("BDR update_step_size must be positive")
+        if bdr.fixed_point_label_smoothing < 0.0 or bdr.fixed_point_label_smoothing >= 1.0:
+            raise ValueError("BDR fixed_point_label_smoothing must be in [0, 1)")
         if min(
-            brc.path_energy_weight,
-            brc.fixed_point_update_weight,
-            brc.wrong_attractor_rank_weight,
-            brc.wrong_attractor_direction_weight,
-            brc.wrong_attractor_nonzero_weight,
-            brc.corrupted_recovery_weight,
+            bdr.path_energy_weight,
+            bdr.fixed_point_update_weight,
+            bdr.wrong_attractor_rank_weight,
+            bdr.wrong_attractor_direction_weight,
+            bdr.wrong_attractor_nonzero_weight,
+            bdr.corrupted_recovery_weight,
         ) < 0.0:
-            raise ValueError("BRC objective weights must be non-negative")
-        if brc.wrong_attractor_rank_margin < 0.0:
-            raise ValueError("BRC wrong_attractor_rank_margin must be non-negative")
-        if brc.wrong_attractor_update_floor < 0.0:
-            raise ValueError("BRC wrong_attractor_update_floor must be non-negative")
-        if brc.early_stop_min_steps < 1:
-            raise ValueError("BRC early_stop_min_steps must be at least 1")
-        if brc.early_stop_patience < 1:
-            raise ValueError("BRC early_stop_patience must be at least 1")
-        if brc.early_stop_distribution_delta_threshold < 0.0:
-            raise ValueError("BRC early_stop_distribution_delta_threshold must be non-negative")
-        if brc.early_stop_flip_threshold < 0.0:
-            raise ValueError("BRC early_stop_flip_threshold must be non-negative")
-        if brc.early_stop_margin_threshold < 0.0:
-            raise ValueError("BRC early_stop_margin_threshold must be non-negative")
+            raise ValueError("BDR objective weights must be non-negative")
+        if bdr.wrong_attractor_rank_margin < 0.0:
+            raise ValueError("BDR wrong_attractor_rank_margin must be non-negative")
+        if bdr.wrong_attractor_update_floor < 0.0:
+            raise ValueError("BDR wrong_attractor_update_floor must be non-negative")
+        if bdr.early_stop_min_steps < 1:
+            raise ValueError("BDR early_stop_min_steps must be at least 1")
+        if bdr.early_stop_patience < 1:
+            raise ValueError("BDR early_stop_patience must be at least 1")
+        if bdr.early_stop_distribution_delta_threshold < 0.0:
+            raise ValueError("BDR early_stop_distribution_delta_threshold must be non-negative")
+        if bdr.early_stop_flip_threshold < 0.0:
+            raise ValueError("BDR early_stop_flip_threshold must be non-negative")
+        if bdr.early_stop_margin_threshold < 0.0:
+            raise ValueError("BDR early_stop_margin_threshold must be non-negative")
         self.config = config
         self.runtime = runtime
-        self.brc = brc
-        self.commit_steps = int(brc.commit_steps)
+        self.bdr = bdr
+        self.commit_steps = int(bdr.commit_steps)
         self.total_steps = self.commit_steps
-        self.refine_steps = int(brc.refine_steps)
+        self.refine_steps = int(bdr.refine_steps)
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
@@ -309,15 +309,15 @@ class BRCModel(nnx.Module):
             embedding_init=embed_init,
             rngs=rngs,
         )
-        if brc.position_encoding == "learned":
+        if bdr.position_encoding == "learned":
             self.row_embed = nnx.Embed(config.grid_height, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
             self.col_embed = nnx.Embed(config.grid_width, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
             self.box_embed = nnx.Embed(self.num_boxes, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
-        if brc.position_encoding == "rope":
-            head_dim = self.hidden_dim // brc.num_heads
+        if bdr.position_encoding == "rope":
+            head_dim = self.hidden_dim // bdr.num_heads
             axis_dim = head_dim // 2
-            inv_freq = 1.0 / (brc.rope_theta ** (jnp.arange(0, axis_dim, 2, dtype=jnp.float32) / axis_dim))
+            inv_freq = 1.0 / (bdr.rope_theta ** (jnp.arange(0, axis_dim, 2, dtype=jnp.float32) / axis_dim))
             row_freqs = rows.astype(jnp.float32)[:, None] * inv_freq[None, :]
             col_freqs = cols.astype(jnp.float32)[:, None] * inv_freq[None, :]
             freqs = jnp.concatenate((row_freqs, col_freqs), axis=-1)
@@ -354,18 +354,18 @@ class BRCModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.update_readout_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
+        self.update_readout_norm = unscaled_rms_norm(self.hidden_dim, bdr.rms_norm_eps, self.dtype, rngs)
         self.solver_blocks = nnx.List(
             [
-                BRCSolverBlock(
+                BDRSolverBlock(
                     config,
                     self.hidden_dim,
-                    brc.num_heads,
-                    brc.mlp_ratio,
+                    bdr.num_heads,
+                    bdr.mlp_ratio,
                     self.dtype,
                     rngs=rngs,
                 )
-                for _ in range(brc.block_depth)
+                for _ in range(bdr.block_depth)
             ]
         )
         self.energy_state_to_hidden = nnx.Linear(
@@ -377,7 +377,7 @@ class BRCModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.energy_norm = unscaled_rms_norm(self.hidden_dim, brc.rms_norm_eps, self.dtype, rngs)
+        self.energy_norm = unscaled_rms_norm(self.hidden_dim, bdr.rms_norm_eps, self.dtype, rngs)
         self.energy_head = nnx.Linear(
             self.hidden_dim,
             1,
@@ -441,7 +441,7 @@ class BRCModel(nnx.Module):
 
     def _z_to_output_logits(self, z_logits: Array, tokens: Array) -> Array:
         del tokens
-        if self.brc.update_rule == "energy":
+        if self.bdr.update_rule == "energy":
             return self._distribution_from_logits(z_logits)
         return self._center_logits(z_logits)
 
@@ -449,7 +449,7 @@ class BRCModel(nnx.Module):
         return self._zero_z(tokens)
 
     def _position_embeddings(self) -> Array:
-        if self.brc.position_encoding != "learned":
+        if self.bdr.position_encoding != "learned":
             return jnp.zeros((self.config.seq_len, self.config.d_model), dtype=self.dtype)
         return (
             self.row_embed(self.row_ids)
@@ -572,7 +572,7 @@ class BRCModel(nnx.Module):
         current_distribution = jax.nn.softmax(current_logits, axis=-1)
         raw_velocity = self.velocity_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
         velocity = self._center_logits(raw_velocity)
-        raw_logit_step = float(self.brc.update_step_size) * velocity
+        raw_logit_step = float(self.bdr.update_step_size) * velocity
         logit_step = raw_logit_step
         next_logits = self._center_logits(current_logits + logit_step)
         next_distribution = jax.nn.softmax(next_logits, axis=-1)
@@ -586,7 +586,7 @@ class BRCModel(nnx.Module):
         logit_step_rms = jnp.sqrt(jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True) + 1e-12)
         path_energy = jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True)
         update_step_size = jnp.broadcast_to(
-            jnp.asarray(float(self.brc.update_step_size), dtype=jnp.float32),
+            jnp.asarray(float(self.bdr.update_step_size), dtype=jnp.float32),
             (*current_logits.shape[:-1], 1),
         )
         diagnostics = {
@@ -617,9 +617,9 @@ class BRCModel(nnx.Module):
         energy_value = energy_cells[..., None]
         energy_grad = self._center_logits(energy_vjp(jnp.ones_like(energy_cells))[0])
         descent_direction = -energy_grad
-        logit_step = float(self.brc.update_step_size) * descent_direction
+        logit_step = float(self.bdr.update_step_size) * descent_direction
         update_step_size = jnp.broadcast_to(
-            jnp.asarray(float(self.brc.update_step_size), dtype=jnp.float32),
+            jnp.asarray(float(self.bdr.update_step_size), dtype=jnp.float32),
             (*current_logits.shape[:-1], 1),
         )
         next_logits = self._center_logits(current_logits + logit_step)
@@ -717,7 +717,7 @@ class BRCModel(nnx.Module):
         )
         read_state = self._update_read_state(hidden_state)
         del step_index
-        if self.brc.update_rule == "velocity":
+        if self.bdr.update_rule == "velocity":
             z, update_diagnostics, update_distributions = self._velocity_step_from_read_state(z, read_state)
         else:
             z, update_diagnostics, update_distributions = self._energy_descent_from_read_state(z, read_state)
@@ -730,7 +730,7 @@ class BRCModel(nnx.Module):
 
     def target_z_logits(self, targets: Array) -> Array:
         """Return centered logits for the smoothed fixed-point answer distribution."""
-        smoothing = float(self.brc.fixed_point_label_smoothing)
+        smoothing = float(self.bdr.fixed_point_label_smoothing)
         labels = jnp.clip(targets.astype(jnp.int32), 0, self.q_vocab_size - 1)
         target_distribution = (
             (1.0 - smoothing) * jax.nn.one_hot(labels, self.q_vocab_size, dtype=jnp.float32)
@@ -846,7 +846,7 @@ class BRCModel(nnx.Module):
             stop_hidden_between_steps=True,
         )
         current_logits = self._center_logits(z_logits)
-        if self.brc.update_rule == "velocity":
+        if self.bdr.update_rule == "velocity":
             next_logits, diagnostics, update_distributions = self._velocity_step_from_read_state(current_logits, read_state)
         else:
             next_logits, diagnostics, update_distributions = self._energy_descent_from_read_state(current_logits, read_state)
@@ -860,13 +860,13 @@ class BRCModel(nnx.Module):
             example_mask = example_mask & (~exact)
         example_weight = example_mask.astype(jnp.float32)
         normalizer = jnp.maximum(jnp.sum(example_weight), 1.0)
-        if self.brc.update_rule == "energy":
+        if self.bdr.update_rule == "energy":
             target_distribution = self._distribution_from_logits(target_logits)
             target_energy_cell = self._energy_per_cell_from_read_state(target_distribution, read_state).astype(jnp.float32)
             current_energy = self._masked_per_example_mean(current_energy_cell, mask)
             target_energy = self._masked_per_example_mean(target_energy_cell, mask)
             rank_loss = jnp.sum(
-                jax.nn.relu(float(self.brc.wrong_attractor_rank_margin) + target_energy - current_energy)
+                jax.nn.relu(float(self.bdr.wrong_attractor_rank_margin) + target_energy - current_energy)
                 * example_weight
             ) / normalizer
             energy_gap = jnp.sum((current_energy - target_energy) * example_weight) / normalizer
@@ -874,7 +874,7 @@ class BRCModel(nnx.Module):
             rank_loss = jnp.asarray(0.0, dtype=jnp.float32)
             energy_gap = jnp.asarray(0.0, dtype=jnp.float32)
 
-        if self.brc.update_rule == "energy":
+        if self.bdr.update_rule == "energy":
             current_distribution, next_distribution = update_distributions
             update_direction = next_distribution - current_distribution
             target_direction = target_distribution - current_distribution
@@ -886,7 +886,7 @@ class BRCModel(nnx.Module):
 
         update_rms = self._masked_per_example_mean(diagnostics["update_rms"][..., 0], mask)
         nonzero_loss = jnp.sum(
-            jnp.square(jax.nn.relu(float(self.brc.wrong_attractor_update_floor) - update_rms))
+            jnp.square(jax.nn.relu(float(self.bdr.wrong_attractor_update_floor) - update_rms))
             * example_weight
         ) / normalizer
         active_rate = jnp.mean(example_weight)
@@ -931,7 +931,7 @@ class BRCModel(nnx.Module):
         )
 
         wrong_labels = jnp.mod(targets.astype(jnp.int32) + 1, self.q_vocab_size)
-        smoothing = float(self.brc.fixed_point_label_smoothing)
+        smoothing = float(self.bdr.fixed_point_label_smoothing)
         wrong_distribution = (
             (1.0 - smoothing) * jax.nn.one_hot(wrong_labels, self.q_vocab_size, dtype=jnp.float32)
             + smoothing / float(self.q_vocab_size)
@@ -1013,14 +1013,14 @@ class BRCModel(nnx.Module):
             constraint_ok = self._sudoku_constraint_ok(new_pred, inputs)
         else:
             constraint_ok = jnp.ones((inputs.shape[0],), dtype=bool)
-        if not bool(self.brc.early_stop_require_constraints):
+        if not bool(self.bdr.early_stop_require_constraints):
             constraint_ok = jnp.ones_like(constraint_ok)
         stable = (
-            bool(self.brc.early_stop_enabled)
-            & (new_steps >= int(self.brc.early_stop_min_steps))
-            & (distribution_delta <= float(self.brc.early_stop_distribution_delta_threshold))
-            & (flip_rate <= float(self.brc.early_stop_flip_threshold))
-            & (margin_min >= float(self.brc.early_stop_margin_threshold))
+            bool(self.bdr.early_stop_enabled)
+            & (new_steps >= int(self.bdr.early_stop_min_steps))
+            & (distribution_delta <= float(self.bdr.early_stop_distribution_delta_threshold))
+            & (flip_rate <= float(self.bdr.early_stop_flip_threshold))
+            & (margin_min >= float(self.bdr.early_stop_margin_threshold))
             & constraint_ok
         )
         diagnostics = {
@@ -1054,7 +1054,7 @@ class BRCModel(nnx.Module):
             self.puzzle_embed(token_ids.astype(jnp.int32))
             + self.context_embed(context.astype(jnp.int32))
         )
-        if self.brc.position_encoding == "learned":
+        if self.bdr.position_encoding == "learned":
             base_embeddings = base_embeddings + self._position_embeddings()[None, :, :]
         return base_embeddings, context
 
@@ -1131,7 +1131,7 @@ class BRCModel(nnx.Module):
             update_distributions,
         )
         stable_steps = jnp.where(early_stop, stable_steps + 1, 0)
-        stable_reset = stable_steps >= int(self.brc.early_stop_patience)
+        stable_reset = stable_steps >= int(self.bdr.early_stop_patience)
         next_reset = is_last_step | stable_reset
         new_carry = {
             "z": jax.lax.stop_gradient(next_z),

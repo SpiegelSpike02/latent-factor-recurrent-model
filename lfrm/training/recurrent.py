@@ -22,6 +22,8 @@ def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
     puzzle_lr_schedule = scheduled_lr(
         peak_value=config.optimizer.puzzle_embed_learning_rate,
         min_ratio=config.optimizer.lr_min_ratio,
+        mid_ratio=config.optimizer.lr_mid_ratio,
+        mid_fraction=config.optimizer.lr_mid_fraction,
         warmup_steps=max(1, config.optimizer.lr_warmup_steps),
         optimizer_updates=max(1, config.train.optimizer_updates),
     )

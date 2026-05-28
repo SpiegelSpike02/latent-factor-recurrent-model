@@ -153,7 +153,7 @@ CORE_SCALAR_METRICS = (
     "final_path_recall",
     "final_path_f1",
 )
-BRC_SCALAR_METRICS = (
+BDR_SCALAR_METRICS = (
     "loss",
     "ce_loss",
     "final_ce_loss",
@@ -254,7 +254,7 @@ LEGACY_METRIC_NAMES = {
     "q_confidence",
     "distribution_delta",
 }
-BRC_CONSOLE_GROUPS = (
+BDR_CONSOLE_GROUPS = (
     (
         "objective",
         (
@@ -358,9 +358,9 @@ TRM_CONSOLE_GROUPS = (
     ("halt", ("selected_step", "oracle_step", "act_step", "halted_rate", "selected_accuracy", "selected_exact_accuracy")),
     ("dynamics", ("unroll_steps", "terminal_belief_delta", "terminal_belief_mse")),
 )
-METRIC_GROUPS = BRC_CONSOLE_GROUPS
+METRIC_GROUPS = BDR_CONSOLE_GROUPS
 CONSOLE_GROUPS_BY_MODEL = {
-    "brc": BRC_CONSOLE_GROUPS,
+    "bdr": BDR_CONSOLE_GROUPS,
     "trm": TRM_CONSOLE_GROUPS,
     "urm": TRM_CONSOLE_GROUPS,
 }
@@ -390,8 +390,8 @@ def metric_display_name(name: str) -> str:
 
 
 def scalar_metric_names(config) -> tuple[str, ...]:
-    names = list(BRC_SCALAR_METRICS if config.model.model_type == "brc" else CORE_SCALAR_METRICS)
-    if config.model.model_type == "brc" and config.model.task_type != "sudoku":
+    names = list(BDR_SCALAR_METRICS if config.model.model_type == "bdr" else CORE_SCALAR_METRICS)
+    if config.model.model_type == "bdr" and config.model.task_type != "sudoku":
         names = [
             name for name in names
             if "context_" not in name

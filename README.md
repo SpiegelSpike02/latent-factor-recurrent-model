@@ -1,27 +1,27 @@
 # Recurrent Grid Reasoning
 
 This is a JAX + `flax.nnx` research codebase for recurrent reasoning on 2D grid
-tasks. The current Sudoku MVP is BRC-Sudoku, a belief-first recurrent solver
-that keeps working memory out of the latent controller.
+tasks. The current Sudoku MVP is BDR-Sudoku, a belief-first recurrent solver
+that studies learned dynamics over an explicit answer belief.
 
-- `brc_sudoku`: the current Sudoku path. It uses digit belief logits, recurrent
-  spatial hidden state, relation-typed attention, a small controller latent, and
-  an independent verifier/energy model.
+- `bdr_sudoku`: the current Sudoku path. It uses digit belief logits, recurrent
+  spatial hidden state, local convolutional mixing, global attention, and either
+  velocity or energy-gradient belief updates.
 - `trm`: a Tiny Recursive Model baseline.
 
-The BRC design separates state by capacity: size-growing information lives in
-`B` (explicit output belief) and `H` (spatial hidden field), while `z` is a small
-controller that only modulates update dynamics. Sudoku supplies a relation
-schema `G` with `self`, `same_row`, `same_col`, and `same_box`; the learned
-verifier `E` ranks hard candidates and can conservatively refine belief logits.
+BDR means Belief Dynamics Reasoner. The design separates explicit answer state
+from recurrent computation. The persistent answer coordinate is centered logits
+`z`; its softmax `q` is the per-cell probability view used by the loss and by
+the recurrent solver. The separate hidden field `h` carries grid computation.
+The current energy branch learns a scalar energy over candidate distributions
+and updates `z` by a mirror-descent-like step; the velocity branch learns a free
+logit-space update field.
 
-BRC-Sudoku does not use clue-dropout pseudo-labels, symbolic traces, DSL rules,
-or a hand-written Sudoku checker in the loss. Training uses a single
-step-weighted unknown-cell CE schedule with stronger late-step weights, mixed
-answer-belief starts (`full_mask`/teacher/self-conditioned/corrupt), digit
-permutation augmentation, and verifier hard negatives. Verifier margin training
-uses detached model-generated fakes; generator-side verifier use is handled
-separately through energy minimization or belief refinement.
+BDR-Sudoku does not use clue-dropout pseudo-labels, symbolic traces, DSL rules,
+or a hand-written Sudoku checker in the loss. Training uses step-carry
+recurrence, supervised CE over target cells, digit permutation augmentation,
+energy/path diagnostics, and optional fixed-point, wrong-attractor, and
+corrupted-recovery auxiliary losses.
 
 A short architecture overview lives in [docs/architecture.md](docs/architecture.md).
 
@@ -29,7 +29,7 @@ A short architecture overview lives in [docs/architecture.md](docs/architecture.
 
 The implementation lives under the `lfrm` package:
 
-- `lfrm.models`: BRC-Sudoku and TRM models
+- `lfrm.models`: BDR-Sudoku and TRM models
 - `lfrm.datasets`: generic grid dataset loading plus Sudoku/Maze dataset building
 - `lfrm.training`: optimizer, loss, metrics, and checkpoint helpers
 - `lfrm.scripts`: console-script entry points
@@ -74,24 +74,24 @@ uv run lfrm-build-arc \
   --num-aug 1000
 ```
 
-Train BRC-Sudoku:
+Train BDR-Sudoku:
 
 ```bash
-uv run lfrm-train --config configs/sudoku_brc.toml
+uv run lfrm-train --config configs/sudoku_bdr.toml
 ```
 
 CLI flags override config values:
 
 ```bash
-uv run lfrm-train --config configs/sudoku_brc.toml --learning-rate 1e-4 --batch-size 16
+uv run lfrm-train --config configs/sudoku_bdr.toml --learning-rate 1e-4 --batch-size 16
 ```
 
-BRC-Sudoku recurrent supervision is controlled by `model.brc.step_loss_weights`,
-one relative CE weight per recurrent step. The weights are normalized internally.
+BDR-Sudoku recurrent supervision is controlled by `model.bdr.step_loss_schedule`,
+which selects how per-step CE terms are normalized across commit steps.
 TRM/URM official ACT configs do not use step-weighted dense supervision; dense
-unroll remains a separate experimental path. BRC-Sudoku additionally reports
-given consistency, invalid-board rate, row/column/box conflict count, verifier
-ranking accuracy, and belief/refinement diagnostics.
+unroll remains a separate experimental path. BDR-Sudoku additionally reports
+given consistency, row/column/box conflict count, target probability, update
+size, distribution movement, and energy-gradient diagnostics.
 
 The package also applies project-level JAX defaults before JAX initializes:
 Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, the XLA GPU
@@ -119,5 +119,5 @@ as a `jax-profile` artifact. Disable with `--no-profile-enabled` or
 - Sudoku derives blank-cell supervision from token `1`; Maze writes an explicit
   `given_mask.npy` so known walls, start, and goal cells are treated as givens,
   while open cells are supervised as path/non-path decisions.
-- Old Sudoku LFRM/Mini-GLIDER configs are not compatible with the current
-  BRC-Sudoku path. The TRM Sudoku baseline config is still available.
+- Old Sudoku LFRM/Mini-GLIDER/BDR-prototype configs are not compatible with the current
+  BDR-Sudoku path. The TRM Sudoku baseline config is still available.

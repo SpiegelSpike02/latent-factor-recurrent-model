@@ -15,7 +15,7 @@ from lfrm.config import (
     DataConfig,
     EvalConfig,
     ExperimentConfig,
-    BRCConfig,
+    BDRConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
@@ -33,9 +33,9 @@ from lfrm.runtime import (
     small_metric_items,
     updates_from_epochs,
 )
-from lfrm.models import BRCModel, TinyRecursiveModel
+from lfrm.models import BDRModel, TinyRecursiveModel
 from lfrm.training import (
-    build_brc_step_carry_train_step_runner,
+    build_bdr_step_carry_train_step_runner,
     build_train_step_runner,
     build_trm_act_train_step_runner,
     create_model,
@@ -149,7 +149,7 @@ class GridModelTests(unittest.TestCase):
         self.assertAlmostEqual(float(metrics["accuracy"]), 0.75, places=6)
         self.assertAlmostEqual(float(metrics["exact_accuracy"]), 0.5, places=6)
 
-    def test_create_model_supports_trm_and_brc(self) -> None:
+    def test_create_model_supports_trm_and_bdr(self) -> None:
         trm_config = ExperimentConfig(
             model=ModelConfig(
                 vocab_size=11,
@@ -168,17 +168,17 @@ class GridModelTests(unittest.TestCase):
             wandb=WandbConfig(),
         )
         self.assertIsInstance(create_model(trm_config), TinyRecursiveModel)
-        brc_config = ExperimentConfig(
+        bdr_config = ExperimentConfig(
             model=ModelConfig(
                 vocab_size=9,
                 input_vocab_size=10,
-                model_type="brc",
+                model_type="bdr",
                 seq_len=81,
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
                 rollout_steps=1,
-                brc=BRCConfig(commit_steps=1, num_heads=4),
+                bdr=BDRConfig(commit_steps=1, num_heads=4),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),
@@ -186,7 +186,7 @@ class GridModelTests(unittest.TestCase):
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
         )
-        self.assertIsInstance(create_model(brc_config), BRCModel)
+        self.assertIsInstance(create_model(bdr_config), BDRModel)
         invalid = ExperimentConfig(
             model=ModelConfig(vocab_size=11, model_type="legacy_shared_block"),
             optimizer=OptimizerConfig(),
@@ -195,7 +195,7 @@ class GridModelTests(unittest.TestCase):
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
         )
-        with self.assertRaisesRegex(ValueError, "brc"):
+        with self.assertRaisesRegex(ValueError, "bdr"):
             create_model(invalid)
 
     def test_stablemax_forward_backward_are_finite(self) -> None:
@@ -293,18 +293,18 @@ class GridModelTests(unittest.TestCase):
         )
         self.assertEqual(logits.shape, (1, 1, 9, 11))
 
-    def test_brc_forward_is_finite_without_optional_energy(self) -> None:
-        model = BRCModel(
+    def test_bdr_forward_is_finite_without_optional_energy(self) -> None:
+        model = BDRModel(
             ModelConfig(
                 vocab_size=9,
                 input_vocab_size=10,
-                model_type="brc",
+                model_type="bdr",
                 seq_len=81,
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
                 rollout_steps=2,
-                brc=BRCConfig(
+                bdr=BDRConfig(
                     commit_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
@@ -340,18 +340,18 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(diagnostics["q_top1_probability"].shape, (2,))
         self.assertEqual(final_only_diagnostics["q_top1_probability"].shape, (2,))
 
-    def test_brc_initial_z_is_uniform(self) -> None:
-        model = BRCModel(
+    def test_bdr_initial_z_is_uniform(self) -> None:
+        model = BDRModel(
             ModelConfig(
                 vocab_size=9,
                 input_vocab_size=10,
-                model_type="brc",
+                model_type="bdr",
                 seq_len=81,
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
                 rollout_steps=3,
-                brc=BRCConfig(
+                bdr=BDRConfig(
                     commit_steps=3,
                     num_heads=4,
                     mlp_ratio=1,
@@ -366,17 +366,17 @@ class GridModelTests(unittest.TestCase):
         q_view = model._distribution_from_logits(initial_z)
         self.assertTrue(bool(jnp.allclose(q_view, jnp.full_like(q_view, 1.0 / 9.0))))
 
-    def test_brc_energy_step_updates_probability_simplex(self) -> None:
-        model = BRCModel(
+    def test_bdr_energy_step_updates_probability_simplex(self) -> None:
+        model = BDRModel(
             ModelConfig(
                 vocab_size=5,
-                model_type="brc",
+                model_type="bdr",
                 task=TaskConfig(type="arc"),
                 seq_len=4,
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                brc=BRCConfig(
+                bdr=BDRConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -407,17 +407,17 @@ class GridModelTests(unittest.TestCase):
         expected_path_energy = jnp.mean(jnp.square(next_distribution - current_distribution), axis=-1, keepdims=True)
         self.assertTrue(bool(jnp.allclose(diagnostics["path_energy"], expected_path_energy, rtol=1e-5, atol=1e-6)))
 
-    def test_brc_energy_outputs_probabilities_for_loss(self) -> None:
-        model = BRCModel(
+    def test_bdr_energy_outputs_probabilities_for_loss(self) -> None:
+        model = BDRModel(
             ModelConfig(
                 vocab_size=5,
-                model_type="brc",
+                model_type="bdr",
                 task=TaskConfig(type="arc"),
                 seq_len=4,
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                brc=BRCConfig(
+                bdr=BDRConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -447,17 +447,17 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.isfinite(zero_loss)))
         self.assertLess(float(zero_grad[0, 0, 0]), 0.0)
 
-    def test_brc_energy_attractor_direction_uses_distribution_delta(self) -> None:
-        model = BRCModel(
+    def test_bdr_energy_attractor_direction_uses_distribution_delta(self) -> None:
+        model = BDRModel(
             ModelConfig(
                 vocab_size=5,
-                model_type="brc",
+                model_type="bdr",
                 task=TaskConfig(type="arc"),
                 seq_len=4,
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                brc=BRCConfig(
+                bdr=BDRConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -495,18 +495,18 @@ class GridModelTests(unittest.TestCase):
         self.assertGreaterEqual(float(terms["direction_cosine"]), -1.0)
         self.assertLessEqual(float(terms["direction_cosine"]), 1.0)
 
-    def test_brc_losses_are_finite(self) -> None:
-        model = BRCModel(
+    def test_bdr_losses_are_finite(self) -> None:
+        model = BDRModel(
             ModelConfig(
                 vocab_size=9,
                 input_vocab_size=10,
-                model_type="brc",
+                model_type="bdr",
                 seq_len=81,
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
                 rollout_steps=2,
-                brc=BRCConfig(
+                bdr=BDRConfig(
                     commit_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
@@ -561,11 +561,11 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(metrics["per_step_q_top1_probability"].shape, (2,))
         self.assertEqual(metrics["step_loss_weights"].shape, (2,))
 
-    def test_brc_arc_canvas_belief_loss_is_finite(self) -> None:
-        model = BRCModel(
+    def test_bdr_arc_canvas_belief_loss_is_finite(self) -> None:
+        model = BDRModel(
             ModelConfig(
                 vocab_size=12,
-                model_type="brc",
+                model_type="bdr",
                 task=TaskConfig(type="arc"),
                 seq_len=16,
                 grid_height=4,
@@ -573,7 +573,7 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 rollout_steps=2,
                 loss_type="stablemax",
-                brc=BRCConfig(
+                bdr=BDRConfig(
                     commit_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
@@ -597,18 +597,18 @@ class GridModelTests(unittest.TestCase):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
 
-    def test_brc_train_step_updates_parameters(self) -> None:
+    def test_bdr_train_step_updates_parameters(self) -> None:
         config = ExperimentConfig(
             model=ModelConfig(
                 vocab_size=9,
                 input_vocab_size=10,
-                model_type="brc",
+                model_type="bdr",
                 seq_len=81,
                 grid_height=9,
                 grid_width=9,
                 d_model=16,
                 rollout_steps=1,
-                brc=BRCConfig(
+                bdr=BDRConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -623,7 +623,7 @@ class GridModelTests(unittest.TestCase):
         model = create_model(config)
         self.assertNotIn("init_hidden", str(nnx.state(model, nnx.Param)))
         optimizer = create_optimizer(model, config)
-        train_step = build_brc_step_carry_train_step_runner()
+        train_step = build_bdr_step_carry_train_step_runner()
         puzzle = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
         solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
         tokens = _sudoku_input_tokens(puzzle)
@@ -942,17 +942,17 @@ class GridModelTests(unittest.TestCase):
 
     def test_num_heads_must_divide_d_model(self) -> None:
         with self.assertRaisesRegex(ValueError, "divisible by num_heads"):
-            BRCModel(
+            BDRModel(
                 ModelConfig(
                     vocab_size=9,
                     input_vocab_size=10,
-                    model_type="brc",
+                    model_type="bdr",
                     seq_len=81,
                     grid_height=9,
                     grid_width=9,
                     d_model=10,
                     rollout_steps=1,
-                    brc=BRCConfig(commit_steps=1, num_heads=4),
+                    bdr=BDRConfig(commit_steps=1, num_heads=4),
                 ),
                 RuntimeConfig(compute_dtype="float32"),
                 rngs=nnx.Rngs(0),
@@ -963,7 +963,7 @@ class GridModelTests(unittest.TestCase):
             config_path = Path(tmpdir) / "legacy.toml"
             config_path.write_text(
                 "[model]\n"
-                "model_type = \"brc\"\n"
+                "model_type = \"bdr\"\n"
                 "legacy_field = \"old\"\n",
                 encoding="utf-8",
             )
@@ -979,18 +979,18 @@ class GridModelTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unsupported \\[train\\] field"):
                 load_toml_config(str(train_legacy_path))
 
-    def test_config_loader_accepts_brc_and_trm_step_weights(self) -> None:
+    def test_config_loader_accepts_bdr_and_trm_step_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "brc.toml"
+            config_path = Path(tmpdir) / "bdr.toml"
             config_path.write_text(
                 "[task]\n"
                 "type = \"sudoku\"\n"
                 "\n"
                 "[model]\n"
-                "model_type = \"brc\"\n"
+                "model_type = \"bdr\"\n"
                 "d_model = 16\n"
                 "\n"
-                "[model.brc]\n"
+                "[model.bdr]\n"
                 "commit_steps = 4\n"
                 "refine_steps = 4\n"
                 "block_depth = 1\n"
@@ -999,25 +999,25 @@ class GridModelTests(unittest.TestCase):
                 "step_loss_schedule = \"quadratic\"\n"
                 "update_step_size = 0.4\n"
                 "\n"
-                "[model.brc.objective]\n"
+                "[model.bdr.objective]\n"
                 "path_energy_weight = 0.0001\n"
                 "fixed_point_update_weight = 0.0002\n"
                 "fixed_point_label_smoothing = 0.002\n",
                 encoding="utf-8",
             )
             loaded = load_toml_config(str(config_path))
-            self.assertEqual(loaded["model_type"], "brc")
+            self.assertEqual(loaded["model_type"], "bdr")
             self.assertEqual(loaded["task_type"], "sudoku")
-            self.assertEqual(loaded["brc_commit_steps"], 4)
-            self.assertEqual(loaded["brc_refine_steps"], 4)
-            self.assertEqual(loaded["brc_block_depth"], 1)
-            self.assertEqual(loaded["brc_hidden_state_dim"], 16)
-            self.assertEqual(loaded["brc_num_heads"], 4)
-            self.assertEqual(loaded["brc_step_loss_schedule"], "quadratic")
-            self.assertEqual(loaded["brc_update_step_size"], 0.4)
-            self.assertEqual(loaded["brc_path_energy_weight"], 0.0001)
-            self.assertEqual(loaded["brc_fixed_point_update_weight"], 0.0002)
-            self.assertEqual(loaded["brc_fixed_point_label_smoothing"], 0.002)
+            self.assertEqual(loaded["bdr_commit_steps"], 4)
+            self.assertEqual(loaded["bdr_refine_steps"], 4)
+            self.assertEqual(loaded["bdr_block_depth"], 1)
+            self.assertEqual(loaded["bdr_hidden_state_dim"], 16)
+            self.assertEqual(loaded["bdr_num_heads"], 4)
+            self.assertEqual(loaded["bdr_step_loss_schedule"], "quadratic")
+            self.assertEqual(loaded["bdr_update_step_size"], 0.4)
+            self.assertEqual(loaded["bdr_path_energy_weight"], 0.0001)
+            self.assertEqual(loaded["bdr_fixed_point_update_weight"], 0.0002)
+            self.assertEqual(loaded["bdr_fixed_point_label_smoothing"], 0.002)
 
             eval_config_path = Path(tmpdir) / "eval.toml"
             eval_config_path.write_text(

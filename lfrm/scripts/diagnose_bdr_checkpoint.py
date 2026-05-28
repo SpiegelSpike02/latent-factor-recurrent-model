@@ -31,14 +31,14 @@ def _load_config(config_path: str, *, batch_size: int, commit_steps: int | None)
         num_puzzle_identifiers=dataset.spec.num_puzzle_identifiers,
         seq_len=dataset.spec.seq_len,
     )
-    if config.model.model_type != "brc":
-        raise ValueError("This diagnostic script expects model_type='brc'")
-    brc = config.model.brc_config
+    if config.model.model_type != "bdr":
+        raise ValueError("This diagnostic script expects model_type='bdr'")
+    bdr = config.model.bdr_config
     if commit_steps is not None:
-        brc = replace(brc, commit_steps=commit_steps)
+        bdr = replace(bdr, commit_steps=commit_steps)
     config = replace(
         config,
-        model=replace(config.model, brc=brc),
+        model=replace(config.model, bdr=bdr),
         train=replace(config.train, batch_size=batch_size),
         runtime=replace(config.runtime, data_parallel_devices=1, prefetch_depth=1, prefetch_workers=1),
     )
@@ -220,9 +220,9 @@ def build_diagnostic_runner(model):
 
         wrong_labels = jnp.mod(targets + 1, model.q_vocab_size)
         wrong_distribution = (
-            (1.0 - float(model.brc.fixed_point_label_smoothing))
+            (1.0 - float(model.bdr.fixed_point_label_smoothing))
             * jax.nn.one_hot(wrong_labels, model.q_vocab_size, dtype=jnp.float32)
-            + float(model.brc.fixed_point_label_smoothing) / float(model.q_vocab_size)
+            + float(model.bdr.fixed_point_label_smoothing) / float(model.q_vocab_size)
         )
         wrong_logits = model._center_logits(jnp.log(jnp.maximum(wrong_distribution, model.output_logit_eps)))
         wrong_hidden = model.initial_hidden_state(tokens, wrong_logits, base_embeddings, train=False, dropout_key=jax.random.key(0))
@@ -281,8 +281,8 @@ def _print_table(results: dict[str, float]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Diagnose BRC checkpoint attractors on a fixed batch.")
-    parser.add_argument("--config", default="configs/sudoku_brc.toml")
+    parser = argparse.ArgumentParser(description="Diagnose BDR checkpoint attractors on a fixed batch.")
+    parser.add_argument("--config", default="configs/sudoku_bdr.toml")
     parser.add_argument("--checkpoint", required=True, help="Concrete step_N checkpoint path.")
     parser.add_argument("--split", choices=("train", "eval"), default="eval")
     parser.add_argument("--index", type=int, default=0)

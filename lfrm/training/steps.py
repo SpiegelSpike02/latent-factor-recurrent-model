@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from lfrm.models import BRCModel, TinyRecursiveModel, UnifiedReasoningModel
+from lfrm.models import BDRModel, TinyRecursiveModel, UnifiedReasoningModel
 from lfrm.training.factory import GridReasoningModel
 from lfrm.training.losses import (
     output_probabilities,
@@ -64,7 +64,7 @@ def _permute_sudoku_digits(
 
 
 def _sudoku_board_metrics(
-    model: BRCModel,
+    model: BDRModel,
     predictions: jax.Array,
     inputs: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
@@ -101,7 +101,7 @@ def _sudoku_board_metrics(
     return context_consistency, conflicts
 
 
-def _brc_region_masks(model: BRCModel, inputs: jax.Array, loss_mask: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _bdr_region_masks(model: BDRModel, inputs: jax.Array, loss_mask: jax.Array) -> tuple[jax.Array, jax.Array]:
     if model.config.task_type != "sudoku":
         zero_context = jnp.zeros_like(loss_mask, dtype=jnp.float32)
         return zero_context, (loss_mask > 0.0).astype(jnp.float32)
@@ -138,11 +138,11 @@ def _normalized_step_loss_weights(configured: tuple[float, ...] | None, rollout_
     return weights / jnp.maximum(jnp.sum(weights), 1e-6)
 
 
-def _brc_step_loss_weights(model: BRCModel, rollout_steps: int) -> jax.Array:
+def _bdr_step_loss_weights(model: BDRModel, rollout_steps: int) -> jax.Array:
     progress = jnp.arange(1, rollout_steps + 1, dtype=jnp.float32) / float(rollout_steps)
-    if model.brc.step_loss_schedule == "quadratic":
+    if model.bdr.step_loss_schedule == "quadratic":
         weights = jnp.square(progress)
-    elif model.brc.step_loss_schedule == "linear":
+    elif model.bdr.step_loss_schedule == "linear":
         weights = progress
     else:
         weights = jnp.ones((rollout_steps,), dtype=jnp.float32)
@@ -160,14 +160,14 @@ def _trm_selected_step(halt_logits: jax.Array) -> jax.Array:
     return jnp.argmax(step_halted.astype(jnp.int32), axis=0)
 
 
-def brc_loss_and_metrics(
-    model: BRCModel,
+def bdr_loss_and_metrics(
+    model: BDRModel,
     batch: dict[str, jax.Array],
     train: bool,
     dropout_key: jax.Array | None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     if train:
-        raise ValueError("BRC training uses step-carry only; dense BRC training has been removed")
+        raise ValueError("BDR training uses step-carry only; dense BDR training has been removed")
     if dropout_key is None:
         dropout_key = jax.random.key(0)
     augment_key, solve_key, terminal_key, attractor_key = jax.random.split(dropout_key, 4)
@@ -183,7 +183,7 @@ def brc_loss_and_metrics(
     example_mask = _example_mask(batch, targets)
     loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
     zero = jnp.asarray(0.0, dtype=jnp.float32)
-    context_mask, query_mask = _brc_region_masks(model, inputs, loss_mask)
+    context_mask, query_mask = _bdr_region_masks(model, inputs, loss_mask)
     metric_loss_mask = loss_mask
 
     initial_z = model.initial_z(inputs)
@@ -200,11 +200,11 @@ def brc_loss_and_metrics(
     token_loss = token_cross_entropy(model, step_logits, step_targets)
     per_step_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=(1, 2)) / normalizer
     final_logits = step_logits[-1]
-    step_loss_weights = _brc_step_loss_weights(model, per_step_loss.shape[0])
+    step_loss_weights = _bdr_step_loss_weights(model, per_step_loss.shape[0])
     step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
     per_step_path_energy = diagnostics["path_energy"].astype(jnp.float32)
     path_energy_loss = jnp.sum(step_loss_weights * per_step_path_energy)
-    if float(model.brc.fixed_point_update_weight) != 0.0:
+    if float(model.bdr.fixed_point_update_weight) != 0.0:
         fixed_point_update_loss = model.fixed_point_update_loss(
             inputs,
             targets,
@@ -215,10 +215,10 @@ def brc_loss_and_metrics(
     else:
         fixed_point_update_loss = zero
     if (
-        float(model.brc.wrong_attractor_rank_weight) != 0.0
-        or float(model.brc.wrong_attractor_direction_weight) != 0.0
-        or float(model.brc.wrong_attractor_nonzero_weight) != 0.0
-        or float(model.brc.corrupted_recovery_weight) != 0.0
+        float(model.bdr.wrong_attractor_rank_weight) != 0.0
+        or float(model.bdr.wrong_attractor_direction_weight) != 0.0
+        or float(model.bdr.wrong_attractor_nonzero_weight) != 0.0
+        or float(model.bdr.corrupted_recovery_weight) != 0.0
     ):
         base_embeddings, _context = model.context_memory(inputs)
         probe_hidden = model.initial_hidden_state(
@@ -253,12 +253,12 @@ def brc_loss_and_metrics(
     solution_loss = per_step_loss[-1]
     loss = (
         step_ce_loss
-        + float(model.brc.path_energy_weight) * path_energy_loss
-        + float(model.brc.fixed_point_update_weight) * fixed_point_update_loss
-        + float(model.brc.wrong_attractor_rank_weight) * attractor_losses["wrong_attractor_rank_loss"]
-        + float(model.brc.wrong_attractor_direction_weight) * attractor_losses["wrong_attractor_direction_loss"]
-        + float(model.brc.wrong_attractor_nonzero_weight) * attractor_losses["wrong_attractor_nonzero_loss"]
-        + float(model.brc.corrupted_recovery_weight) * attractor_losses["corrupted_recovery_loss"]
+        + float(model.bdr.path_energy_weight) * path_energy_loss
+        + float(model.bdr.fixed_point_update_weight) * fixed_point_update_loss
+        + float(model.bdr.wrong_attractor_rank_weight) * attractor_losses["wrong_attractor_rank_loss"]
+        + float(model.bdr.wrong_attractor_direction_weight) * attractor_losses["wrong_attractor_direction_loss"]
+        + float(model.bdr.wrong_attractor_nonzero_weight) * attractor_losses["wrong_attractor_nonzero_loss"]
+        + float(model.bdr.corrupted_recovery_weight) * attractor_losses["corrupted_recovery_loss"]
     )
 
     predictions = _output_predictions_to_tokens(model, final_logits)
@@ -350,8 +350,8 @@ def brc_loss_and_metrics(
     return loss, metrics
 
 
-def brc_carry_loss_and_metrics(
-    model: BRCModel,
+def bdr_carry_loss_and_metrics(
+    model: BDRModel,
     carry: dict[str, jax.Array],
     batch: dict[str, jax.Array],
     train: bool,
@@ -375,7 +375,7 @@ def brc_carry_loss_and_metrics(
     ce_loss = jnp.sum(token_loss * loss_mask.astype(jnp.float32)) / normalizer
     predictions = _output_predictions_to_tokens(model, logits)
     metric_correct = (predictions == targets).astype(jnp.float32) * loss_mask.astype(jnp.float32)
-    context_mask, query_mask = _brc_region_masks(model, inputs, loss_mask)
+    context_mask, query_mask = _bdr_region_masks(model, inputs, loss_mask)
     accuracy = jnp.sum(metric_correct) / normalizer
     context_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
     query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
@@ -394,7 +394,7 @@ def brc_carry_loss_and_metrics(
     context_target_probability = _masked_probability(target_probability_cells, context_mask)
     query_target_probability = _masked_probability(target_probability_cells, query_mask)
     path_energy_loss = diagnostics["path_energy"].astype(jnp.float32)
-    if float(model.brc.fixed_point_update_weight) != 0.0:
+    if float(model.bdr.fixed_point_update_weight) != 0.0:
         fixed_point_update_loss = model.fixed_point_update_loss(
             inputs,
             targets,
@@ -405,10 +405,10 @@ def brc_carry_loss_and_metrics(
     else:
         fixed_point_update_loss = jnp.asarray(0.0, dtype=jnp.float32)
     if (
-        float(model.brc.wrong_attractor_rank_weight) != 0.0
-        or float(model.brc.wrong_attractor_direction_weight) != 0.0
-        or float(model.brc.wrong_attractor_nonzero_weight) != 0.0
-        or float(model.brc.corrupted_recovery_weight) != 0.0
+        float(model.bdr.wrong_attractor_rank_weight) != 0.0
+        or float(model.bdr.wrong_attractor_direction_weight) != 0.0
+        or float(model.bdr.wrong_attractor_nonzero_weight) != 0.0
+        or float(model.bdr.corrupted_recovery_weight) != 0.0
     ):
         attractor_losses = model.attractor_recovery_losses(
             inputs,
@@ -435,12 +435,12 @@ def brc_carry_loss_and_metrics(
         }
     loss = (
         ce_loss
-        + float(model.brc.path_energy_weight) * path_energy_loss
-        + float(model.brc.fixed_point_update_weight) * fixed_point_update_loss
-        + float(model.brc.wrong_attractor_rank_weight) * attractor_losses["wrong_attractor_rank_loss"]
-        + float(model.brc.wrong_attractor_direction_weight) * attractor_losses["wrong_attractor_direction_loss"]
-        + float(model.brc.wrong_attractor_nonzero_weight) * attractor_losses["wrong_attractor_nonzero_loss"]
-        + float(model.brc.corrupted_recovery_weight) * attractor_losses["corrupted_recovery_loss"]
+        + float(model.bdr.path_energy_weight) * path_energy_loss
+        + float(model.bdr.fixed_point_update_weight) * fixed_point_update_loss
+        + float(model.bdr.wrong_attractor_rank_weight) * attractor_losses["wrong_attractor_rank_loss"]
+        + float(model.bdr.wrong_attractor_direction_weight) * attractor_losses["wrong_attractor_direction_loss"]
+        + float(model.bdr.wrong_attractor_nonzero_weight) * attractor_losses["wrong_attractor_nonzero_loss"]
+        + float(model.bdr.corrupted_recovery_weight) * attractor_losses["corrupted_recovery_loss"]
     )
     metrics = {
         "loss": loss,
@@ -501,9 +501,9 @@ def loss_and_metrics(
     halt_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    if isinstance(model, BRCModel):
+    if isinstance(model, BDRModel):
         del terminal_residual_weight
-        return brc_loss_and_metrics(
+        return bdr_loss_and_metrics(
             model,
             batch,
             train,

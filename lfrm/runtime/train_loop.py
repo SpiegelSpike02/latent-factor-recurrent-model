@@ -34,7 +34,7 @@ from lfrm.runtime.sharding import (
 )
 from lfrm.training import (
     build_ema_update_runner,
-    build_brc_step_carry_train_step_runner,
+    build_bdr_step_carry_train_step_runner,
     build_state_copy_runner,
     build_eval_step_runner,
     build_train_step_runner,
@@ -123,20 +123,20 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
             raise ValueError("profile_start_step must be positive when profiling is enabled")
         if config.runtime.profile_steps <= 0:
             raise ValueError("profile_steps must be positive when profiling is enabled")
-    if config.model.model_type not in ("trm", "urm", "brc") and config.train.train_mode != "act":
+    if config.model.model_type not in ("trm", "urm", "bdr") and config.train.train_mode != "act":
         raise ValueError("train_mode is only supported for recurrent model types")
-    if config.train.train_mode == "step_carry" and config.model.model_type != "brc":
-        raise ValueError("train_mode='step_carry' is currently only implemented for model_type='brc'")
-    if config.model.model_type == "brc" and config.train.train_mode != "step_carry":
-        raise ValueError("BRC training supports only train_mode='step_carry'")
+    if config.train.train_mode == "step_carry" and config.model.model_type != "bdr":
+        raise ValueError("train_mode='step_carry' is currently only implemented for model_type='bdr'")
+    if config.model.model_type == "bdr" and config.train.train_mode != "step_carry":
+        raise ValueError("BDR training supports only train_mode='step_carry'")
 
 
 def training_uses_carry(config: ExperimentConfig) -> bool:
-    return config.model.model_type in ("brc", "trm", "urm") and config.train.train_mode in ("act", "step_carry")
+    return config.model.model_type in ("bdr", "trm", "urm") and config.train.train_mode in ("act", "step_carry")
 
 
 def halt_loss_weight_for_mode(config: ExperimentConfig) -> float:
-    if config.model.model_type == "brc":
+    if config.model.model_type == "bdr":
         return 0.0
     return config.train.halt_loss_weight
 
@@ -156,8 +156,8 @@ def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size
 
 def build_step_runners(config: ExperimentConfig):
     halt_loss_weight = halt_loss_weight_for_mode(config)
-    if config.model.model_type == "brc":
-        train_step_fn = build_brc_step_carry_train_step_runner()
+    if config.model.model_type == "bdr":
+        train_step_fn = build_bdr_step_carry_train_step_runner()
         eval_step_fn = build_eval_step_runner(
             halt_loss_weight,
             config.train.terminal_residual_weight,
@@ -266,7 +266,7 @@ def log_train_metrics(
         )
     )
     train_summary = optional_summary_log("train", host_metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
-    if config.model.model_type != "brc":
+    if config.model.model_type != "bdr":
         for metric_name, log_name in PER_STEP_SCALAR_SERIES:
             if metric_name in host_metrics:
                 train_log.update(flatten_step_metrics(f"train/{log_name}", list(host_metrics[metric_name])))
@@ -431,7 +431,7 @@ def run_training(
 
     current_batch = prefetcher.next()
     use_step_carry = training_uses_carry(config)
-    console_model_label = "brc" if config.model.model_type == "brc" else config.model.model_type
+    console_model_label = "bdr" if config.model.model_type == "bdr" else config.model.model_type
     train_carry = place_tree(model.initial_carry(current_batch), data_sharding) if use_step_carry else None
     eval_steps = eval_update_steps(config)
     profile_active = False

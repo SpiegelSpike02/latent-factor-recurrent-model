@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from lfrm.training.checkpointing import build_ema_update_runner, build_state_copy_runner, load_checkpoint, save_checkpoint
-from lfrm.training.brc import (
-    build_brc_step_carry_train_step_runner,
+from lfrm.training.bdr import (
+    build_bdr_step_carry_train_step_runner,
     build_eval_step_runner,
     build_train_step_runner,
 )
@@ -25,7 +25,7 @@ from lfrm.training.recurrent import (
     build_trm_eval_step_runner,
 )
 from lfrm.training.steps import (
-    brc_loss_and_metrics,
+    bdr_loss_and_metrics,
     loss_and_metrics,
     trm_act_loss_and_metrics,
     trm_dense_unroll_loss_and_metrics,
@@ -34,9 +34,9 @@ from lfrm.training.steps import (
 
 __all__ = [
     "GridReasoningModel",
-    "brc_loss_and_metrics",
+    "bdr_loss_and_metrics",
     "build_ema_update_runner",
-    "build_brc_step_carry_train_step_runner",
+    "build_bdr_step_carry_train_step_runner",
     "build_state_copy_runner",
     "build_eval_step_runner",
     "build_optimizer",

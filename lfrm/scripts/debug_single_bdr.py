@@ -12,7 +12,7 @@ import numpy as np
 
 from lfrm.cli import build_config, build_parser, load_toml_config
 from lfrm.datasets import load_dataset
-from lfrm.training.brc import build_brc_step_carry_train_step_runner
+from lfrm.training.bdr import build_bdr_step_carry_train_step_runner
 from lfrm.training.factory import create_model, create_optimizer
 
 
@@ -30,12 +30,12 @@ def _load_config(config_path: str, *, steps: int, commit_steps: int | None, batc
         num_puzzle_identifiers=dataset.spec.num_puzzle_identifiers,
         seq_len=dataset.spec.seq_len,
     )
-    if config.model.model_type != "brc" or config.task.type != "sudoku":
-        raise ValueError("This debug script expects a sudoku BRC config")
-    brc = config.model.brc_config
+    if config.model.model_type != "bdr" or config.task.type != "sudoku":
+        raise ValueError("This debug script expects a sudoku BDR config")
+    bdr = config.model.bdr_config
     if commit_steps is not None:
-        brc = replace(brc, commit_steps=commit_steps)
-    model = replace(config.model, brc=brc)
+        bdr = replace(bdr, commit_steps=commit_steps)
+    model = replace(config.model, bdr=bdr)
     train = replace(
         config.train,
         batch_size=batch_size,
@@ -122,8 +122,8 @@ def _metric(metrics: dict[str, object], name: str, default: float = 0.0) -> floa
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Debug BRC step-carry on a fixed sudoku mini-batch.")
-    parser.add_argument("--config", default="configs/sudoku_brc.toml")
+    parser = argparse.ArgumentParser(description="Debug BDR step-carry on a fixed sudoku mini-batch.")
+    parser.add_argument("--config", default="configs/sudoku_bdr.toml")
     parser.add_argument("--split", choices=("train", "eval"), default="train")
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -144,12 +144,12 @@ def main() -> None:
     batch_host = jax.device_get(batch)
     model = create_model(config)
     optimizer = create_optimizer(model, config)
-    train_step = build_brc_step_carry_train_step_runner()
+    train_step = build_bdr_step_carry_train_step_runner()
     carry = model.initial_carry(batch)
     key = jax.random.key(args.seed)
 
     log_path = Path(args.log_path) if args.log_path else Path("debug_logs") / (
-        f"single_brc_step_carry_{args.split}_{args.index}_b{args.batch_size}_{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+        f"single_bdr_step_carry_{args.split}_{args.index}_b{args.batch_size}_{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
 

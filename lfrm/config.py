@@ -30,7 +30,7 @@ class TRMConfig:
 
 
 @dataclass(frozen=True)
-class BRCConfig:
+class BDRConfig:
     commit_steps: int = 6
     refine_steps: int = 2
     block_depth: int = 1
@@ -85,7 +85,7 @@ class URMConfig:
 class ModelConfig:
     vocab_size: int
     input_vocab_size: int | None = None
-    model_type: str = "brc"
+    model_type: str = "bdr"
     num_puzzle_identifiers: int = 1
     seq_len: int = 81
     grid_height: int = 9
@@ -96,7 +96,7 @@ class ModelConfig:
     loss_type: str = "softmax"
     task: TaskConfig | None = None
     trm: TRMConfig | None = None
-    brc: BRCConfig | None = None
+    bdr: BDRConfig | None = None
     urm: URMConfig | None = None
 
     @property
@@ -108,8 +108,8 @@ class ModelConfig:
         return self.trm or TRMConfig()
 
     @property
-    def brc_config(self) -> BRCConfig:
-        return self.brc or BRCConfig()
+    def bdr_config(self) -> BDRConfig:
+        return self.bdr or BDRConfig()
 
     @property
     def urm_config(self) -> URMConfig:

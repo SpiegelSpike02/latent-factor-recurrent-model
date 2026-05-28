@@ -13,7 +13,7 @@ import numpy as np
 
 from lfrm.cli import build_config, build_parser, load_toml_config
 from lfrm.datasets import load_dataset
-from lfrm.training.brc import build_brc_step_carry_train_step_runner
+from lfrm.training.bdr import build_bdr_step_carry_train_step_runner
 from lfrm.training.factory import create_model, create_optimizer
 
 
@@ -73,18 +73,18 @@ def _load_config(
         num_puzzle_identifiers=dataset.spec.num_puzzle_identifiers,
         seq_len=dataset.spec.seq_len,
     )
-    if config.model.model_type != "brc":
-        raise ValueError("This sweep expects model_type='brc'")
-    brc = replace(
-        config.model.brc_config,
+    if config.model.model_type != "bdr":
+        raise ValueError("This sweep expects model_type='bdr'")
+    bdr = replace(
+        config.model.bdr_config,
         update_rule=update_rule,
         update_step_size=update_step_size,
     )
     if commit_steps is not None:
-        brc = replace(brc, commit_steps=commit_steps)
+        bdr = replace(bdr, commit_steps=commit_steps)
     config = replace(
         config,
-        model=replace(config.model, brc=brc),
+        model=replace(config.model, bdr=bdr),
         train=replace(
             config.train,
             batch_size=batch_size,
@@ -167,11 +167,11 @@ def _run_trial(
     batch = _make_batch(dataset, split=split, index=index, batch_size=batch_size)
     model = create_model(config)
     optimizer = create_optimizer(model, config)
-    train_step = build_brc_step_carry_train_step_runner()
+    train_step = build_bdr_step_carry_train_step_runner()
     carry = model.initial_carry(batch)
     key = jax.random.key(seed)
 
-    tag = f"{update_rule}_eta{update_step_size:g}_b{batch_size}_u{steps}_c{config.model.brc_config.commit_steps}_s{seed}"
+    tag = f"{update_rule}_eta{update_step_size:g}_b{batch_size}_u{steps}_c{config.model.bdr_config.commit_steps}_s{seed}"
     log_path = output_dir / f"{tag}.jsonl"
     rows: list[dict[str, float]] = []
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -191,7 +191,7 @@ def _run_trial(
                     "step": float(step),
                     "update_rule": update_rule,
                     "update_step_size": float(update_step_size),
-                    "commit_steps": float(config.model.brc_config.commit_steps),
+                    "commit_steps": float(config.model.bdr_config.commit_steps),
                 }
                 row.update({name: _metric(host_metrics, name) for name in KEY_METRICS})
                 rows.append(row)
@@ -205,7 +205,7 @@ def _run_trial(
             "log_path": str(log_path),
             "steps": steps,
             "batch_size": batch_size,
-            "commit_steps": config.model.brc_config.commit_steps,
+            "commit_steps": config.model.bdr_config.commit_steps,
             "seed": seed,
         }
     )
@@ -237,9 +237,9 @@ def _print_summary(summaries: list[dict[str, Any]]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a very short BRC sweep and summarize train metrics.")
-    parser.add_argument("--config", default="configs/sudoku_brc.toml")
-    parser.add_argument("--output-dir", default="logs/ablations/short_brc_sweep")
+    parser = argparse.ArgumentParser(description="Run a very short BDR sweep and summarize train metrics.")
+    parser.add_argument("--config", default="configs/sudoku_bdr.toml")
+    parser.add_argument("--output-dir", default="logs/ablations/short_bdr_sweep")
     parser.add_argument("--update-rule", choices=("energy", "velocity"), default="energy")
     parser.add_argument("--update-step-sizes", type=float, nargs="+", default=[0.1, 0.2, 0.3, 0.5])
     parser.add_argument("--steps", type=int, default=64)

@@ -1,63 +1,57 @@
 [data]
-dataset_path = "data/sudoku-extreme-1k-aug-1000"
+dataset_path = "data/arc1concept-aug-1000"
 
 [task]
-type = "sudoku"
+type = "arc"
 
 [model]
-model_type = "brc"
-seq_len = 81
-grid_height = 9
-grid_width = 9
+model_type = "bdr"
+seq_len = 900
+grid_height = 30
+grid_width = 30
 d_model = 512
+rollout_steps = 16
 dropout_rate = 0.0
 loss_type = "softmax"
 
-[model.brc]
+[model.bdr]
 
-[model.brc.dynamics]
+[model.bdr.dynamics]
 commit_steps = 48
 refine_steps = 4
 block_depth = 2
 step_loss_schedule = "uniform"
-update_rule = "energy"
 update_step_size = 0.3
 
-[model.brc.objective]
+[model.bdr.objective]
 path_energy_weight = 0.0
-fixed_point_update_weight = 1e-3
+fixed_point_update_weight = 3e-4
 fixed_point_label_smoothing = 3e-3
-wrong_attractor_rank_weight = 1e-3
-wrong_attractor_direction_weight = 5e-2
-wrong_attractor_nonzero_weight = 1e-2
-wrong_attractor_rank_margin = 1.0
-wrong_attractor_update_floor = 0.5
-corrupted_recovery_weight = 2e-2
 
-[model.brc.early_stop]
+[model.bdr.early_stop]
 early_stop_enabled = true
 early_stop_min_steps = 4
 early_stop_patience = 2
 early_stop_distribution_delta_threshold = 1e-3
 early_stop_flip_threshold = 0.0
 early_stop_margin_threshold = 0.5
-early_stop_require_constraints = true
+early_stop_require_constraints = false
 
-[model.brc.hidden]
-hidden_state_dim = 512
+[model.bdr.hidden]
+hidden_state_dim = 256
 num_heads = 8
 mlp_ratio = 4
 local_kernel = 3
-attn_scale = 1.0
-local_scale = 1.0
+attn_scale = 0.2
+local_scale = 0.2
 rms_norm_eps = 1e-5
 
-[model.brc.position]
+[model.bdr.position]
 position_encoding = "rope"
 rope_theta = 10000.0
 
 [optimizer]
-optimizer_type = "adamw"
+optimizer_type = "adam_atan2"
 learning_rate = 1e-4
 lr_min_ratio = 1.0
 beta1 = 0.9
@@ -68,7 +62,7 @@ grad_clip_norm = 1.0
 
 [train]
 batch_size = 768
-epochs = 50000
+epochs = 100000
 log_epochs = 10
 train_mode = "step_carry"
 seed = 0
@@ -94,5 +88,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-brc-energy-eta03-c48-r4-d2-b768"
+name = "arc1-bdr-core-c48-r4-d2-b768"
 mode = "online"

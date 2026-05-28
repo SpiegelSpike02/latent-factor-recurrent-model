@@ -1,156 +1,118 @@
-# BRC Architecture
+# BDR Architecture
 
-BRC means Belief-Controller Reasoner. The central split is:
-
-```text
-B = explicit output belief / working answer state
-H = spatial hidden field / local computation state
-z = small latent controller / update modulation
-G = relation schema / communication graph
-E = learned verifier or energy model
-```
-
-Anything that grows with the output size belongs in `B` or `H`. The latent `z`
-must stay small and only control how the solver updates state. It should not
-store a compressed answer, act as a slot cache, or directly decode output cells.
-
-## Sudoku MVP
-
-The current implemented path is `brc_sudoku`:
+BDR means Belief Dynamics Reasoner. The name is meant to describe the current
+model directly: the recurrent computation learns dynamics over an explicit
+answer belief rather than routing through a separate controller state.
 
 ```text
-C = puzzle givens
-G = self, same_row, same_col, same_box
-B_t = [batch, 81, 9] digit belief logits
-P_t = softmax(B_t / tau_t) soft digit distribution
-H_t = [batch, 81, d_model] recurrent spatial field
-z = z_global + q(C)
-E = independent relation-typed verifier
+z_t = centered answer logits, shape [batch, cells, symbols]
+q_t = softmax(z_t), the probability view of the answer state
+h_t = recurrent hidden grid field
+C   = fixed puzzle/context tokens and given-mask information
+F   = shared local/global recurrent solver
 ```
 
-Each recurrent step embeds the puzzle, given flags, position/schema ids, time,
-and `P_t`. A shared relation-typed solver block performs message passing over
-the Sudoku schema and updates `H`; the token head emits a belief-logit delta,
-and givens are clamped back into `B`.
+The persistent answer state is `z_t`; `q_t` is derived when the model needs a
+probability distribution. Keeping logits as the stored coordinate avoids simplex
+constraints during updates, while keeping `q_t` as the semantic view gives the
+loss and diagnostics direct probabilistic meaning.
 
-`B_t` is the recurrent answer state and is updated additively as logits. `P_t`
-is derived from `B_t` only when a probability distribution is needed, such as
-for soft draft embeddings or soft verifier inputs. Given cells are clamped in
-logit space with large finite logits for the clue digit and low finite logits
-for the other digits.
+## Sudoku Path
 
-The solver avoids early hard locking. `B` stays continuous through the recurrent
-loop, with sharpening only near the final steps. Hard boards are decoded at the
-end or supplied to the verifier for ranking.
-
-## Controller
-
-The controller latent is intentionally weak:
+The current implemented path is `bdr_sudoku`:
 
 ```text
-allowed: FiLM scale/shift, recurrent gates, conservative latent fitting
-disallowed: direct output logits, large key-value memory, slot-style answer cache
+C         = puzzle givens
+z_0       = zero centered logits, equivalent to uniform q_0
+q_t       = softmax(z_t)
+h_t       = [batch, 81, hidden_dim] recurrent spatial field
+read_t    = F(C, q_t, h_t)
+z_{t+1}   = update(z_t, read_t)
 ```
 
-Sudoku has fixed rules, so the main inference state is `B`, not `z`. The code
-keeps verifier-guided latent fitting optional and conservative through low inner
-step counts, gradient clipping, and a prior penalty.
+Each commit step embeds the puzzle context and a compact feature view of the
+current belief. The shared solver mixes information with global attention and a
+local convolutional SwiGLU block. The read state is then converted into one of
+two update rules.
 
-For the Sudoku MVP, verifier-guided latent fitting is not the main path.
-`meta_outer_loss` is currently disabled in the default BRC config; z fitting is a
-later ablation after the B/H recurrent belief solver and verifier ranking are
-healthy.
-
-## Verifier
-
-The verifier has its own relation-typed recurrent core. It may share the
-high-level schema but not the solver recurrent block, so it is less likely to
-inherit the generator's exact failure modes.
-
-It supports hard candidates for ranking and soft candidate distributions for
-gradient-based belief refinement. Training negatives include random/corrupted
-boards plus detached model early/final samples.
-
-The verifier margin loss trains the verifier by enforcing:
+Velocity mode learns a direct centered logit-space vector field:
 
 ```text
-E(puzzle, true_solution) < E(puzzle, fake_candidate)
+z_{t+1} = center(z_t + eta * v(read_t))
 ```
 
-Model-generated fake candidates are detached for this loss. The margin loss is
-not used as a generator objective, because backpropagating it into the generator
-would push the generator to increase the energy of its own fake samples. If the
-generator uses verifier signal, it should do so through a separate energy
-minimization or belief refinement objective:
+Energy mode learns a scalar energy over candidate distributions and follows the
+negative energy gradient in the logit coordinate:
 
 ```text
-minimize_B E(puzzle, softmax(B))
+E_t(q)     = energy(read_t, q)
+g_t        = center(dE_t(q_t) / dq_t)
+z_{t+1}    = center(z_t - eta * g_t)
+q_{t+1}    = softmax(z_{t+1})
 ```
 
-When belief refinement is enabled, verifier training should include soft model
-beliefs in addition to hard boards; otherwise gradients through soft candidates
-may be unreliable.
+This makes energy mode closer to mirror descent or exponentiated-gradient
+dynamics. It is not a proof of global convergence, because `read_t` is
+recomputed after every step, but it gives the model a useful language for fixed
+points, wrong attractors, and recovery directions.
+
+## State Semantics
+
+BDR does not treat logits and probabilities as interchangeable names for the
+same thing. They play different roles:
+
+- `z_t` is the stored dual coordinate used for additive updates.
+- `q_t` is the probability view used for targets, confidence, energy candidates,
+  and most diagnostics.
+- `h_t` is the hidden computation field, not an answer cache.
+
+The initial answer state is exactly uniform because `z_0` is all zeros. This is
+kept as logits rather than as a mutable probability array because it makes both
+velocity and energy updates unconstrained while preserving the same semantic
+initial belief.
 
 ## Training
 
-BRC-Sudoku uses:
+BDR-Sudoku uses step-carry training. Instead of unrolling all commit steps inside
+one large training example, the training loop carries `z` and `h` across
+optimizer updates and resets examples when a new puzzle is loaded or when the
+early-stop diagnostic marks the current state stable.
 
-- a single step-weighted solution CE schedule over recurrent steps
-- mixed belief starts: full mask, partially masked true solution,
-  self-conditioned model belief, and corrupted solution belief
-- digit permutation augmentation
-- verifier margin loss with hard negatives
-- optional meta loss after conservative verifier-guided latent fitting
+The main loss is cross entropy on supervised cells. Sudoku givens are always
+available as conditioning context; they are reported through consistency metrics
+rather than used to inflate a clue-copying score. The current energy
+configuration also supports:
 
-The main CE is computed on the original unknown cells. Givens are always visible
-as conditions and are clamped during belief updates; they are used for
-consistency checks rather than as the dominant supervised signal. This avoids
-inflating training or eval metrics by rewarding clue copying.
+- fixed-point update loss near the target state
+- wrong-attractor rank, direction, and nonzero-update losses
+- corrupted-recovery loss from synthetic corrupted states
+- path-energy and update-size diagnostics
 
-`model.brc.step_loss_weights` controls the recurrent supervision schedule.
-Weights are normalized internally and the default schedule increases toward late
-steps, so early steps learn useful intermediate belief while late/final steps
-carry the strongest final-solve pressure.
+Digit permutation augmentation is a default training condition for Sudoku,
+because digit labels are symbols rather than ordered semantic values.
 
-The denoising loss is answer-belief denoising, not clue denoising. Full puzzle
-givens remain visible as conditions; the corrupted or masked object is the
-answer belief draft. In particular, BRC-Sudoku does not mask out a subset of
-givens and train the model to predict those clues.
+## Metrics
 
-Digit permutation augmentation is a default training condition, not a cosmetic
-augmentation. Sudoku digits are symbols, so the model should not rely on fixed
-semantic differences between labels like 1 and 9.
+The primary training diagnostics are query accuracy, query target probability,
+exact accuracy, Sudoku conflict count, update RMS, distribution total-variation
+movement, and energy-gradient RMS. Exact solving remains the strict metric; cell
+accuracy and query probability are useful mainly for understanding whether the
+belief dynamics are improving before complete boards are solved.
 
-Sudoku datasets are assumed to contain unique-solution puzzles. If a dataset can
-have multiple valid completions, exact match CE and full-board exact accuracy
-must be interpreted carefully and supplemented with valid-solution metrics.
-
-Core metrics are full-board solved rate, given consistency, invalid-board rate,
-row/column/box conflict count, verifier ranking accuracy, and oracle-step
-diagnostics. For multi-candidate inference, the key diagnostic is oracle top-k
-accuracy versus verifier top-1 accuracy:
-
-```text
-oracle top-k high, verifier top-1 low -> generator can produce the solution, ranker is weak
-oracle top-k low                     -> recurrent belief solver/generator is weak
-```
-
-Cell accuracy is treated as secondary because it can look high even when
-full-board exact accuracy is poor.
+For energy mode, the wrong-attractor losses are especially important. If the
+target energy is not below carried wrong states, the learned energy landscape is
+not yet aligned with the desired fixed point even if CE improves.
 
 ## Generalization Target
 
-Sudoku is the fixed-rule, fixed-size first case. The same state split is meant
-to extend to:
+Sudoku is the fixed-size first case. The same state split is intended to extend
+to other grid tasks:
 
 ```text
-Maze:   local relation schema, variable-size B/H, weak z
-ARC:    demo-conditioned z_episode, output belief B, verifier/reranking
+Maze: output belief over path/non-path or cell labels, spatial hidden field
+ARC:  demo-conditioned context plus explicit output-grid belief
 ```
 
-The rule of thumb is:
-
-```text
-single fixed-rule instance -> refine B first
-few-shot demonstrations    -> fit z_episode, then refine B
-```
+The common rule is: keep the answer-sized object explicit, keep the hidden field
+for computation, and make the learned dynamics accountable through probabilities
+and update diagnostics.

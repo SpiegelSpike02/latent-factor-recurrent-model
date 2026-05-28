@@ -26,8 +26,8 @@ def stablemax_cross_entropy_with_integer_labels(logits: jax.Array, targets: jax.
 
 def outputs_are_probabilities(model: object) -> bool:
     return (
-        getattr(getattr(model, "config", None), "model_type", None) == "brc"
-        and getattr(getattr(model, "brc", None), "update_rule", None) == "energy"
+        getattr(getattr(model, "config", None), "model_type", None) == "bdr"
+        and getattr(getattr(model, "bdr", None), "update_rule", None) == "energy"
     )
 
 
