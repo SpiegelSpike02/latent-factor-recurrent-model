@@ -448,9 +448,9 @@ class BDRModel(nnx.Module):
 
     def _zero_z(self, tokens: Array) -> Array:
         # Zero centered logits represent the uniform answer distribution.
-        return jnp.zeros(
+        return jnp.broadcast_to(
+            jnp.zeros_like(tokens[..., None], dtype=jnp.float32),
             (*tokens.shape, self.q_vocab_size),
-            dtype=jnp.float32,
         )
 
     def _z_to_output_logits(self, z_logits: Array, tokens: Array) -> Array:
@@ -491,7 +491,7 @@ class BDRModel(nnx.Module):
         )
         margin = self._top2_margin(q_view)
         step_progress = (step_index.astype(jnp.float32) + 1.0) / float(self.total_steps)
-        step_progress = jnp.broadcast_to(step_progress, z_logits.shape[:1])
+        step_progress = jnp.zeros_like(z_logits[:, 0, 0], dtype=jnp.float32) + step_progress
         progress = jnp.broadcast_to(step_progress[:, None, None], entropy.shape)
         scalar_features = jnp.concatenate(
             (
@@ -1049,7 +1049,10 @@ class BDRModel(nnx.Module):
         dropout_key: Array | None,
     ) -> Array:
         del z, base_embeddings, train, dropout_key
-        return jnp.zeros((tokens.shape[0], self.config.seq_len, self.hidden_dim), dtype=self.dtype)
+        return jnp.broadcast_to(
+            jnp.zeros_like(tokens[..., None], dtype=self.dtype),
+            (tokens.shape[0], self.config.seq_len, self.hidden_dim),
+        )
 
     def context_memory(
         self,
