@@ -39,7 +39,6 @@ from lfrm.training import (
     build_eval_step_runner,
     build_train_step_runner,
     build_trm_act_train_step_runner,
-    build_trm_dense_unroll_train_step_runner,
     build_trm_eval_step_runner,
     create_ema_model,
     create_model,
@@ -85,8 +84,8 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("epochs must be positive")
     if config.train.log_epochs <= 0:
         raise ValueError("log_epochs must be positive")
-    if config.train.train_mode not in ("act", "dense_unroll", "step_carry"):
-        raise ValueError("train_mode must be 'act', 'dense_unroll', or 'step_carry'")
+    if config.train.train_mode not in ("act", "step_carry"):
+        raise ValueError("train_mode must be 'act' or 'step_carry'")
     if config.eval.nums < 0:
         raise ValueError("eval nums must be non-negative; use 0 to disable eval")
     if not config.eval.full_dataset:
@@ -158,12 +157,7 @@ def build_step_runners(config: ExperimentConfig):
             config.train.terminal_residual_weight,
         )
     elif config.model.model_type in ("trm", "urm"):
-        if config.train.train_mode == "dense_unroll":
-            train_step_fn = build_trm_dense_unroll_train_step_runner(
-                halt_loss_weight=config.train.halt_loss_weight,
-            )
-        else:
-            train_step_fn = build_trm_act_train_step_runner(config, config.train.halt_loss_weight)
+        train_step_fn = build_trm_act_train_step_runner(config, config.train.halt_loss_weight)
         eval_step_fn = build_trm_eval_step_runner(
             config.train.halt_loss_weight,
             collect_diagnostics=config.eval.diagnostics,

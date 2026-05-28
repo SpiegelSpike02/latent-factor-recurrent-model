@@ -242,11 +242,14 @@ class UnifiedReasoningModel(nnx.Module):
             "current_puzzle_identifiers": jnp.zeros_like(batch["puzzle_identifiers"]),
         }
 
-    def _reset_hidden(self, batch_size: int) -> Array:
-        hidden = jnp.broadcast_to(
-            self.init_hidden[...][None, None, :],
-            (batch_size, self.total_seq_len, self.config.d_model),
-        )
+    def _reset_hidden(self, batch_size: int, template: Array | None = None) -> Array:
+        if template is None:
+            hidden = jnp.broadcast_to(
+                self.init_hidden[...][None, None, :],
+                (batch_size, self.total_seq_len, self.config.d_model),
+            )
+        else:
+            hidden = jnp.zeros_like(template, dtype=self.dtype) + self.init_hidden[...].astype(self.dtype)
         return hidden.astype(self.dtype)
 
     def forward_act_step(
@@ -266,7 +269,7 @@ class UnifiedReasoningModel(nnx.Module):
         inputs = jnp.where(reset_broadcast, batch["inputs"], carry["current_inputs"])
         labels = jnp.where(reset_broadcast, batch["labels"], carry["current_labels"])
         puzzle_ids = jnp.where(reset, batch["puzzle_identifiers"], carry["current_puzzle_identifiers"])
-        hidden = jnp.where(reset_hidden, self._reset_hidden(inputs.shape[0]), carry["hidden"])
+        hidden = jnp.where(reset_hidden, self._reset_hidden(inputs.shape[0], template=carry["hidden"]), carry["hidden"])
         steps = jnp.where(reset, 0, carry["steps"])
 
         input_embeddings = self._input_embeddings(inputs, puzzle_ids, puzzle_embeddings)
@@ -318,8 +321,8 @@ class UnifiedReasoningModel(nnx.Module):
     ) -> tuple[Array, dict[str, Array]]:
         if dropout_key is None:
             dropout_key = jax.random.key(0)
-        hidden = self._reset_hidden(tokens.shape[0])
         input_embeddings = self._input_embeddings(tokens, puzzle_identifiers)
+        hidden = self._reset_hidden(tokens.shape[0], template=input_embeddings)
         dropout_keys = jax.random.split(dropout_key, self.recurrent_steps)
 
         def scan_step(h: Array, step_key: Array) -> tuple[Array, tuple[Array, Array, Array]]:

@@ -44,7 +44,6 @@ from lfrm.training import (
     loss_and_metrics,
     save_checkpoint,
     stablemax_cross_entropy_with_integer_labels,
-    trm_dense_unroll_loss_and_metrics,
 )
 from lfrm.training.losses import token_cross_entropy
 from lfrm.training.optim import scheduled_lr
@@ -240,25 +239,12 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(logits.shape, (2, 1, 9, 11))
         self.assertEqual(diagnostics["halt_logits"].shape, (2, 1))
         self.assertEqual(diagnostics["hidden_delta_mean"].shape, (2,))
-        _, metrics = loss_and_metrics(model, batch, True, jax.random.key(2), halt_loss_weight=0.1)
+        _, metrics = loss_and_metrics(model, batch, False, None, halt_loss_weight=0.1)
         for key in ("loss", "halt_loss", "selected_lm_loss", "accuracy"):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
-        dense_loss, dense_metrics = trm_dense_unroll_loss_and_metrics(
-            model,
-            batch,
-            True,
-            jax.random.key(3),
-        )
-        self.assertIn("lm_loss", dense_metrics)
-        self.assertIn("step_loss_weights", dense_metrics)
-        self.assertEqual(dense_metrics["step_loss_weights"].shape, (2,))
-        self.assertTrue(bool(jnp.isfinite(dense_metrics["lm_loss"])))
-        self.assertAlmostEqual(
-            float(dense_loss),
-            float(dense_metrics["lm_loss"]),
-            places=5,
-        )
+        with self.assertRaisesRegex(ValueError, "ACT carry mode"):
+            loss_and_metrics(model, batch, True, jax.random.key(3), halt_loss_weight=0.1)
 
     def test_trm_mlp_t_keeps_channel_mlp(self) -> None:
         model = TinyRecursiveModel(
@@ -365,6 +351,32 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.allclose(initial_z, jnp.zeros_like(initial_z))))
         q_view = model._distribution_from_logits(initial_z)
         self.assertTrue(bool(jnp.allclose(q_view, jnp.full_like(q_view, 1.0 / 9.0))))
+
+    def test_bdr_top2_margin_matches_top_k_without_sort_primitive(self) -> None:
+        model = BDRModel(
+            ModelConfig(
+                vocab_size=5,
+                input_vocab_size=6,
+                model_type="bdr",
+                task=TaskConfig(type="arc"),
+                seq_len=4,
+                grid_height=2,
+                grid_width=2,
+                d_model=16,
+                bdr=BDRConfig(commit_steps=1, num_heads=4),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(37),
+        )
+        distribution = jnp.asarray(
+            [
+                [[0.1, 0.4, 0.2, 0.2, 0.1], [0.3, 0.3, 0.2, 0.1, 0.1]],
+            ],
+            dtype=jnp.float32,
+        )
+        expected_top2, _indices = jax.lax.top_k(distribution, 2)
+        expected = expected_top2[..., :1] - expected_top2[..., 1:2]
+        self.assertTrue(bool(jnp.allclose(model._top2_margin(distribution), expected)))
 
     def test_bdr_energy_step_updates_probability_simplex(self) -> None:
         model = BDRModel(

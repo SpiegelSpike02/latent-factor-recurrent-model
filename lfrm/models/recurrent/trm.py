@@ -372,12 +372,14 @@ class TinyRecursiveModel(nnx.Module):
         embedding = self.embed_scale * embedding
         return self.dropout(embedding, deterministic=not train, rngs=dropout_key).astype(self.dtype)
 
-    def _initial_state(self, batch_size: int) -> State:
+    def _initial_state(self, batch_size: int, template: Array | None = None) -> State:
         shape = (batch_size, self.total_seq_len, self.config.d_model)
-        return {
-            "y": jnp.broadcast_to(self.y_init.astype(self.dtype), shape),
-            "z": jnp.broadcast_to(self.z_init.astype(self.dtype), shape),
-        }
+        y_init = jnp.broadcast_to(self.y_init.astype(self.dtype), shape)
+        z_init = jnp.broadcast_to(self.z_init.astype(self.dtype), shape)
+        if template is not None:
+            y_init = jnp.zeros_like(template, dtype=self.dtype) + self.y_init.astype(self.dtype)
+            z_init = jnp.zeros_like(template, dtype=self.dtype) + self.z_init.astype(self.dtype)
+        return {"y": y_init, "z": z_init}
 
     def initial_carry(self, batch: dict[str, Array]) -> Carry:
         batch_size = batch["inputs"].shape[0]
@@ -394,7 +396,7 @@ class TinyRecursiveModel(nnx.Module):
         }
 
     def _reset_carry_state(self, carry: Carry) -> State:
-        state_init = self._initial_state(carry["steps"].shape[0])
+        state_init = self._initial_state(carry["steps"].shape[0], template=carry["y"])
         reset = carry["halted"][:, None, None]
         return {
             "y": jnp.where(reset, state_init["y"], carry["y"]),
@@ -530,7 +532,7 @@ class TinyRecursiveModel(nnx.Module):
             train=train,
             dropout_key=dropout_key,
         )
-        state0 = self._initial_state(tokens.shape[0])
+        state0 = self._initial_state(tokens.shape[0], template=input_embeddings)
 
         def scan_step(state: State, _step_index):
             prev_data = state["y"][:, self.prefix_len :] if collect_diagnostics else None

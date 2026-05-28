@@ -88,8 +88,8 @@ uv run lfrm-train --config configs/sudoku_bdr.toml --learning-rate 1e-4 --batch-
 
 BDR-Sudoku recurrent supervision is controlled by `model.bdr.step_loss_schedule`,
 which selects how per-step CE terms are normalized across commit steps.
-TRM/URM official ACT configs do not use step-weighted dense supervision; dense
-unroll remains a separate experimental path. BDR-Sudoku additionally reports
+TRM/URM train through the official-style ACT carry path by default; the older
+dense unroll training path has been removed. BDR-Sudoku additionally reports
 given consistency, row/column/box conflict count, target probability, update
 size, distribution movement, and energy-gradient diagnostics.
 

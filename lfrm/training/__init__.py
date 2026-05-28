@@ -21,14 +21,12 @@ from lfrm.training.losses import (
 from lfrm.training.optim import build_optimizer, scale_by_adam_atan2
 from lfrm.training.recurrent import (
     build_trm_act_train_step_runner,
-    build_trm_dense_unroll_train_step_runner,
     build_trm_eval_step_runner,
 )
 from lfrm.training.steps import (
     bdr_loss_and_metrics,
     loss_and_metrics,
     trm_act_loss_and_metrics,
-    trm_dense_unroll_loss_and_metrics,
     trm_eval_loss_and_metrics,
 )
 
@@ -42,7 +40,6 @@ __all__ = [
     "build_optimizer",
     "build_train_step_runner",
     "build_trm_act_train_step_runner",
-    "build_trm_dense_unroll_train_step_runner",
     "build_trm_eval_step_runner",
     "create_ema_model",
     "create_model",
@@ -56,6 +53,5 @@ __all__ = [
     "stablemax",
     "stablemax_cross_entropy_with_integer_labels",
     "trm_act_loss_and_metrics",
-    "trm_dense_unroll_loss_and_metrics",
     "trm_eval_loss_and_metrics",
 ]

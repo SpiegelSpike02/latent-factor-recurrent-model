@@ -440,8 +440,17 @@ class BDRModel(nnx.Module):
         return jax.nn.softmax(z_logits.astype(jnp.float32), axis=-1)
 
     def _top2_margin(self, distribution: Array) -> Array:
-        top2, _indices = jax.lax.top_k(distribution.astype(jnp.float32), 2)
-        return top2[..., :1] - top2[..., 1:2]
+        distribution = distribution.astype(jnp.float32)
+        top1 = jnp.max(distribution, axis=-1, keepdims=True)
+        top1_index = jnp.argmax(distribution, axis=-1)
+        vocab_positions = jnp.arange(distribution.shape[-1], dtype=top1_index.dtype)
+        without_top1 = jnp.where(
+            vocab_positions == top1_index[..., None],
+            jnp.asarray(-jnp.inf, dtype=jnp.float32),
+            distribution,
+        )
+        top2 = jnp.max(without_top1, axis=-1, keepdims=True)
+        return top1 - top2
 
     def _logits_from_distribution(self, distribution: Array) -> Array:
         return self._center_logits(jnp.log(jnp.maximum(distribution, self.output_logit_eps)))

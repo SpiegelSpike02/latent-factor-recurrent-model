@@ -12,7 +12,6 @@ from lfrm.training.puzzle_embedding import (
 )
 from lfrm.training.steps import (
     trm_act_loss_and_metrics,
-    trm_dense_unroll_loss_and_metrics,
     trm_eval_loss_and_metrics,
 )
 
@@ -94,37 +93,6 @@ def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
         return metrics, new_carry
 
     return nnx.jit(train_step, donate_argnums=(2,))
-
-
-def build_trm_dense_unroll_train_step_runner(
-    *,
-    halt_loss_weight: float = 0.0,
-):
-    def train_step(
-        model: TinyRecursiveModel,
-        optimizer: nnx.Optimizer,
-        batch: dict[str, jax.Array],
-        dropout_key: jax.Array,
-    ) -> dict[str, jax.Array]:
-        def objective(model, batch, train, dropout_key):
-            return trm_dense_unroll_loss_and_metrics(
-                model,
-                batch,
-                train,
-                dropout_key,
-                halt_loss_weight=halt_loss_weight,
-            )
-
-        (_, metrics), grads = nnx.value_and_grad(objective, has_aux=True)(
-            model,
-            batch,
-            True,
-            dropout_key,
-        )
-        optimizer.update(model, grads)
-        return metrics
-
-    return nnx.jit(train_step)
 
 
 def build_trm_eval_step_runner(halt_loss_weight: float = 0.5, *, collect_diagnostics: bool = False):

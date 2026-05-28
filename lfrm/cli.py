@@ -311,9 +311,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-epochs", type=int, default=10)
     parser.add_argument(
         "--train-mode",
-        choices=("act", "dense_unroll", "step_carry"),
+        choices=("act", "step_carry"),
         default="act",
-        help="Recurrent training path. BDR supports only step_carry; TRM/URM support act or dense_unroll.",
+        help="Recurrent training path. TRM/URM use act; BDR uses step_carry.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--halt-loss-weight", type=float, default=0.0)
