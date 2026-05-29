@@ -5,17 +5,15 @@ model directly: the recurrent computation learns dynamics over an explicit
 answer belief rather than routing through a separate controller state.
 
 ```text
-z_t = centered answer logits, shape [batch, cells, symbols]
-q_t = softmax(z_t), the probability view of the answer state
+q_t = explicit answer distribution, shape [batch, cells, symbols]
 h_t = recurrent hidden grid field
 C   = fixed puzzle/context tokens and given-mask information
 F   = shared local/global recurrent solver
 ```
 
-The persistent answer state is `z_t`; `q_t` is derived when the model needs a
-probability distribution. Keeping logits as the stored coordinate avoids simplex
-constraints during updates, while keeping `q_t` as the semantic view gives the
-loss and diagnostics direct probabilistic meaning.
+The persistent answer state is the probability distribution `q_t`. Updates may
+still be parameterized as direct proposals, scalar energy gradients, or velocity
+fields, but the carried belief remains an explicitly normalized distribution.
 
 ## Sudoku Path
 
@@ -23,53 +21,52 @@ The current implemented path is `bdr_sudoku`:
 
 ```text
 C         = puzzle givens
-z_0       = zero centered logits, equivalent to uniform q_0
-q_t       = softmax(z_t)
+q_0       = uniform answer distribution
 h_t       = [batch, 81, hidden_dim] recurrent spatial field
 read_t    = F(C, q_t, h_t)
-z_{t+1}   = update(z_t, read_t)
+q_{t+1}   = update(q_t, read_t)
 ```
 
 Each commit step embeds the puzzle context and a compact feature view of the
 current belief. The shared solver mixes information with global attention and a
 local convolutional SwiGLU block. The read state is then converted into one of
-two update rules.
+three update rules.
 
-Velocity mode learns a direct centered logit-space vector field:
+Proposal mode directly emits the next belief:
 
 ```text
-z_{t+1} = center(z_t + eta * v(read_t))
+q_{t+1} = softmax(proposal(read_t))
 ```
 
-Energy mode learns a scalar energy over candidate distributions and follows the
-negative energy gradient in the logit coordinate:
+Energy-gradient mode learns a scalar energy over candidate distributions and
+follows the negative energy gradient:
 
 ```text
 E_t(q)     = energy(read_t, q)
 g_t        = center(dE_t(q_t) / dq_t)
-z_{t+1}    = center(z_t - eta * g_t)
-q_{t+1}    = softmax(z_{t+1})
+q_{t+1}    = normalize(q_t - g_t)
 ```
 
-This makes energy mode closer to mirror descent or exponentiated-gradient
-dynamics. It is not a proof of global convergence, because `read_t` is
-recomputed after every step, but it gives the model a useful language for fixed
-points, wrong attractors, and recovery directions.
+Velocity mode learns a free centered vector field over the belief:
+
+```text
+v_t       = center(velocity(read_t))
+q_{t+1}   = normalize(relu(q_t + v_t) + eps)
+```
+
+This keeps proposal as the direct baseline while preserving two higher-value
+dynamical routes: scalar energy descent and learned velocity fields.
 
 ## State Semantics
 
-BDR does not treat logits and probabilities as interchangeable names for the
-same thing. They play different roles:
+BDR keeps the answer state and hidden computation separate:
 
-- `z_t` is the stored dual coordinate used for additive updates.
-- `q_t` is the probability view used for targets, confidence, energy candidates,
-  and most diagnostics.
+- `q_t` is the explicit answer distribution used for targets, confidence,
+  energy candidates, and most diagnostics.
 - `h_t` is the hidden computation field, not an answer cache.
 
-The initial answer state is exactly uniform because `z_0` is all zeros. This is
-kept as logits rather than as a mutable probability array because it makes both
-velocity and energy updates unconstrained while preserving the same semantic
-initial belief.
+The initial answer state is exactly uniform. This makes every update rule start
+from the same semantic belief.
 
 ## Training
 

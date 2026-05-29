@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from lfrm.config import ModelConfig, RuntimeConfig
+from lfrm.config import BDR_UPDATE_RULES, ModelConfig, RuntimeConfig
 from lfrm.models.common import (
     Array,
     casted_linear_init,
@@ -127,11 +127,11 @@ class BeliefDynamicsBlock(nnx.Module):
 
 
 class BeliefDynamicsReasoner(nnx.Module):
-    """Z-state recurrent solver for fixed-size grid reasoning tasks.
+    """Belief-state recurrent solver for fixed-size grid reasoning tasks.
 
-    The recurrent state stores centered answer logits ``z``. Its softmax is the
-    per-cell explicit answer distribution view, which is read as a typed
-    hypothesis hint; BDR does not learn a separate per-cell confidence state.
+    The recurrent state stores the per-cell explicit answer distribution,
+    which is read as a typed hypothesis hint; BDR does not learn a separate
+    per-cell confidence state.
     """
 
     def __init__(
@@ -171,17 +171,16 @@ class BeliefDynamicsReasoner(nnx.Module):
             raise ValueError("BDR 2D axial RoPE head dimension must be divisible by 4")
         if bdr.step_loss_schedule not in ("uniform", "linear", "quadratic"):
             raise ValueError("BDR step_loss_schedule must be 'uniform', 'linear', or 'quadratic'")
-        if bdr.update_rule not in ("energy_prob", "energy_dist", "free_velocity", "proposal"):
-            raise ValueError("BDR update_rule must be 'energy_prob', 'energy_dist', 'free_velocity', or 'proposal'")
+        if bdr.update_rule not in BDR_UPDATE_RULES:
+            raise ValueError("BDR update_rule must be 'proposal', 'energy_grad', or 'velocity'")
         if bdr.draft_view != "probability":
             raise ValueError("BDR draft_view must be 'probability'")
         if bdr.prediction_view not in ("probability", "logits"):
             raise ValueError("BDR prediction_view must be 'probability' or 'logits'")
-        if bdr.update_rule == "energy_prob" and bdr.update_step_size <= 0.0:
-            raise ValueError("BDR update_step_size must be positive")
         self.config = config
         self.runtime = runtime
         self.bdr = bdr
+        self.update_rule = bdr.update_rule
         self.commit_steps = int(bdr.commit_steps)
         self.total_steps = self.commit_steps
         self.h_cycles = int(bdr.h_cycles)
@@ -199,7 +198,7 @@ class BeliefDynamicsReasoner(nnx.Module):
             self.input_vocab_size = int(config.input_vocab_size or config.vocab_size)
             self.q_vocab_size = config.vocab_size
             self.sudoku_blank_token_id = 0
-        self.output_logit_eps = 1e-9
+        self.distribution_eps = 1e-9
         self.box_height, self.box_width = self._box_shape(config.grid_height, config.grid_width)
         self.draft_view = bdr.draft_view
         self.prediction_view = bdr.prediction_view
@@ -307,14 +306,6 @@ class BeliefDynamicsReasoner(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.label_energy_head = nnx.Linear(
-            self.hidden_dim,
-            self.q_vocab_size,
-            dtype=self.dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
         self.velocity_head = nnx.Linear(
             self.hidden_dim,
             self.q_vocab_size,
@@ -366,7 +357,7 @@ class BeliefDynamicsReasoner(nnx.Module):
         return self.prediction_view == "probability"
 
     def _normalize_distribution(self, distribution: Array) -> Array:
-        distribution = jnp.maximum(distribution.astype(jnp.float32), self.output_logit_eps)
+        distribution = jnp.maximum(distribution.astype(jnp.float32), self.distribution_eps)
         return distribution / jnp.sum(distribution, axis=-1, keepdims=True)
 
     def _state_distribution(self, state: Array) -> Array:
@@ -386,7 +377,7 @@ class BeliefDynamicsReasoner(nnx.Module):
         return top1 - top2
 
     def _logits_from_distribution(self, distribution: Array) -> Array:
-        return self._center_logits(jnp.log(jnp.maximum(distribution, self.output_logit_eps)))
+        return self._center_logits(jnp.log(jnp.maximum(distribution, self.distribution_eps)))
 
     def _zero_z(self, tokens: Array) -> Array:
         return jnp.broadcast_to(
@@ -473,52 +464,7 @@ class BeliefDynamicsReasoner(nnx.Module):
         )
         return self.energy_head(maybe_cast(energy_input, self.dtype)).astype(jnp.float32)[..., 0]
 
-    def _label_energies_from_read_state(self, read_state: Array) -> Array:
-        return self.label_energy_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
-
-    def _distribution_energy_step_from_read_state(
-        self,
-        current_distribution: Array,
-        read_state: Array,
-    ) -> tuple[Array, dict[str, Array], tuple[Array, Array]]:
-        current_distribution = self._normalize_distribution(current_distribution)
-        label_energies = self._label_energies_from_read_state(read_state)
-        next_distribution = jax.nn.softmax(-label_energies, axis=-1)
-        distribution_step = next_distribution - current_distribution
-        distribution_tv_delta = 0.5 * jnp.sum(
-            jnp.abs(distribution_step),
-            axis=-1,
-            keepdims=True,
-        )
-        energy_update_rms = jnp.sqrt(jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True) + 1e-12)
-        energy_value = jnp.sum(current_distribution * label_energies, axis=-1, keepdims=True)
-        energy_entropy = -jnp.sum(
-            next_distribution * jnp.log(jnp.maximum(next_distribution, self.output_logit_eps)),
-            axis=-1,
-            keepdims=True,
-        ) / jnp.log(float(self.q_vocab_size))
-        path_energy = jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True)
-        zero = jnp.zeros_like(energy_update_rms)
-        diagnostics = {
-            "update_step_size": zero,
-            "update_rms": energy_update_rms,
-            "velocity_rms": zero,
-            "energy_update_rms": energy_update_rms,
-            "energy_value": energy_value,
-            "energy_grad_rms": zero,
-            "probability_step_rms": zero,
-            "energy_distribution_step_rms": energy_update_rms,
-            "energy_entropy": energy_entropy,
-            "proposal_update_rms": zero,
-            "proposal_entropy": zero,
-            "free_velocity_rms": zero,
-            "free_velocity_negative_rate": zero,
-            "distribution_tv_delta": distribution_tv_delta,
-            "path_energy": path_energy,
-        }
-        return next_distribution, diagnostics, (current_distribution, next_distribution)
-
-    def _energy_probability_descent_from_read_state(
+    def _energy_gradient_step_from_read_state(
         self,
         current_distribution: Array,
         read_state: Array,
@@ -533,8 +479,7 @@ class BeliefDynamicsReasoner(nnx.Module):
         energy_value = energy_cells[..., None]
         energy_grad = energy_vjp(jnp.ones_like(energy_cells))[0].astype(jnp.float32)
         energy_grad = energy_grad - jnp.mean(energy_grad, axis=-1, keepdims=True)
-        update_step_size_scalar = float(self.bdr.update_step_size)
-        distribution_step = -update_step_size_scalar * energy_grad
+        distribution_step = -energy_grad
         next_distribution = self._normalize_distribution(current_distribution + distribution_step)
 
         distribution_tv_delta = 0.5 * jnp.sum(
@@ -544,25 +489,17 @@ class BeliefDynamicsReasoner(nnx.Module):
         )
         energy_grad_rms = jnp.sqrt(jnp.mean(jnp.square(energy_grad), axis=-1, keepdims=True) + 1e-12)
         distribution_step_rms = jnp.sqrt(jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True) + 1e-12)
-        update_step_size = jnp.broadcast_to(
-            jnp.asarray(update_step_size_scalar, dtype=jnp.float32),
-            (*current_distribution.shape[:-1], 1),
-        )
         path_energy = jnp.mean(jnp.square(next_distribution - current_distribution), axis=-1, keepdims=True)
         diagnostics = {
-            "update_step_size": update_step_size,
             "update_rms": energy_grad_rms,
-            "velocity_rms": jnp.zeros_like(energy_grad_rms),
             "energy_update_rms": energy_grad_rms,
             "energy_value": energy_value,
             "energy_grad_rms": energy_grad_rms,
-            "probability_step_rms": distribution_step_rms,
-            "energy_distribution_step_rms": jnp.zeros_like(energy_grad_rms),
-            "energy_entropy": jnp.zeros_like(energy_grad_rms),
+            "energy_step_rms": distribution_step_rms,
             "proposal_update_rms": jnp.zeros_like(energy_grad_rms),
             "proposal_entropy": jnp.zeros_like(energy_grad_rms),
-            "free_velocity_rms": jnp.zeros_like(energy_grad_rms),
-            "free_velocity_negative_rate": jnp.zeros_like(energy_grad_rms),
+            "velocity_update_rms": jnp.zeros_like(energy_grad_rms),
+            "velocity_negative_rate": jnp.zeros_like(energy_grad_rms),
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
         }
@@ -584,32 +521,28 @@ class BeliefDynamicsReasoner(nnx.Module):
         )
         proposal_update_rms = jnp.sqrt(jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True) + 1e-12)
         proposal_entropy = -jnp.sum(
-            next_distribution * jnp.log(jnp.maximum(next_distribution, self.output_logit_eps)),
+            next_distribution * jnp.log(jnp.maximum(next_distribution, self.distribution_eps)),
             axis=-1,
             keepdims=True,
         ) / jnp.log(float(self.q_vocab_size))
         path_energy = jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True)
         zero = jnp.zeros_like(proposal_update_rms)
         diagnostics = {
-            "update_step_size": zero,
             "update_rms": proposal_update_rms,
-            "velocity_rms": zero,
             "energy_update_rms": zero,
             "energy_value": zero,
             "energy_grad_rms": zero,
-            "probability_step_rms": zero,
-            "energy_distribution_step_rms": zero,
-            "energy_entropy": zero,
+            "energy_step_rms": zero,
             "proposal_update_rms": proposal_update_rms,
             "proposal_entropy": proposal_entropy,
-            "free_velocity_rms": zero,
-            "free_velocity_negative_rate": zero,
+            "velocity_update_rms": zero,
+            "velocity_negative_rate": zero,
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
         }
         return next_distribution, diagnostics, (current_distribution, next_distribution)
 
-    def _free_velocity_step_from_read_state(
+    def _velocity_step_from_read_state(
         self,
         current_distribution: Array,
         read_state: Array,
@@ -619,30 +552,26 @@ class BeliefDynamicsReasoner(nnx.Module):
         delta = raw_delta - jnp.mean(raw_delta, axis=-1, keepdims=True)
         pre_normalized = current_distribution + delta
         negative_rate = jnp.mean((pre_normalized < 0.0).astype(jnp.float32), axis=-1, keepdims=True)
-        next_distribution = self._normalize_distribution(jax.nn.relu(pre_normalized) + self.output_logit_eps)
+        next_distribution = self._normalize_distribution(jax.nn.relu(pre_normalized) + self.distribution_eps)
         distribution_step = next_distribution - current_distribution
         distribution_tv_delta = 0.5 * jnp.sum(
             jnp.abs(distribution_step),
             axis=-1,
             keepdims=True,
         )
-        free_velocity_rms = jnp.sqrt(jnp.mean(jnp.square(delta), axis=-1, keepdims=True) + 1e-12)
+        velocity_update_rms = jnp.sqrt(jnp.mean(jnp.square(delta), axis=-1, keepdims=True) + 1e-12)
         path_energy = jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True)
-        zero = jnp.zeros_like(free_velocity_rms)
+        zero = jnp.zeros_like(velocity_update_rms)
         diagnostics = {
-            "update_step_size": zero,
-            "update_rms": free_velocity_rms,
-            "velocity_rms": zero,
+            "update_rms": velocity_update_rms,
             "energy_update_rms": zero,
             "energy_value": zero,
             "energy_grad_rms": zero,
-            "probability_step_rms": zero,
-            "energy_distribution_step_rms": zero,
-            "energy_entropy": zero,
+            "energy_step_rms": zero,
             "proposal_update_rms": zero,
             "proposal_entropy": zero,
-            "free_velocity_rms": free_velocity_rms,
-            "free_velocity_negative_rate": negative_rate,
+            "velocity_update_rms": velocity_update_rms,
+            "velocity_negative_rate": negative_rate,
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
         }
@@ -716,16 +645,14 @@ class BeliefDynamicsReasoner(nnx.Module):
         )
         read_state = self._update_read_state(hidden_state)
         del step_index
-        if self.bdr.update_rule == "energy_dist":
-            z, update_diagnostics, update_distributions = self._distribution_energy_step_from_read_state(z, read_state)
-        elif self.bdr.update_rule == "free_velocity":
-            z, update_diagnostics, update_distributions = self._free_velocity_step_from_read_state(z, read_state)
-        elif self.bdr.update_rule == "proposal":
+        if self.update_rule == "proposal":
             z, update_diagnostics, update_distributions = self._proposal_step_from_read_state(z, read_state)
-        elif self.bdr.update_rule == "energy_prob":
-            z, update_diagnostics, update_distributions = self._energy_probability_descent_from_read_state(z, read_state)
+        elif self.update_rule == "energy_grad":
+            z, update_diagnostics, update_distributions = self._energy_gradient_step_from_read_state(z, read_state)
+        elif self.update_rule == "velocity":
+            z, update_diagnostics, update_distributions = self._velocity_step_from_read_state(z, read_state)
         else:
-            raise ValueError(f"Unsupported BDR update_rule={self.bdr.update_rule!r}")
+            raise ValueError(f"Unsupported BDR update_rule={self.update_rule!r}")
         update_diagnostics = {
             **update_diagnostics,
             "halt_logits": self._halt_logits(read_state, tokens),
@@ -889,19 +816,15 @@ class BeliefDynamicsReasoner(nnx.Module):
             "act_step": jnp.mean(new_steps.astype(jnp.float32)),
             "halted_rate": jnp.mean(next_halted.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
-            "update_step_size": jnp.mean(update_diagnostics["update_step_size"].astype(jnp.float32)),
             "update_rms": jnp.mean(update_diagnostics["update_rms"].astype(jnp.float32)),
-            "velocity_rms": jnp.mean(update_diagnostics["velocity_rms"].astype(jnp.float32)),
             "energy_update_rms": jnp.mean(update_diagnostics["energy_update_rms"].astype(jnp.float32)),
             "energy_value": jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
             "energy_grad_rms": jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
-            "probability_step_rms": jnp.mean(update_diagnostics["probability_step_rms"].astype(jnp.float32)),
-            "energy_distribution_step_rms": jnp.mean(update_diagnostics["energy_distribution_step_rms"].astype(jnp.float32)),
-            "energy_entropy": jnp.mean(update_diagnostics["energy_entropy"].astype(jnp.float32)),
+            "energy_step_rms": jnp.mean(update_diagnostics["energy_step_rms"].astype(jnp.float32)),
             "proposal_update_rms": jnp.mean(update_diagnostics["proposal_update_rms"].astype(jnp.float32)),
             "proposal_entropy": jnp.mean(update_diagnostics["proposal_entropy"].astype(jnp.float32)),
-            "free_velocity_rms": jnp.mean(update_diagnostics["free_velocity_rms"].astype(jnp.float32)),
-            "free_velocity_negative_rate": jnp.mean(update_diagnostics["free_velocity_negative_rate"].astype(jnp.float32)),
+            "velocity_update_rms": jnp.mean(update_diagnostics["velocity_update_rms"].astype(jnp.float32)),
+            "velocity_negative_rate": jnp.mean(update_diagnostics["velocity_negative_rate"].astype(jnp.float32)),
             "distribution_tv_delta": jnp.mean(update_diagnostics["distribution_tv_delta"].astype(jnp.float32)),
             "path_energy": jnp.mean(update_diagnostics["path_energy"].astype(jnp.float32)),
         }
@@ -951,19 +874,15 @@ class BeliefDynamicsReasoner(nnx.Module):
                 update_diagnostics["halt_logits"],
                 hidden_delta,
                 q_top1_probability,
-                jnp.mean(update_diagnostics["update_step_size"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["update_rms"].astype(jnp.float32)),
-                jnp.mean(update_diagnostics["velocity_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_update_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
-                jnp.mean(update_diagnostics["probability_step_rms"].astype(jnp.float32)),
-                jnp.mean(update_diagnostics["energy_distribution_step_rms"].astype(jnp.float32)),
-                jnp.mean(update_diagnostics["energy_entropy"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["energy_step_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["proposal_update_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["proposal_entropy"].astype(jnp.float32)),
-                jnp.mean(update_diagnostics["free_velocity_rms"].astype(jnp.float32)),
-                jnp.mean(update_diagnostics["free_velocity_negative_rate"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["velocity_update_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["velocity_negative_rate"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["distribution_tv_delta"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["path_energy"].astype(jnp.float32)),
             )
@@ -998,19 +917,15 @@ class BeliefDynamicsReasoner(nnx.Module):
                 "halt_logits": jnp.zeros((self.total_steps, tokens.shape[0]), dtype=jnp.float32),
                 "hidden_delta_mean": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
-                "update_step_size": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "velocity_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_value": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_grad_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "probability_step_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "energy_distribution_step_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "energy_entropy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "energy_step_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "proposal_update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "proposal_entropy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "free_velocity_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "free_velocity_negative_rate": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "velocity_update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "velocity_negative_rate": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "distribution_tv_delta": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "path_energy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
             }
@@ -1020,19 +935,15 @@ class BeliefDynamicsReasoner(nnx.Module):
             halt_logits,
             hidden_delta_mean,
             q_top1_probability,
-            update_step_size,
             update_rms,
-            velocity_rms,
             energy_update_rms,
             energy_value,
             energy_grad_rms,
-            probability_step_rms,
-            energy_distribution_step_rms,
-            energy_entropy,
+            energy_step_rms,
             proposal_update_rms,
             proposal_entropy,
-            free_velocity_rms,
-            free_velocity_negative_rate,
+            velocity_update_rms,
+            velocity_negative_rate,
             distribution_tv_delta,
             path_energy,
         ) = scan_outputs
@@ -1041,19 +952,15 @@ class BeliefDynamicsReasoner(nnx.Module):
             "halt_logits": halt_logits,
             "hidden_delta_mean": hidden_delta_mean,
             "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
-            "update_step_size": update_step_size,
             "update_rms": update_rms,
-            "velocity_rms": velocity_rms,
             "energy_update_rms": energy_update_rms,
             "energy_value": energy_value,
             "energy_grad_rms": energy_grad_rms,
-            "probability_step_rms": probability_step_rms,
-            "energy_distribution_step_rms": energy_distribution_step_rms,
-            "energy_entropy": energy_entropy,
+            "energy_step_rms": energy_step_rms,
             "proposal_update_rms": proposal_update_rms,
             "proposal_entropy": proposal_entropy,
-            "free_velocity_rms": free_velocity_rms,
-            "free_velocity_negative_rate": free_velocity_negative_rate,
+            "velocity_update_rms": velocity_update_rms,
+            "velocity_negative_rate": velocity_negative_rate,
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
         }

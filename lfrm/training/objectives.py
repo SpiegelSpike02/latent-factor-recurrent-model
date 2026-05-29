@@ -152,30 +152,23 @@ def _bdr_step_loss_weights(model: BeliefDynamicsReasoner, rollout_steps: int) ->
 
 
 def _bdr_branch_diagnostics(model: BeliefDynamicsReasoner, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
-    update_rule = model.bdr.update_rule
+    update_rule = model.update_rule
     if update_rule == "proposal":
         return {
             "proposal_update_rms": diagnostics["proposal_update_rms"],
             "proposal_entropy": diagnostics["proposal_entropy"],
         }
-    if update_rule == "free_velocity":
+    if update_rule == "velocity":
         return {
-            "free_velocity_rms": diagnostics["free_velocity_rms"],
-            "free_velocity_negative_rate": diagnostics["free_velocity_negative_rate"],
+            "velocity_update_rms": diagnostics["velocity_update_rms"],
+            "velocity_negative_rate": diagnostics["velocity_negative_rate"],
         }
-    if update_rule == "energy_dist":
-        return {
-            "energy_update_rms": diagnostics["energy_update_rms"],
-            "energy_value": diagnostics["energy_value"],
-            "energy_distribution_step_rms": diagnostics["energy_distribution_step_rms"],
-            "energy_entropy": diagnostics["energy_entropy"],
-        }
-    if update_rule == "energy_prob":
+    if update_rule == "energy_grad":
         return {
             "energy_update_rms": diagnostics["energy_update_rms"],
             "energy_value": diagnostics["energy_value"],
             "energy_grad_rms": diagnostics["energy_grad_rms"],
-            "energy_probability_step_rms": diagnostics["probability_step_rms"],
+            "energy_step_rms": diagnostics["energy_step_rms"],
         }
     raise ValueError(f"Unsupported BDR update_rule={update_rule!r}")
 

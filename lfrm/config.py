@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+BDR_UPDATE_RULES = frozenset(("proposal", "energy_grad", "velocity"))
+
+
 @dataclass(frozen=True)
 class TaskConfig:
     type: str = "sudoku"
@@ -49,7 +52,6 @@ class BeliefDynamicsConfig:
     update_rule: str = "proposal"
     draft_view: str = "probability"
     prediction_view: str = "probability"
-    update_step_size: float = 0.3
 
 
 @dataclass(frozen=True)

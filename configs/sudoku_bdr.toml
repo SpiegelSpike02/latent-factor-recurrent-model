@@ -21,7 +21,7 @@ h_cycles = 2
 l_cycles = 6
 l_layers = 4
 step_loss_schedule = "uniform"
-update_rule = "proposal"
+update_rule = "energy_grad"
 draft_view = "probability"
 prediction_view = "probability"
 
@@ -35,7 +35,7 @@ local_scale = 1.0
 rms_norm_eps = 1e-5
 
 [model.bdr.position]
-position_encoding = "rope"
+position_encoding = "rope2d"
 rope_theta = 10000.0
 
 [optimizer]
@@ -79,5 +79,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-bdr-proposal-h2-l6x4-c16-act-b768"
+name = "sudoku-bdr-energy-grad-rope2d-h2-l6x4-c16-act-b768"
 mode = "online"

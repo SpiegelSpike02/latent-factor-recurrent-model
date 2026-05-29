@@ -5,6 +5,7 @@ from pathlib import Path
 import tomllib
 
 from lfrm.config import (
+    BDR_UPDATE_RULES,
     DataConfig,
     EMAConfig,
     ExperimentConfig,
@@ -42,7 +43,6 @@ GROUPED_NESTED_KEYS = {
             "update_rule",
             "draft_view",
             "prediction_view",
-            "update_step_size",
             "halt_exploration_prob",
         },
         "hidden": {
@@ -157,7 +157,6 @@ ALLOWED_NESTED_KEYS = {
         "update_rule",
         "draft_view",
         "prediction_view",
-        "update_step_size",
         "halt_exploration_prob",
         "dynamics",
         "hidden",
@@ -325,10 +324,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bdr-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--bdr-rope-theta", type=float, default=10000.0)
     parser.add_argument("--bdr-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
-    parser.add_argument("--bdr-update-rule", choices=("energy_prob", "energy_dist", "free_velocity", "proposal"), default="proposal")
+    parser.add_argument(
+        "--bdr-update-rule",
+        choices=tuple(sorted(BDR_UPDATE_RULES)),
+        default="proposal",
+    )
     parser.add_argument("--bdr-draft-view", choices=("probability",), default="probability")
     parser.add_argument("--bdr-prediction-view", choices=("probability", "logits"), default="probability")
-    parser.add_argument("--bdr-update-step-size", type=float, default=0.3)
     parser.add_argument("--bdr-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
@@ -474,7 +476,6 @@ def build_config(
             update_rule=args.bdr_update_rule,
             draft_view=args.bdr_draft_view,
             prediction_view=args.bdr_prediction_view,
-            update_step_size=args.bdr_update_step_size,
             halt_exploration_prob=args.bdr_halt_exploration_prob,
         ),
         urm=URMConfig(

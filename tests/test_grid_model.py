@@ -440,7 +440,7 @@ class GridModelTests(unittest.TestCase):
         expected = expected_top2[..., :1] - expected_top2[..., 1:2]
         self.assertTrue(bool(jnp.allclose(model._top2_margin(distribution), expected)))
 
-    def test_bdr_energy_prob_step_updates_probability_simplex(self) -> None:
+    def test_bdr_energy_grad_step_updates_probability_simplex(self) -> None:
         model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=5,
@@ -454,8 +454,7 @@ class GridModelTests(unittest.TestCase):
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
-                    update_rule="energy_prob",
-                    update_step_size=0.5,
+                    update_rule="energy_grad",
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -467,7 +466,7 @@ class GridModelTests(unittest.TestCase):
         )
         read_state = jnp.zeros((1, 4, 16), dtype=jnp.float32)
 
-        next_distribution, diagnostics, update_distributions = model._energy_probability_descent_from_read_state(
+        next_distribution, diagnostics, update_distributions = model._energy_gradient_step_from_read_state(
             current_distribution,
             read_state,
         )
@@ -510,7 +509,7 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.all(outputs >= 0.0)))
         self.assertTrue(bool(jnp.allclose(token_cross_entropy(model, outputs, targets), expected_loss, atol=1e-6)))
 
-    def test_bdr_energy_prob_outputs_probabilities_for_loss(self) -> None:
+    def test_bdr_energy_grad_outputs_probabilities_for_loss(self) -> None:
         model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=5,
@@ -524,7 +523,7 @@ class GridModelTests(unittest.TestCase):
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
-                    update_rule="energy_prob",
+                    update_rule="energy_grad",
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -550,7 +549,7 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.isfinite(zero_loss)))
         self.assertLess(float(zero_grad[0, 0, 0]), 0.0)
 
-    def test_bdr_proposal_outputs_probabilities_without_eta_metric(self) -> None:
+    def test_bdr_proposal_outputs_probabilities(self) -> None:
         config = ExperimentConfig(
             task=TaskConfig(type="arc"),
             model=ModelConfig(
@@ -593,12 +592,11 @@ class GridModelTests(unittest.TestCase):
 
         self.assertIn("proposal_update_rms", metrics)
         self.assertIn("proposal_entropy", metrics)
-        self.assertNotIn("update_step_size", metrics)
-        self.assertNotIn("velocity_rms", metrics)
+        self.assertNotIn("velocity_update_rms", metrics)
         self.assertNotIn("energy_grad_rms", metrics)
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
 
-    def test_bdr_free_velocity_outputs_probabilities_without_eta_metric(self) -> None:
+    def test_bdr_velocity_outputs_probabilities(self) -> None:
         config = ExperimentConfig(
             task=TaskConfig(type="arc"),
             model=ModelConfig(
@@ -612,7 +610,7 @@ class GridModelTests(unittest.TestCase):
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
-                    update_rule="free_velocity",
+                    update_rule="velocity",
                 ),
             ),
             optimizer=OptimizerConfig(learning_rate=1e-3, lr_warmup_steps=1),
@@ -639,14 +637,12 @@ class GridModelTests(unittest.TestCase):
             jnp.asarray(0, dtype=jnp.int32),
         )
 
-        self.assertIn("free_velocity_rms", metrics)
-        self.assertIn("free_velocity_negative_rate", metrics)
-        self.assertNotIn("update_step_size", metrics)
-        self.assertNotIn("velocity_rms", metrics)
+        self.assertIn("velocity_update_rms", metrics)
+        self.assertIn("velocity_negative_rate", metrics)
         self.assertNotIn("energy_grad_rms", metrics)
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
 
-    def test_bdr_energy_dist_reports_branch_metrics_without_eta_metric(self) -> None:
+    def test_bdr_energy_grad_reports_branch_metrics(self) -> None:
         config = ExperimentConfig(
             task=TaskConfig(type="arc"),
             model=ModelConfig(
@@ -660,7 +656,7 @@ class GridModelTests(unittest.TestCase):
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
-                    update_rule="energy_dist",
+                    update_rule="energy_grad",
                 ),
             ),
             optimizer=OptimizerConfig(learning_rate=1e-3, lr_warmup_steps=1),
@@ -687,10 +683,10 @@ class GridModelTests(unittest.TestCase):
             jnp.asarray(0, dtype=jnp.int32),
         )
 
-        self.assertIn("energy_distribution_step_rms", metrics)
-        self.assertIn("energy_entropy", metrics)
-        self.assertNotIn("update_step_size", metrics)
-        self.assertNotIn("energy_grad_rms", metrics)
+        self.assertIn("energy_update_rms", metrics)
+        self.assertIn("energy_value", metrics)
+        self.assertIn("energy_grad_rms", metrics)
+        self.assertIn("energy_step_rms", metrics)
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
 
     def test_bdr_eval_metrics_are_finite(self) -> None:
@@ -1182,7 +1178,6 @@ class GridModelTests(unittest.TestCase):
                 "step_loss_schedule = \"quadratic\"\n"
                 "draft_view = \"probability\"\n"
                 "prediction_view = \"probability\"\n"
-                "update_step_size = 0.4\n"
                 "\n",
                 encoding="utf-8",
             )
@@ -1198,7 +1193,6 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["bdr_step_loss_schedule"], "quadratic")
             self.assertEqual(loaded["bdr_draft_view"], "probability")
             self.assertEqual(loaded["bdr_prediction_view"], "probability")
-            self.assertEqual(loaded["bdr_update_step_size"], 0.4)
 
             eval_config_path = Path(tmpdir) / "eval.toml"
             eval_config_path.write_text(
