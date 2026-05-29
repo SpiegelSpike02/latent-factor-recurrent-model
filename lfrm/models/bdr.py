@@ -229,9 +229,13 @@ class BDRModel(nnx.Module):
             raise ValueError("BDR axial RoPE head dimension must be divisible by 4")
         if bdr.step_loss_schedule not in ("uniform", "linear", "quadratic"):
             raise ValueError("BDR step_loss_schedule must be 'uniform', 'linear', or 'quadratic'")
-        if bdr.update_rule not in ("energy", "energy_prob", "velocity"):
-            raise ValueError("BDR update_rule must be 'energy', 'energy_prob', or 'velocity'")
-        if bdr.update_step_size <= 0.0:
+        if bdr.update_rule not in ("energy_prob", "energy_dist", "free_velocity", "proposal"):
+            raise ValueError("BDR update_rule must be 'energy_prob', 'energy_dist', 'free_velocity', or 'proposal'")
+        if bdr.draft_view not in ("auto", "logits", "probability"):
+            raise ValueError("BDR draft_view must be 'auto', 'logits', or 'probability'")
+        if bdr.prediction_view not in ("auto", "logits", "probability"):
+            raise ValueError("BDR prediction_view must be 'auto', 'logits', or 'probability'")
+        if bdr.update_rule == "energy_prob" and bdr.update_step_size <= 0.0:
             raise ValueError("BDR update_step_size must be positive")
         if bdr.fixed_point_label_smoothing < 0.0 or bdr.fixed_point_label_smoothing >= 1.0:
             raise ValueError("BDR fixed_point_label_smoothing must be in [0, 1)")
@@ -277,6 +281,10 @@ class BDRModel(nnx.Module):
             self.sudoku_blank_token_id = 0
         self.output_logit_eps = 1e-9
         self.box_height, self.box_width = self._box_shape(config.grid_height, config.grid_width)
+        self.draft_view = self._resolve_draft_view(bdr.update_rule, bdr.draft_view)
+        self.prediction_view = self._resolve_prediction_view(self.draft_view, bdr.prediction_view)
+        if self.draft_view != "probability":
+            raise ValueError(f"BDR update_rule={bdr.update_rule!r} requires draft_view='probability'")
 
         rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
         cols = jnp.arange(config.seq_len, dtype=jnp.int32) % config.grid_width
@@ -373,7 +381,23 @@ class BDRModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
+        self.label_energy_head = nnx.Linear(
+            self.hidden_dim,
+            self.q_vocab_size,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
         self.velocity_head = nnx.Linear(
+            self.hidden_dim,
+            self.q_vocab_size,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.proposal_head = nnx.Linear(
             self.hidden_dim,
             self.q_vocab_size,
             dtype=self.dtype,
@@ -390,6 +414,19 @@ class BDRModel(nnx.Module):
         while box_width > 1 and grid_width % box_width != 0:
             box_width -= 1
         return max(box_height, 1), max(box_width, 1)
+
+    @staticmethod
+    def _resolve_draft_view(update_rule: str, configured: str) -> str:
+        if configured != "auto":
+            return configured
+        del update_rule
+        return "probability"
+
+    @staticmethod
+    def _resolve_prediction_view(draft_view: str, configured: str) -> str:
+        if configured != "auto":
+            return configured
+        return draft_view
 
     @staticmethod
     def _build_box_indices(grid_height: int, grid_width: int, box_height: int, box_width: int) -> Array:
@@ -417,7 +454,10 @@ class BDRModel(nnx.Module):
         return jax.nn.softmax(z_logits.astype(jnp.float32), axis=-1)
 
     def _state_is_probability(self) -> bool:
-        return self.bdr.update_rule == "energy_prob"
+        return self.draft_view == "probability"
+
+    def outputs_are_probabilities(self) -> bool:
+        return self.prediction_view == "probability"
 
     def _normalize_distribution(self, distribution: Array) -> Array:
         distribution = jnp.maximum(distribution.astype(jnp.float32), self.output_logit_eps)
@@ -458,8 +498,10 @@ class BDRModel(nnx.Module):
 
     def _z_to_output_logits(self, z_logits: Array, tokens: Array) -> Array:
         del tokens
-        if self._state_is_probability():
+        if self.outputs_are_probabilities():
             return self._normalize_distribution(z_logits)
+        if self._state_is_probability():
+            return self._logits_from_distribution(z_logits)
         return self._center_logits(z_logits)
 
     def initial_z(self, tokens: Array) -> Array:
@@ -511,24 +553,6 @@ class BDRModel(nnx.Module):
         del step_index
         return self._z_to_output_logits(z, tokens)
 
-    def _energy_descent_step(
-        self,
-        tokens: Array,
-        z_logits: Array,
-        read_state: Array,
-        step_index: Array,
-    ) -> tuple[Array, dict[str, Array]]:
-        del tokens, step_index
-        if self._state_is_probability():
-            next_distribution, diagnostics, _distributions = self._energy_probability_descent_from_read_state(
-                z_logits,
-                read_state,
-            )
-            return next_distribution, diagnostics
-        current_logits = self._center_logits(z_logits)
-        next_logits, diagnostics, _distributions = self._energy_descent_from_read_state(current_logits, read_state)
-        return next_logits, diagnostics
-
     def _energy_per_cell_from_read_state(
         self,
         candidate_distribution: Array,
@@ -542,29 +566,50 @@ class BDRModel(nnx.Module):
         )
         return self.energy_head(maybe_cast(energy_input, self.dtype)).astype(jnp.float32)[..., 0]
 
-    def _energy_per_cell_from_logit_state(
-        self,
-        candidate_logits: Array,
-        read_state: Array,
-    ) -> Array:
-        candidate_logits = self._center_logits(candidate_logits)
-        energy_condition = self.energy_state_to_hidden(
-            maybe_cast(candidate_logits, self.dtype)
-        ).astype(jnp.float32)
-        energy_input = self.energy_norm(
-            (read_state.astype(jnp.float32) + energy_condition).astype(self.dtype)
-        )
-        return self.energy_head(maybe_cast(energy_input, self.dtype)).astype(jnp.float32)[..., 0]
+    def _label_energies_from_read_state(self, read_state: Array) -> Array:
+        return self.label_energy_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
 
-    def _energy_value_for_logits(
+    def _distribution_energy_step_from_read_state(
         self,
-        z_logits: Array,
+        current_distribution: Array,
         read_state: Array,
-    ) -> Array:
-        if self._state_is_probability():
-            candidate_distribution = self._normalize_distribution(z_logits)
-            return self._energy_per_cell_from_read_state(candidate_distribution, read_state)
-        return self._energy_per_cell_from_logit_state(z_logits, read_state)
+    ) -> tuple[Array, dict[str, Array], tuple[Array, Array]]:
+        current_distribution = self._normalize_distribution(current_distribution)
+        label_energies = self._label_energies_from_read_state(read_state)
+        next_distribution = jax.nn.softmax(-label_energies, axis=-1)
+        distribution_step = next_distribution - current_distribution
+        distribution_tv_delta = 0.5 * jnp.sum(
+            jnp.abs(distribution_step),
+            axis=-1,
+            keepdims=True,
+        )
+        energy_update_rms = jnp.sqrt(jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True) + 1e-12)
+        energy_value = jnp.sum(current_distribution * label_energies, axis=-1, keepdims=True)
+        energy_entropy = -jnp.sum(
+            next_distribution * jnp.log(jnp.maximum(next_distribution, self.output_logit_eps)),
+            axis=-1,
+            keepdims=True,
+        ) / jnp.log(float(self.q_vocab_size))
+        path_energy = jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True)
+        zero = jnp.zeros_like(energy_update_rms)
+        diagnostics = {
+            "update_step_size": zero,
+            "update_rms": energy_update_rms,
+            "velocity_rms": zero,
+            "energy_update_rms": energy_update_rms,
+            "energy_value": energy_value,
+            "energy_grad_rms": zero,
+            "logit_step_rms": zero,
+            "energy_distribution_step_rms": energy_update_rms,
+            "energy_entropy": energy_entropy,
+            "proposal_update_rms": zero,
+            "proposal_entropy": zero,
+            "free_velocity_rms": zero,
+            "free_velocity_negative_rate": zero,
+            "distribution_tv_delta": distribution_tv_delta,
+            "path_energy": path_energy,
+        }
+        return next_distribution, diagnostics, (current_distribution, next_distribution)
 
     def _energy_probability_descent_from_read_state(
         self,
@@ -605,96 +650,96 @@ class BDRModel(nnx.Module):
             "energy_value": energy_value,
             "energy_grad_rms": energy_grad_rms,
             "logit_step_rms": distribution_step_rms,
+            "energy_distribution_step_rms": jnp.zeros_like(energy_grad_rms),
+            "energy_entropy": jnp.zeros_like(energy_grad_rms),
+            "proposal_update_rms": jnp.zeros_like(energy_grad_rms),
+            "proposal_entropy": jnp.zeros_like(energy_grad_rms),
+            "free_velocity_rms": jnp.zeros_like(energy_grad_rms),
+            "free_velocity_negative_rate": jnp.zeros_like(energy_grad_rms),
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
         }
         return next_distribution, diagnostics, (current_distribution, next_distribution)
 
-    def _velocity_step_from_read_state(
+    def _proposal_step_from_read_state(
         self,
-        current_logits: Array,
+        current_distribution: Array,
         read_state: Array,
     ) -> tuple[Array, dict[str, Array], tuple[Array, Array]]:
-        current_logits = self._center_logits(current_logits)
-        current_distribution = jax.nn.softmax(current_logits, axis=-1)
-        raw_velocity = self.velocity_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
-        velocity = self._center_logits(raw_velocity)
-        update_step_size_scalar = float(self.bdr.update_step_size)
-        raw_logit_step = update_step_size_scalar * velocity
-        logit_step = raw_logit_step
-        next_logits = self._center_logits(current_logits + logit_step)
-        next_distribution = jax.nn.softmax(next_logits, axis=-1)
-
+        current_distribution = self._normalize_distribution(current_distribution)
+        proposal_logits = self.proposal_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
+        next_distribution = jax.nn.softmax(proposal_logits, axis=-1)
+        distribution_step = next_distribution - current_distribution
         distribution_tv_delta = 0.5 * jnp.sum(
-            jnp.abs(next_distribution - current_distribution),
+            jnp.abs(distribution_step),
             axis=-1,
             keepdims=True,
         )
-        velocity_rms = jnp.sqrt(jnp.mean(jnp.square(velocity), axis=-1, keepdims=True) + 1e-12)
-        logit_step_rms = update_step_size_scalar * velocity_rms
-        path_energy = jnp.mean(jnp.square(logit_step), axis=-1, keepdims=True)
-        update_step_size = jnp.broadcast_to(
-            jnp.asarray(update_step_size_scalar, dtype=jnp.float32),
-            (*current_logits.shape[:-1], 1),
-        )
+        proposal_update_rms = jnp.sqrt(jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True) + 1e-12)
+        proposal_entropy = -jnp.sum(
+            next_distribution * jnp.log(jnp.maximum(next_distribution, self.output_logit_eps)),
+            axis=-1,
+            keepdims=True,
+        ) / jnp.log(float(self.q_vocab_size))
+        path_energy = jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True)
+        zero = jnp.zeros_like(proposal_update_rms)
         diagnostics = {
-            "update_step_size": update_step_size,
-            "update_rms": velocity_rms,
-            "velocity_rms": velocity_rms,
-            "energy_update_rms": jnp.zeros_like(velocity_rms),
-            "energy_value": jnp.zeros_like(velocity_rms),
-            "energy_grad_rms": jnp.zeros_like(velocity_rms),
-            "logit_step_rms": logit_step_rms,
+            "update_step_size": zero,
+            "update_rms": proposal_update_rms,
+            "velocity_rms": zero,
+            "energy_update_rms": zero,
+            "energy_value": zero,
+            "energy_grad_rms": zero,
+            "logit_step_rms": zero,
+            "energy_distribution_step_rms": zero,
+            "energy_entropy": zero,
+            "proposal_update_rms": proposal_update_rms,
+            "proposal_entropy": proposal_entropy,
+            "free_velocity_rms": zero,
+            "free_velocity_negative_rate": zero,
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
         }
-        return next_logits, diagnostics, (current_distribution, next_distribution)
+        return next_distribution, diagnostics, (current_distribution, next_distribution)
 
-    def _energy_descent_from_read_state(
+    def _free_velocity_step_from_read_state(
         self,
-        current_logits: Array,
+        current_distribution: Array,
         read_state: Array,
     ) -> tuple[Array, dict[str, Array], tuple[Array, Array]]:
-        current_logits = self._center_logits(current_logits)
-        current_distribution = jax.nn.softmax(current_logits, axis=-1)
-
-        def energy_per_cell(candidate_logits: Array) -> Array:
-            return self._energy_per_cell_from_logit_state(candidate_logits, read_state)
-
-        energy_cells, energy_vjp = jax.vjp(energy_per_cell, current_logits)
-        energy_value = energy_cells[..., None]
-        energy_grad = self._center_logits(energy_vjp(jnp.ones_like(energy_cells))[0])
-        descent_direction = -energy_grad
-        update_step_size_scalar = float(self.bdr.update_step_size)
-        logit_step = update_step_size_scalar * descent_direction
-        update_step_size = jnp.broadcast_to(
-            jnp.asarray(update_step_size_scalar, dtype=jnp.float32),
-            (*current_logits.shape[:-1], 1),
-        )
-        next_logits = self._center_logits(current_logits + logit_step)
-        next_distribution = jax.nn.softmax(next_logits, axis=-1)
-
+        current_distribution = self._normalize_distribution(current_distribution)
+        raw_delta = self.velocity_head(maybe_cast(read_state, self.dtype)).astype(jnp.float32)
+        delta = raw_delta - jnp.mean(raw_delta, axis=-1, keepdims=True)
+        pre_normalized = current_distribution + delta
+        negative_rate = jnp.mean((pre_normalized < 0.0).astype(jnp.float32), axis=-1, keepdims=True)
+        next_distribution = self._normalize_distribution(jax.nn.relu(pre_normalized) + self.output_logit_eps)
+        distribution_step = next_distribution - current_distribution
         distribution_tv_delta = 0.5 * jnp.sum(
-            jnp.abs(next_distribution - current_distribution),
+            jnp.abs(distribution_step),
             axis=-1,
             keepdims=True,
         )
-        energy_grad_rms = jnp.sqrt(jnp.mean(jnp.square(energy_grad), axis=-1, keepdims=True) + 1e-12)
-        update_rms = energy_grad_rms
-        logit_step_rms = update_step_size_scalar * update_rms
-        path_energy = jnp.mean(jnp.square(next_distribution - current_distribution), axis=-1, keepdims=True)
+        free_velocity_rms = jnp.sqrt(jnp.mean(jnp.square(delta), axis=-1, keepdims=True) + 1e-12)
+        path_energy = jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True)
+        zero = jnp.zeros_like(free_velocity_rms)
         diagnostics = {
-            "update_step_size": update_step_size,
-            "update_rms": update_rms,
-            "velocity_rms": jnp.zeros_like(update_rms),
-            "energy_update_rms": update_rms,
-            "energy_value": energy_value,
-            "energy_grad_rms": energy_grad_rms,
-            "logit_step_rms": logit_step_rms,
+            "update_step_size": zero,
+            "update_rms": free_velocity_rms,
+            "velocity_rms": zero,
+            "energy_update_rms": zero,
+            "energy_value": zero,
+            "energy_grad_rms": zero,
+            "logit_step_rms": zero,
+            "energy_distribution_step_rms": zero,
+            "energy_entropy": zero,
+            "proposal_update_rms": zero,
+            "proposal_entropy": zero,
+            "free_velocity_rms": free_velocity_rms,
+            "free_velocity_negative_rate": negative_rate,
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
         }
-        return next_logits, diagnostics, (current_distribution, next_distribution)
+        return next_distribution, diagnostics, (current_distribution, next_distribution)
 
     def _hidden_h_cycle(
         self,
@@ -755,12 +800,16 @@ class BDRModel(nnx.Module):
         )
         read_state = self._update_read_state(hidden_state)
         del step_index
-        if self.bdr.update_rule == "velocity":
-            z, update_diagnostics, update_distributions = self._velocity_step_from_read_state(z, read_state)
-        elif self._state_is_probability():
+        if self.bdr.update_rule == "energy_dist":
+            z, update_diagnostics, update_distributions = self._distribution_energy_step_from_read_state(z, read_state)
+        elif self.bdr.update_rule == "free_velocity":
+            z, update_diagnostics, update_distributions = self._free_velocity_step_from_read_state(z, read_state)
+        elif self.bdr.update_rule == "proposal":
+            z, update_diagnostics, update_distributions = self._proposal_step_from_read_state(z, read_state)
+        elif self.bdr.update_rule == "energy_prob":
             z, update_diagnostics, update_distributions = self._energy_probability_descent_from_read_state(z, read_state)
         else:
-            z, update_diagnostics, update_distributions = self._energy_descent_from_read_state(z, read_state)
+            raise ValueError(f"Unsupported BDR update_rule={self.bdr.update_rule!r}")
         return (
             z,
             hidden_state,
@@ -889,15 +938,25 @@ class BDRModel(nnx.Module):
             stop_hidden_between_steps=True,
         )
         current_logits = z_logits if self._state_is_probability() else self._center_logits(z_logits)
-        if self.bdr.update_rule == "velocity":
-            next_logits, diagnostics, update_distributions = self._velocity_step_from_read_state(current_logits, read_state)
-        elif self._state_is_probability():
+        if self.bdr.update_rule == "energy_dist":
+            next_logits, diagnostics, update_distributions = self._distribution_energy_step_from_read_state(
+                current_logits,
+                read_state,
+            )
+        elif self.bdr.update_rule == "free_velocity":
+            next_logits, diagnostics, update_distributions = self._free_velocity_step_from_read_state(
+                current_logits,
+                read_state,
+            )
+        elif self.bdr.update_rule == "proposal":
+            next_logits, diagnostics, update_distributions = self._proposal_step_from_read_state(current_logits, read_state)
+        elif self.bdr.update_rule == "energy_prob":
             next_logits, diagnostics, update_distributions = self._energy_probability_descent_from_read_state(
                 current_logits,
                 read_state,
             )
         else:
-            next_logits, diagnostics, update_distributions = self._energy_descent_from_read_state(current_logits, read_state)
+            raise ValueError(f"Unsupported BDR update_rule={self.bdr.update_rule!r}")
         target_logits = self.target_z_logits(targets)
         current_energy_cell = diagnostics["energy_value"][..., 0].astype(jnp.float32)
         mask = loss_mask.astype(bool)
@@ -908,16 +967,23 @@ class BDRModel(nnx.Module):
             example_mask = example_mask & (~exact)
         example_weight = example_mask.astype(jnp.float32)
         normalizer = jnp.maximum(jnp.sum(example_weight), 1.0)
-        if self.bdr.update_rule == "energy":
-            target_energy_cell = self._energy_value_for_logits(target_logits, read_state).astype(jnp.float32)
-            current_energy = self._masked_per_example_mean(current_energy_cell, mask)
+        if self.bdr.update_rule == "energy_dist":
+            label_energies = self._label_energies_from_read_state(read_state).astype(jnp.float32)
+            target_labels = jnp.clip(targets.astype(jnp.int32), 0, self.q_vocab_size - 1)
+            target_energy_cell = jnp.take_along_axis(label_energies, target_labels[..., None], axis=-1)[..., 0]
+            target_one_hot = jax.nn.one_hot(target_labels, self.q_vocab_size, dtype=bool)
+            wrong_energy_cell = jnp.min(jnp.where(target_one_hot, jnp.inf, label_energies), axis=-1)
+            cell_rank_loss = jax.nn.relu(
+                float(self.bdr.wrong_attractor_rank_margin)
+                + target_energy_cell
+                - wrong_energy_cell
+            )
+            per_example_rank_loss = self._masked_per_example_mean(cell_rank_loss, mask)
+            rank_loss = jnp.sum(per_example_rank_loss * example_weight) / normalizer
             target_energy = self._masked_per_example_mean(target_energy_cell, mask)
-            rank_loss = jnp.sum(
-                jax.nn.relu(float(self.bdr.wrong_attractor_rank_margin) + target_energy - current_energy)
-                * example_weight
-            ) / normalizer
-            energy_gap = jnp.sum((current_energy - target_energy) * example_weight) / normalizer
-        elif self._state_is_probability():
+            wrong_energy = self._masked_per_example_mean(wrong_energy_cell, mask)
+            energy_gap = jnp.sum((wrong_energy - target_energy) * example_weight) / normalizer
+        elif self.bdr.update_rule == "energy_prob":
             target_distribution = self._normalize_distribution(target_logits)
             target_energy_cell = self._energy_per_cell_from_read_state(target_distribution, read_state).astype(jnp.float32)
             current_energy = self._masked_per_example_mean(current_energy_cell, mask)
@@ -933,6 +999,7 @@ class BDRModel(nnx.Module):
 
         if self._state_is_probability():
             current_distribution, next_distribution = update_distributions
+            target_distribution = self._normalize_distribution(target_logits)
             update_direction = next_distribution - current_distribution
             target_direction = target_distribution - current_distribution
         else:
@@ -1245,6 +1312,12 @@ class BDRModel(nnx.Module):
             "energy_value": jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
             "energy_grad_rms": jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
             "logit_step_rms": jnp.mean(update_diagnostics["logit_step_rms"].astype(jnp.float32)),
+            "energy_distribution_step_rms": jnp.mean(update_diagnostics["energy_distribution_step_rms"].astype(jnp.float32)),
+            "energy_entropy": jnp.mean(update_diagnostics["energy_entropy"].astype(jnp.float32)),
+            "proposal_update_rms": jnp.mean(update_diagnostics["proposal_update_rms"].astype(jnp.float32)),
+            "proposal_entropy": jnp.mean(update_diagnostics["proposal_entropy"].astype(jnp.float32)),
+            "free_velocity_rms": jnp.mean(update_diagnostics["free_velocity_rms"].astype(jnp.float32)),
+            "free_velocity_negative_rate": jnp.mean(update_diagnostics["free_velocity_negative_rate"].astype(jnp.float32)),
             "distribution_tv_delta": jnp.mean(update_diagnostics["distribution_tv_delta"].astype(jnp.float32)),
             "path_energy": jnp.mean(update_diagnostics["path_energy"].astype(jnp.float32)),
             **early_stop_diagnostics,
@@ -1301,6 +1374,12 @@ class BDRModel(nnx.Module):
                 jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["logit_step_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["energy_distribution_step_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["energy_entropy"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["proposal_update_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["proposal_entropy"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["free_velocity_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["free_velocity_negative_rate"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["distribution_tv_delta"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["path_energy"].astype(jnp.float32)),
             )
@@ -1340,6 +1419,12 @@ class BDRModel(nnx.Module):
                 "energy_value": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_grad_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "logit_step_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "energy_distribution_step_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "energy_entropy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "proposal_update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "proposal_entropy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "free_velocity_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "free_velocity_negative_rate": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "distribution_tv_delta": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "path_energy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
             }
@@ -1354,6 +1439,12 @@ class BDRModel(nnx.Module):
             energy_value,
             energy_grad_rms,
             logit_step_rms,
+            energy_distribution_step_rms,
+            energy_entropy,
+            proposal_update_rms,
+            proposal_entropy,
+            free_velocity_rms,
+            free_velocity_negative_rate,
             distribution_tv_delta,
             path_energy,
         ) = scan_outputs
@@ -1367,6 +1458,12 @@ class BDRModel(nnx.Module):
             "energy_value": energy_value,
             "energy_grad_rms": energy_grad_rms,
             "logit_step_rms": logit_step_rms,
+            "energy_distribution_step_rms": energy_distribution_step_rms,
+            "energy_entropy": energy_entropy,
+            "proposal_update_rms": proposal_update_rms,
+            "proposal_entropy": proposal_entropy,
+            "free_velocity_rms": free_velocity_rms,
+            "free_velocity_negative_rate": free_velocity_negative_rate,
             "distribution_tv_delta": distribution_tv_delta,
             "path_energy": path_energy,
         }

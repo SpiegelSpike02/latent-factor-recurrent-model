@@ -153,10 +153,22 @@ def _bdr_step_loss_weights(model: BDRModel, rollout_steps: int) -> jax.Array:
 
 def _bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
     update_rule = model.bdr.update_rule
-    if update_rule == "velocity":
+    if update_rule == "proposal":
         return {
-            "velocity_rms": diagnostics["velocity_rms"],
-            "velocity_logit_step_rms": diagnostics["logit_step_rms"],
+            "proposal_update_rms": diagnostics["proposal_update_rms"],
+            "proposal_entropy": diagnostics["proposal_entropy"],
+        }
+    if update_rule == "free_velocity":
+        return {
+            "free_velocity_rms": diagnostics["free_velocity_rms"],
+            "free_velocity_negative_rate": diagnostics["free_velocity_negative_rate"],
+        }
+    if update_rule == "energy_dist":
+        return {
+            "energy_update_rms": diagnostics["energy_update_rms"],
+            "energy_value": diagnostics["energy_value"],
+            "energy_distribution_step_rms": diagnostics["energy_distribution_step_rms"],
+            "energy_entropy": diagnostics["energy_entropy"],
         }
     if update_rule == "energy_prob":
         return {
@@ -165,12 +177,7 @@ def _bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax.Array]) 
             "energy_grad_rms": diagnostics["energy_grad_rms"],
             "energy_probability_step_rms": diagnostics["logit_step_rms"],
         }
-    return {
-        "energy_update_rms": diagnostics["energy_update_rms"],
-        "energy_value": diagnostics["energy_value"],
-        "energy_grad_rms": diagnostics["energy_grad_rms"],
-        "energy_logit_step_rms": diagnostics["logit_step_rms"],
-    }
+    raise ValueError(f"Unsupported BDR update_rule={update_rule!r}")
 
 
 def _mean_bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
@@ -182,6 +189,29 @@ def _per_step_bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax
         f"per_step_{name}": value
         for name, value in _bdr_branch_diagnostics(model, diagnostics).items()
     }
+
+
+def _bdr_attractor_metrics(model: BDRModel, losses: dict[str, jax.Array]) -> dict[str, jax.Array]:
+    metrics: dict[str, jax.Array] = {}
+    has_energy_rank = model.bdr.update_rule in ("energy_prob", "energy_dist")
+    if float(model.bdr.wrong_attractor_rank_weight) != 0.0 and has_energy_rank:
+        metrics["wrong_attractor_rank_loss"] = losses["wrong_attractor_rank_loss"]
+        metrics["wrong_attractor_energy_gap"] = losses["wrong_attractor_energy_gap"]
+        metrics["wrong_attractor_active_rate"] = losses["wrong_attractor_active_rate"]
+    if float(model.bdr.wrong_attractor_direction_weight) != 0.0:
+        metrics["wrong_attractor_direction_loss"] = losses["wrong_attractor_direction_loss"]
+        metrics["wrong_attractor_direction_cosine"] = losses["wrong_attractor_direction_cosine"]
+        metrics["wrong_attractor_active_rate"] = losses["wrong_attractor_active_rate"]
+    if float(model.bdr.wrong_attractor_nonzero_weight) != 0.0:
+        metrics["wrong_attractor_nonzero_loss"] = losses["wrong_attractor_nonzero_loss"]
+        metrics["wrong_attractor_active_rate"] = losses["wrong_attractor_active_rate"]
+    if float(model.bdr.corrupted_recovery_weight) != 0.0:
+        metrics["corrupted_recovery_loss"] = losses["corrupted_recovery_loss"]
+        metrics["corrupted_recovery_direction_cosine"] = losses["corrupted_recovery_direction_cosine"]
+        if has_energy_rank:
+            metrics["corrupted_recovery_rank_loss"] = losses["corrupted_recovery_rank_loss"]
+            metrics["corrupted_recovery_energy_gap"] = losses["corrupted_recovery_energy_gap"]
+    return metrics
 
 
 def _trm_step_loss_weights(model: GridReasoningModel, rollout_steps: int) -> jax.Array:
@@ -295,7 +325,7 @@ def bdr_loss_and_metrics(
             train=train,
             dropout_key=attractor_key,
         )
-        attractor_metrics = attractor_losses
+        attractor_metrics = _bdr_attractor_metrics(model, attractor_losses)
     else:
         attractor_losses = {
             "wrong_attractor_rank_loss": zero,
@@ -366,8 +396,6 @@ def bdr_loss_and_metrics(
         "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
         "step_loss_weights": step_loss_weights,
         "q_top1_probability": q_top1_probability,
-        "update_step_size": jnp.mean(diagnostics["update_step_size"]),
-        "update_rms": jnp.mean(diagnostics["update_rms"]),
         "distribution_tv_delta": jnp.mean(diagnostics["distribution_tv_delta"]),
         "path_energy": jnp.mean(diagnostics["path_energy"]),
         **_mean_bdr_branch_diagnostics(model, diagnostics),
@@ -383,8 +411,6 @@ def bdr_loss_and_metrics(
         {
             "per_step_loss": per_step_loss,
             "per_step_q_top1_probability": per_step_q_top1_probability,
-            "per_step_update_step_size": diagnostics["update_step_size"],
-            "per_step_update_rms": diagnostics["update_rms"],
             "per_step_distribution_tv_delta": diagnostics["distribution_tv_delta"],
             "per_step_path_energy": diagnostics["path_energy"],
             **_per_step_bdr_branch_diagnostics(model, diagnostics),
@@ -475,7 +501,7 @@ def bdr_carry_loss_and_metrics(
             train=train,
             dropout_key=attractor_key,
         )
-        attractor_metrics = attractor_losses
+        attractor_metrics = _bdr_attractor_metrics(model, attractor_losses)
     else:
         zero = jnp.asarray(0.0, dtype=jnp.float32)
         attractor_losses = {
@@ -523,8 +549,6 @@ def bdr_carry_loss_and_metrics(
         "early_stop_flip_rate": diagnostics["early_stop_flip_rate"],
         "early_stop_margin_min": diagnostics["early_stop_margin_min"],
         "early_stop_constraint_rate": diagnostics["early_stop_constraint_rate"],
-        "update_step_size": diagnostics["update_step_size"],
-        "update_rms": diagnostics["update_rms"],
         "distribution_tv_delta": diagnostics["distribution_tv_delta"],
         "path_energy": diagnostics["path_energy"],
         **_bdr_branch_diagnostics(model, diagnostics),

@@ -64,13 +64,10 @@ PER_STEP_SCALAR_SERIES = (
     ("per_step_loss", "loss_by_step"),
     ("per_step_accuracy", "accuracy_by_step"),
     ("per_step_q_top1_probability", "q_top1_probability_by_step"),
-    ("per_step_update_step_size", "update_step_size_by_step"),
     ("per_step_update_rms", "update_rms_by_step"),
-    ("per_step_velocity_rms", "velocity_rms_by_step"),
     ("per_step_energy_update_rms", "energy_update_rms_by_step"),
     ("per_step_energy_value", "energy_value_by_step"),
     ("per_step_energy_grad_rms", "energy_grad_rms_by_step"),
-    ("per_step_logit_step_rms", "logit_step_rms_by_step"),
     ("per_step_distribution_tv_delta", "distribution_tv_delta_by_step"),
     ("per_step_path_energy", "path_energy_by_step"),
 )

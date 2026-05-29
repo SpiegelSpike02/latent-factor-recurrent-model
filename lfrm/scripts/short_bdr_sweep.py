@@ -31,8 +31,14 @@ KEY_METRICS = (
     "distribution_tv_delta",
     "path_energy",
     "update_rms",
+    "proposal_update_rms",
+    "proposal_entropy",
+    "free_velocity_rms",
+    "free_velocity_negative_rate",
     "energy_grad_rms",
-    "logit_step_rms",
+    "energy_probability_step_rms",
+    "energy_distribution_step_rms",
+    "energy_entropy",
     "wrong_attractor_rank_loss",
     "wrong_attractor_direction_loss",
     "wrong_attractor_nonzero_loss",
@@ -54,7 +60,6 @@ def _load_config(
     config_path: str,
     *,
     update_rule: str,
-    update_step_size: float,
     steps: int,
     batch_size: int,
     commit_steps: int | None,
@@ -78,7 +83,8 @@ def _load_config(
     bdr = replace(
         config.model.bdr_config,
         update_rule=update_rule,
-        update_step_size=update_step_size,
+        draft_view="probability",
+        prediction_view="probability",
     )
     if commit_steps is not None:
         bdr = replace(bdr, commit_steps=commit_steps)
@@ -146,7 +152,6 @@ def _run_trial(
     config_path: str,
     output_dir: Path,
     update_rule: str,
-    update_step_size: float,
     steps: int,
     batch_size: int,
     commit_steps: int | None,
@@ -158,7 +163,6 @@ def _run_trial(
     config, dataset = _load_config(
         config_path,
         update_rule=update_rule,
-        update_step_size=update_step_size,
         steps=steps,
         batch_size=batch_size,
         commit_steps=commit_steps,
@@ -171,7 +175,7 @@ def _run_trial(
     carry = model.initial_carry(batch)
     key = jax.random.key(seed)
 
-    tag = f"{update_rule}_eta{update_step_size:g}_b{batch_size}_u{steps}_c{config.model.bdr_config.commit_steps}_s{seed}"
+    tag = f"{update_rule}_b{batch_size}_u{steps}_c{config.model.bdr_config.commit_steps}_s{seed}"
     log_path = output_dir / f"{tag}.jsonl"
     rows: list[dict[str, float]] = []
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -190,7 +194,6 @@ def _run_trial(
                 row = {
                     "step": float(step),
                     "update_rule": update_rule,
-                    "update_step_size": float(update_step_size),
                     "commit_steps": float(config.model.bdr_config.commit_steps),
                 }
                 row.update({name: _metric(host_metrics, name) for name in KEY_METRICS})
@@ -201,7 +204,6 @@ def _run_trial(
     summary.update(
         {
             "update_rule": update_rule,
-            "update_step_size": update_step_size,
             "log_path": str(log_path),
             "steps": steps,
             "batch_size": batch_size,
@@ -214,7 +216,7 @@ def _run_trial(
 
 def _print_summary(summaries: list[dict[str, Any]]) -> None:
     print(
-        "eta    best_qacc best_qprob best_loss final_qacc final_qprob final_loss conflicts log",
+        "rule          best_qacc best_qprob best_loss final_qacc final_qprob final_loss conflicts log",
         flush=True,
     )
     for summary in summaries:
@@ -223,7 +225,7 @@ def _print_summary(summaries: list[dict[str, Any]]) -> None:
         best_l = summary["best_loss"]
         final = summary["final"]
         print(
-            f"{summary['update_step_size']:<6g} "
+            f"{summary['update_rule']:<13} "
             f"{best_q['query_accuracy']:.4f}    "
             f"{best_p['query_target_probability']:.4f}     "
             f"{best_l['loss']:.4f}    "
@@ -240,8 +242,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run a very short BDR sweep and summarize train metrics.")
     parser.add_argument("--config", default="configs/sudoku_bdr.toml")
     parser.add_argument("--output-dir", default="logs/ablations/short_bdr_sweep")
-    parser.add_argument("--update-rule", choices=("energy", "velocity"), default="energy")
-    parser.add_argument("--update-step-sizes", type=float, nargs="+", default=[0.1, 0.2, 0.3, 0.5])
+    parser.add_argument("--update-rule", choices=("energy_prob", "energy_dist", "free_velocity", "proposal"), default="proposal")
     parser.add_argument("--steps", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--commit-steps", type=int, default=8)
@@ -255,23 +256,21 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     summaries = []
     started_at = time.strftime("%Y%m%d-%H%M%S")
-    for update_step_size in args.update_step_sizes:
-        print(f"[short-sweep] {args.update_rule} eta={update_step_size:g}", flush=True)
-        summaries.append(
-            _run_trial(
-                config_path=args.config,
-                output_dir=output_dir,
-                update_rule=args.update_rule,
-                update_step_size=update_step_size,
-                steps=args.steps,
-                batch_size=args.batch_size,
-                commit_steps=args.commit_steps,
-                split=args.split,
-                index=args.index,
-                seed=args.seed,
-                log_every=args.log_every,
-            )
+    print(f"[short-sweep] {args.update_rule}", flush=True)
+    summaries.append(
+        _run_trial(
+            config_path=args.config,
+            output_dir=output_dir,
+            update_rule=args.update_rule,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            commit_steps=args.commit_steps,
+            split=args.split,
+            index=args.index,
+            seed=args.seed,
+            log_every=args.log_every,
         )
+    )
     summary_path = output_dir / f"summary_{args.update_rule}_{started_at}.json"
     summary_path.write_text(json.dumps(summaries, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     _print_summary(summaries)

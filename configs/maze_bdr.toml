@@ -20,7 +20,9 @@ commit_steps = 48
 refine_steps = 4
 block_depth = 2
 step_loss_schedule = "uniform"
-update_step_size = 0.3
+update_rule = "proposal"
+draft_view = "probability"
+prediction_view = "probability"
 
 [model.bdr.objective]
 path_energy_weight = 0.0

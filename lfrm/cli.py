@@ -39,6 +39,8 @@ GROUPED_NESTED_KEYS = {
             "block_depth",
             "step_loss_schedule",
             "update_rule",
+            "draft_view",
+            "prediction_view",
             "update_step_size",
         },
         "objective": {
@@ -170,6 +172,8 @@ ALLOWED_NESTED_KEYS = {
         "rope_theta",
         "step_loss_schedule",
         "update_rule",
+        "draft_view",
+        "prediction_view",
         "update_step_size",
         "path_energy_weight",
         "fixed_point_update_weight",
@@ -355,7 +359,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bdr-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--bdr-rope-theta", type=float, default=10000.0)
     parser.add_argument("--bdr-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
-    parser.add_argument("--bdr-update-rule", choices=("energy", "energy_prob", "velocity"), default="energy")
+    parser.add_argument("--bdr-update-rule", choices=("energy_prob", "energy_dist", "free_velocity", "proposal"), default="proposal")
+    parser.add_argument("--bdr-draft-view", choices=("auto", "logits", "probability"), default="auto")
+    parser.add_argument("--bdr-prediction-view", choices=("auto", "logits", "probability"), default="auto")
     parser.add_argument("--bdr-update-step-size", type=float, default=0.3)
     parser.add_argument("--bdr-path-energy-weight", type=float, default=1e-4)
     parser.add_argument("--bdr-fixed-point-update-weight", type=float, default=0.0)
@@ -514,6 +520,8 @@ def build_config(
             rope_theta=args.bdr_rope_theta,
             step_loss_schedule=args.bdr_step_loss_schedule,
             update_rule=args.bdr_update_rule,
+            draft_view=args.bdr_draft_view,
+            prediction_view=args.bdr_prediction_view,
             update_step_size=args.bdr_update_step_size,
             path_energy_weight=args.bdr_path_energy_weight,
             fixed_point_update_weight=args.bdr_fixed_point_update_weight,

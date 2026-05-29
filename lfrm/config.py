@@ -44,7 +44,9 @@ class BDRConfig:
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     step_loss_schedule: str = "uniform"
-    update_rule: str = "energy"
+    update_rule: str = "proposal"
+    draft_view: str = "auto"
+    prediction_view: str = "auto"
     update_step_size: float = 0.3
     path_energy_weight: float = 1e-4
     fixed_point_update_weight: float = 0.0
