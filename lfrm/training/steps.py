@@ -151,6 +151,39 @@ def _bdr_step_loss_weights(model: BDRModel, rollout_steps: int) -> jax.Array:
     return weights / jnp.maximum(jnp.sum(weights), 1e-6)
 
 
+def _bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
+    update_rule = model.bdr.update_rule
+    if update_rule == "velocity":
+        return {
+            "velocity_rms": diagnostics["velocity_rms"],
+            "velocity_logit_step_rms": diagnostics["logit_step_rms"],
+        }
+    if update_rule == "energy_prob":
+        return {
+            "energy_update_rms": diagnostics["energy_update_rms"],
+            "energy_value": diagnostics["energy_value"],
+            "energy_grad_rms": diagnostics["energy_grad_rms"],
+            "energy_probability_step_rms": diagnostics["logit_step_rms"],
+        }
+    return {
+        "energy_update_rms": diagnostics["energy_update_rms"],
+        "energy_value": diagnostics["energy_value"],
+        "energy_grad_rms": diagnostics["energy_grad_rms"],
+        "energy_logit_step_rms": diagnostics["logit_step_rms"],
+    }
+
+
+def _mean_bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
+    return {name: jnp.mean(value) for name, value in _bdr_branch_diagnostics(model, diagnostics).items()}
+
+
+def _per_step_bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
+    return {
+        f"per_step_{name}": value
+        for name, value in _bdr_branch_diagnostics(model, diagnostics).items()
+    }
+
+
 def _trm_step_loss_weights(model: GridReasoningModel, rollout_steps: int) -> jax.Array:
     recurrent_config = getattr(model, "trm", None) or getattr(model, "urm", None)
     return _normalized_step_loss_weights(getattr(recurrent_config, "step_loss_weights", None), rollout_steps)
@@ -237,12 +270,13 @@ def bdr_loss_and_metrics(
         )
     else:
         fixed_point_update_loss = zero
-    if (
+    use_attractor_losses = (
         float(model.bdr.wrong_attractor_rank_weight) != 0.0
         or float(model.bdr.wrong_attractor_direction_weight) != 0.0
         or float(model.bdr.wrong_attractor_nonzero_weight) != 0.0
         or float(model.bdr.corrupted_recovery_weight) != 0.0
-    ):
+    )
+    if use_attractor_losses:
         base_embeddings, _context = model.context_memory(inputs, puzzle_identifiers)
         probe_hidden = model.initial_hidden_state(
             inputs,
@@ -261,6 +295,7 @@ def bdr_loss_and_metrics(
             train=train,
             dropout_key=attractor_key,
         )
+        attractor_metrics = attractor_losses
     else:
         attractor_losses = {
             "wrong_attractor_rank_loss": zero,
@@ -274,6 +309,7 @@ def bdr_loss_and_metrics(
             "corrupted_recovery_direction_cosine": zero,
             "corrupted_recovery_energy_gap": zero,
         }
+        attractor_metrics = {}
     solution_loss = per_step_loss[-1]
     loss = (
         step_ce_loss
@@ -320,7 +356,7 @@ def bdr_loss_and_metrics(
         "mean_token_loss": jnp.mean(per_step_loss),
         "path_energy_loss": path_energy_loss,
         "fixed_point_update_loss": fixed_point_update_loss,
-        **attractor_losses,
+        **attractor_metrics,
         "final_target_probability": target_probability,
         "accuracy": cell_accuracy,
         "query_accuracy": query_accuracy,
@@ -332,13 +368,9 @@ def bdr_loss_and_metrics(
         "q_top1_probability": q_top1_probability,
         "update_step_size": jnp.mean(diagnostics["update_step_size"]),
         "update_rms": jnp.mean(diagnostics["update_rms"]),
-        "velocity_rms": jnp.mean(diagnostics["velocity_rms"]),
-        "energy_update_rms": jnp.mean(diagnostics["energy_update_rms"]),
-        "energy_value": jnp.mean(diagnostics["energy_value"]),
-        "energy_grad_rms": jnp.mean(diagnostics["energy_grad_rms"]),
-        "logit_step_rms": jnp.mean(diagnostics["logit_step_rms"]),
         "distribution_tv_delta": jnp.mean(diagnostics["distribution_tv_delta"]),
         "path_energy": jnp.mean(diagnostics["path_energy"]),
+        **_mean_bdr_branch_diagnostics(model, diagnostics),
     }
     if model.config.task_type == "sudoku":
         metrics.update(
@@ -353,13 +385,9 @@ def bdr_loss_and_metrics(
             "per_step_q_top1_probability": per_step_q_top1_probability,
             "per_step_update_step_size": diagnostics["update_step_size"],
             "per_step_update_rms": diagnostics["update_rms"],
-            "per_step_velocity_rms": diagnostics["velocity_rms"],
-            "per_step_energy_update_rms": diagnostics["energy_update_rms"],
-            "per_step_energy_value": diagnostics["energy_value"],
-            "per_step_energy_grad_rms": diagnostics["energy_grad_rms"],
-            "per_step_logit_step_rms": diagnostics["logit_step_rms"],
             "per_step_distribution_tv_delta": diagnostics["distribution_tv_delta"],
             "per_step_path_energy": diagnostics["path_energy"],
+            **_per_step_bdr_branch_diagnostics(model, diagnostics),
         }
     )
     if model.config.task_type == "sudoku":
@@ -430,12 +458,13 @@ def bdr_carry_loss_and_metrics(
         )
     else:
         fixed_point_update_loss = jnp.asarray(0.0, dtype=jnp.float32)
-    if (
+    use_attractor_losses = (
         float(model.bdr.wrong_attractor_rank_weight) != 0.0
         or float(model.bdr.wrong_attractor_direction_weight) != 0.0
         or float(model.bdr.wrong_attractor_nonzero_weight) != 0.0
         or float(model.bdr.corrupted_recovery_weight) != 0.0
-    ):
+    )
+    if use_attractor_losses:
         attractor_losses = model.attractor_recovery_losses(
             inputs,
             targets,
@@ -446,6 +475,7 @@ def bdr_carry_loss_and_metrics(
             train=train,
             dropout_key=attractor_key,
         )
+        attractor_metrics = attractor_losses
     else:
         zero = jnp.asarray(0.0, dtype=jnp.float32)
         attractor_losses = {
@@ -460,6 +490,7 @@ def bdr_carry_loss_and_metrics(
             "corrupted_recovery_direction_cosine": zero,
             "corrupted_recovery_energy_gap": zero,
         }
+        attractor_metrics = {}
     loss = (
         ce_loss
         + float(model.bdr.path_energy_weight) * path_energy_loss
@@ -474,7 +505,7 @@ def bdr_carry_loss_and_metrics(
         "token_loss": ce_loss,
         "path_energy_loss": path_energy_loss,
         "fixed_point_update_loss": fixed_point_update_loss,
-        **attractor_losses,
+        **attractor_metrics,
         "accuracy": accuracy,
         "query_accuracy": query_accuracy,
         "exact_accuracy": exact_accuracy,
@@ -494,13 +525,9 @@ def bdr_carry_loss_and_metrics(
         "early_stop_constraint_rate": diagnostics["early_stop_constraint_rate"],
         "update_step_size": diagnostics["update_step_size"],
         "update_rms": diagnostics["update_rms"],
-        "velocity_rms": diagnostics["velocity_rms"],
-        "energy_update_rms": diagnostics["energy_update_rms"],
-        "energy_value": diagnostics["energy_value"],
-        "energy_grad_rms": diagnostics["energy_grad_rms"],
-        "logit_step_rms": diagnostics["logit_step_rms"],
         "distribution_tv_delta": diagnostics["distribution_tv_delta"],
         "path_energy": diagnostics["path_energy"],
+        **_bdr_branch_diagnostics(model, diagnostics),
     }
     if model.config.task_type == "sudoku":
         metrics.update(
