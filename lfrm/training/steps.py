@@ -200,6 +200,7 @@ def bdr_loss_and_metrics(
         )
     else:
         inputs, targets = batch["inputs"], batch["labels"]
+    puzzle_identifiers = batch.get("puzzle_identifiers")
     example_mask = _example_mask(batch, targets)
     loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
     zero = jnp.asarray(0.0, dtype=jnp.float32)
@@ -212,6 +213,7 @@ def bdr_loss_and_metrics(
     step_logits, diagnostics = model.run_commit_steps(
         inputs,
         initial_z=initial_z,
+        puzzle_identifiers=puzzle_identifiers,
         train=False,
         dropout_key=solve_key,
     )
@@ -229,6 +231,7 @@ def bdr_loss_and_metrics(
             inputs,
             targets,
             loss_mask,
+            puzzle_identifiers=puzzle_identifiers,
             train=train,
             dropout_key=terminal_key,
         )
@@ -240,7 +243,7 @@ def bdr_loss_and_metrics(
         or float(model.bdr.wrong_attractor_nonzero_weight) != 0.0
         or float(model.bdr.corrupted_recovery_weight) != 0.0
     ):
-        base_embeddings, _context = model.context_memory(inputs)
+        base_embeddings, _context = model.context_memory(inputs, puzzle_identifiers)
         probe_hidden = model.initial_hidden_state(
             inputs,
             final_logits,
@@ -254,6 +257,7 @@ def bdr_loss_and_metrics(
             loss_mask,
             final_logits,
             probe_hidden,
+            puzzle_identifiers=puzzle_identifiers,
             train=train,
             dropout_key=attractor_key,
         )
@@ -388,6 +392,7 @@ def bdr_carry_loss_and_metrics(
     )
     inputs = new_carry["current_inputs"]
     targets = new_carry["current_labels"]
+    puzzle_identifiers = new_carry.get("current_puzzle_identifiers")
     example_mask = new_carry["current_example_mask"].astype(jnp.float32)
     loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
     normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32)), 1.0)
@@ -419,6 +424,7 @@ def bdr_carry_loss_and_metrics(
             inputs,
             targets,
             loss_mask,
+            puzzle_identifiers=puzzle_identifiers,
             train=train,
             dropout_key=terminal_key,
         )
@@ -436,6 +442,7 @@ def bdr_carry_loss_and_metrics(
             loss_mask,
             new_carry["z"],
             new_carry["hidden"],
+            puzzle_identifiers=puzzle_identifiers,
             train=train,
             dropout_key=attractor_key,
         )

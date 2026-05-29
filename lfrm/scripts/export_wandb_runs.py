@@ -16,6 +16,8 @@ RUN_PREFIXES = ("sudoku-bdr", "maze-bdr", "sudoku-brc", "maze-brc", "arc")
 
 
 SUMMARY_KEYS = (
+    "_step",
+    "_runtime",
     "train/loss",
     "train/token_loss",
     "train/query_accuracy",

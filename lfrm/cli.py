@@ -355,7 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bdr-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--bdr-rope-theta", type=float, default=10000.0)
     parser.add_argument("--bdr-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
-    parser.add_argument("--bdr-update-rule", choices=("energy", "velocity"), default="energy")
+    parser.add_argument("--bdr-update-rule", choices=("energy", "energy_prob", "velocity"), default="energy")
     parser.add_argument("--bdr-update-step-size", type=float, default=0.3)
     parser.add_argument("--bdr-path-energy-weight", type=float, default=1e-4)
     parser.add_argument("--bdr-fixed-point-update-weight", type=float, default=0.0)

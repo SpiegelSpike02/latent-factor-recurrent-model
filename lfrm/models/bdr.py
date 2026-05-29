@@ -108,9 +108,7 @@ class BDRSolverBlock(nnx.Module):
         )
         bdr = config.bdr_config
         self.attn_norm = unscaled_rms_norm(hidden_dim, bdr.rms_norm_eps, dtype, rngs)
-        self.attn_context_norm = unscaled_rms_norm(hidden_dim, bdr.rms_norm_eps, dtype, rngs)
         self.local_norm = unscaled_rms_norm(hidden_dim, bdr.rms_norm_eps, dtype, rngs)
-        self.local_context_norm = unscaled_rms_norm(hidden_dim, bdr.rms_norm_eps, dtype, rngs)
         self.attn_scale = float(bdr.attn_scale)
         self.local_scale = float(bdr.local_scale)
         self.num_heads = num_heads
@@ -127,76 +125,65 @@ class BDRSolverBlock(nnx.Module):
         self,
         h: Array,
         context_condition: Array,
-        state_condition: Array,
+        draft_condition: Array,
         rope_cos: Array | None,
         rope_sin: Array | None,
     ) -> Array:
         h = self.global_communicate(
             h,
             context_condition,
-            state_condition,
+            draft_condition,
             rope_cos,
             rope_sin,
         )
-        return self.local_think(h, context_condition, state_condition)
+        return self.local_think(h, context_condition, draft_condition)
 
-    def global_communicate(
+    def _self_attention(
         self,
-        h: Array,
-        context_condition: Array,
-        state_condition: Array,
+        hidden_state: Array,
         rope_cos: Array | None,
         rope_sin: Array | None,
-        route_condition: Array | None = None,
     ) -> Array:
-        if route_condition is None:
-            route_condition = self.normalized_attn_context(context_condition)
-        state_hint = state_condition.astype(jnp.float32)
-        # Attention routing is anchored by the hidden workspace and hard context.
-        # The stopped z signal is only a value hint for update construction.
-        route = (
-            self.attn_norm(h.astype(jnp.float32)).astype(jnp.float32)
-            + route_condition
-        ).astype(self.dtype)
-        value = (route.astype(jnp.float32) + state_hint).astype(self.dtype)
-        attn = multi_head_attention_with_rope(
+        return multi_head_attention_with_rope(
             self.self_attention,
-            route,
-            route,
-            value,
+            hidden_state,
+            hidden_state,
+            hidden_state,
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             dtype=self.dtype,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
-            name="BDR state-conditioned attention",
+            name="BDR draft-conditioned attention",
         )
-        return (h.astype(jnp.float32) + self.attn_scale * attn.astype(jnp.float32)).astype(self.dtype)
+
+    def global_communicate(
+        self,
+        h: Array,
+        context_condition: Array,
+        draft_condition: Array,
+        rope_cos: Array | None,
+        rope_sin: Array | None,
+    ) -> Array:
+        injected = (
+            h.astype(jnp.float32)
+            + context_condition.astype(jnp.float32)
+            + draft_condition.astype(jnp.float32)
+        ).astype(self.dtype)
+        attended_state = self.attn_norm(injected).astype(self.dtype)
+        attn = self._self_attention(attended_state, rope_cos, rope_sin)
+        return (injected.astype(jnp.float32) + self.attn_scale * attn.astype(jnp.float32)).astype(self.dtype)
 
     def local_think(
         self,
         h: Array,
         context_condition: Array,
-        state_condition: Array,
-        route_condition: Array | None = None,
+        draft_condition: Array,
     ) -> Array:
-        if route_condition is None:
-            route_condition = self.normalized_local_context(context_condition)
-        state_hint = state_condition.astype(jnp.float32)
-        local_base = (
-            self.local_norm(h.astype(jnp.float32)).astype(jnp.float32)
-            + route_condition
-        ).astype(self.dtype)
-        # Local mixing has fixed spatial routing, so it can safely consume the z-derived state hint.
-        local_input = (local_base.astype(jnp.float32) + state_hint).astype(self.dtype)
+        del context_condition, draft_condition
+        local_input = self.local_norm(h.astype(jnp.float32)).astype(self.dtype)
         local = self.local_mlp(local_input).astype(jnp.float32)
         return (h.astype(jnp.float32) + self.local_scale * local).astype(self.dtype)
-
-    def normalized_attn_context(self, context_condition: Array) -> Array:
-        return self.attn_context_norm(context_condition.astype(jnp.float32)).astype(jnp.float32)
-
-    def normalized_local_context(self, context_condition: Array) -> Array:
-        return self.local_context_norm(context_condition.astype(jnp.float32)).astype(jnp.float32)
 
 
 class BDRModel(nnx.Module):
@@ -242,8 +229,8 @@ class BDRModel(nnx.Module):
             raise ValueError("BDR axial RoPE head dimension must be divisible by 4")
         if bdr.step_loss_schedule not in ("uniform", "linear", "quadratic"):
             raise ValueError("BDR step_loss_schedule must be 'uniform', 'linear', or 'quadratic'")
-        if bdr.update_rule not in ("energy", "velocity"):
-            raise ValueError("BDR update_rule must be 'energy' or 'velocity'")
+        if bdr.update_rule not in ("energy", "energy_prob", "velocity"):
+            raise ValueError("BDR update_rule must be 'energy', 'energy_prob', or 'velocity'")
         if bdr.update_step_size <= 0.0:
             raise ValueError("BDR update_step_size must be positive")
         if bdr.fixed_point_label_smoothing < 0.0 or bdr.fixed_point_label_smoothing >= 1.0:
@@ -302,7 +289,7 @@ class BDRModel(nnx.Module):
         self.num_boxes = int(box_indices.shape[0])
 
         embed_init = trunc_normal_init(1.0 / self.embed_scale)
-        self.puzzle_embed = nnx.Embed(
+        self.token_embed = nnx.Embed(
             self.input_vocab_size,
             config.d_model,
             dtype=self.dtype,
@@ -310,13 +297,12 @@ class BDRModel(nnx.Module):
             embedding_init=embed_init,
             rngs=rngs,
         )
-        self.context_embed = nnx.Embed(2, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
-        self.state_embed = nnx.Embed(
-            max(10, self.q_vocab_size),
+        self.puzzle_identifier_embed = nnx.Embed(
+            config.num_puzzle_identifiers,
             config.d_model,
             dtype=self.dtype,
             param_dtype=jnp.float32,
-            embedding_init=embed_init,
+            embedding_init=nnx.initializers.zeros,
             rngs=rngs,
         )
         if bdr.position_encoding == "learned":
@@ -346,17 +332,8 @@ class BDRModel(nnx.Module):
             kernel_init=casted_linear_init,
             rngs=rngs,
         )
-        self.state_to_hidden = nnx.Linear(
-            config.d_model,
-            self.hidden_dim,
-            use_bias=False,
-            dtype=self.dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.state_scalar_to_hidden = nnx.Linear(
-            3,
+        self.draft_to_hidden = nnx.Linear(
+            self.q_vocab_size,
             self.hidden_dim,
             use_bias=False,
             dtype=self.dtype,
@@ -439,6 +416,18 @@ class BDRModel(nnx.Module):
         """Return the explicit answer distribution view from centered logits."""
         return jax.nn.softmax(z_logits.astype(jnp.float32), axis=-1)
 
+    def _state_is_probability(self) -> bool:
+        return self.bdr.update_rule == "energy_prob"
+
+    def _normalize_distribution(self, distribution: Array) -> Array:
+        distribution = jnp.maximum(distribution.astype(jnp.float32), self.output_logit_eps)
+        return distribution / jnp.sum(distribution, axis=-1, keepdims=True)
+
+    def _state_distribution(self, state: Array) -> Array:
+        if self._state_is_probability():
+            return self._normalize_distribution(state)
+        return self._distribution_from_logits(state)
+
     def _top2_margin(self, distribution: Array) -> Array:
         distribution = distribution.astype(jnp.float32)
         top1 = jnp.max(distribution, axis=-1, keepdims=True)
@@ -456,6 +445,11 @@ class BDRModel(nnx.Module):
         return self._center_logits(jnp.log(jnp.maximum(distribution, self.output_logit_eps)))
 
     def _zero_z(self, tokens: Array) -> Array:
+        if self._state_is_probability():
+            return jnp.broadcast_to(
+                jnp.full_like(tokens[..., None], 1.0 / float(self.q_vocab_size), dtype=jnp.float32),
+                (*tokens.shape, self.q_vocab_size),
+            )
         # Zero centered logits represent the uniform answer distribution.
         return jnp.broadcast_to(
             jnp.zeros_like(tokens[..., None], dtype=jnp.float32),
@@ -464,8 +458,8 @@ class BDRModel(nnx.Module):
 
     def _z_to_output_logits(self, z_logits: Array, tokens: Array) -> Array:
         del tokens
-        if self.bdr.update_rule == "energy":
-            return self._distribution_from_logits(z_logits)
+        if self._state_is_probability():
+            return self._normalize_distribution(z_logits)
         return self._center_logits(z_logits)
 
     def initial_z(self, tokens: Array) -> Array:
@@ -483,41 +477,14 @@ class BDRModel(nnx.Module):
     def _embed_tokens(self, embedding: nnx.Embed, token_ids: Array) -> Array:
         return maybe_cast(gather_embedding_rows(embedding.embedding, token_ids.astype(jnp.int32)), self.dtype)
 
-    def _state_features(
+    def _draft_features(
         self,
         tokens: Array,
         z_logits: Array,
         step_index: Array,
-    ) -> tuple[Array, Array]:
-        del tokens
-        z_logits = self._center_logits(z_logits)
-        q_view = self._distribution_from_logits(z_logits)
-        logit_direction = jnp.tanh(z_logits / 4.0)
-        current_direction = q_view - (1.0 / float(self.q_vocab_size))
-
-        entropy = -jnp.sum(q_view * jnp.log(jnp.maximum(q_view, 1e-8)), axis=-1, keepdims=True) / jnp.log(
-            float(self.q_vocab_size)
-        )
-        margin = self._top2_margin(q_view)
-        step_progress = (step_index.astype(jnp.float32) + 1.0) / float(self.total_steps)
-        step_progress = jnp.zeros_like(z_logits[:, 0, 0], dtype=jnp.float32) + step_progress
-        progress = jnp.broadcast_to(step_progress[:, None, None], entropy.shape)
-        scalar_features = jnp.concatenate(
-            (
-                entropy.astype(jnp.float32),
-                margin.astype(jnp.float32),
-                progress.astype(jnp.float32),
-            ),
-            axis=-1,
-        )
-        embedding_table = maybe_cast(self.state_embed.embedding[: self.q_vocab_size], self.dtype)
-        state_embedding = jnp.einsum(
-            "bnd,dk->bnk",
-            maybe_cast(logit_direction + current_direction, self.dtype),
-            embedding_table,
-            preferred_element_type=jnp.float32,
-        )
-        return state_embedding, scalar_features
+    ) -> Array:
+        del tokens, step_index
+        return z_logits.astype(jnp.float32)
 
     def _typed_conditions(
         self,
@@ -529,19 +496,16 @@ class BDRModel(nnx.Module):
         train: bool,
         dropout_key: Array | None,
     ) -> tuple[Array, Array]:
-        state_embedding, state_scalar_features = self._state_features(
+        draft_features = self._draft_features(
             tokens,
             z_logits,
             step_index,
         )
         context_input = self.dropout(base_embeddings, deterministic=not train, rngs=dropout_key)
-        state_input = self.dropout(state_embedding, deterministic=not train, rngs=dropout_key)
+        draft_input = self.dropout(draft_features, deterministic=not train, rngs=dropout_key)
         context_condition = self.context_to_hidden(maybe_cast(context_input, self.dtype)).astype(self.dtype)
-        state_condition = self.state_to_hidden(maybe_cast(state_input, self.dtype)).astype(self.dtype)
-        state_condition = state_condition + self.state_scalar_to_hidden(
-            maybe_cast(state_scalar_features, self.dtype)
-        ).astype(self.dtype)
-        return context_condition, state_condition
+        draft_condition = self.draft_to_hidden(maybe_cast(draft_input, self.dtype)).astype(self.dtype)
+        return context_condition, draft_condition
 
     def _z_to_token_logits(self, z: Array, tokens: Array, step_index: Array) -> Array:
         del step_index
@@ -555,6 +519,12 @@ class BDRModel(nnx.Module):
         step_index: Array,
     ) -> tuple[Array, dict[str, Array]]:
         del tokens, step_index
+        if self._state_is_probability():
+            next_distribution, diagnostics, _distributions = self._energy_probability_descent_from_read_state(
+                z_logits,
+                read_state,
+            )
+            return next_distribution, diagnostics
         current_logits = self._center_logits(z_logits)
         next_logits, diagnostics, _distributions = self._energy_descent_from_read_state(current_logits, read_state)
         return next_logits, diagnostics
@@ -564,11 +534,25 @@ class BDRModel(nnx.Module):
         candidate_distribution: Array,
         read_state: Array,
     ) -> Array:
-        state_condition = self.energy_state_to_hidden(
+        energy_condition = self.energy_state_to_hidden(
             maybe_cast(candidate_distribution - (1.0 / float(self.q_vocab_size)), self.dtype)
         ).astype(jnp.float32)
         energy_input = self.energy_norm(
-            (read_state.astype(jnp.float32) + state_condition).astype(self.dtype)
+            (read_state.astype(jnp.float32) + energy_condition).astype(self.dtype)
+        )
+        return self.energy_head(maybe_cast(energy_input, self.dtype)).astype(jnp.float32)[..., 0]
+
+    def _energy_per_cell_from_logit_state(
+        self,
+        candidate_logits: Array,
+        read_state: Array,
+    ) -> Array:
+        candidate_logits = self._center_logits(candidate_logits)
+        energy_condition = self.energy_state_to_hidden(
+            maybe_cast(candidate_logits, self.dtype)
+        ).astype(jnp.float32)
+        energy_input = self.energy_norm(
+            (read_state.astype(jnp.float32) + energy_condition).astype(self.dtype)
         )
         return self.energy_head(maybe_cast(energy_input, self.dtype)).astype(jnp.float32)[..., 0]
 
@@ -577,8 +561,54 @@ class BDRModel(nnx.Module):
         z_logits: Array,
         read_state: Array,
     ) -> Array:
-        candidate_distribution = jax.nn.softmax(self._center_logits(z_logits), axis=-1)
-        return self._energy_per_cell_from_read_state(candidate_distribution, read_state)
+        if self._state_is_probability():
+            candidate_distribution = self._normalize_distribution(z_logits)
+            return self._energy_per_cell_from_read_state(candidate_distribution, read_state)
+        return self._energy_per_cell_from_logit_state(z_logits, read_state)
+
+    def _energy_probability_descent_from_read_state(
+        self,
+        current_distribution: Array,
+        read_state: Array,
+    ) -> tuple[Array, dict[str, Array], tuple[Array, Array]]:
+        current_distribution = self._normalize_distribution(current_distribution)
+
+        def energy_per_cell(candidate_distribution: Array) -> Array:
+            candidate_distribution = self._normalize_distribution(candidate_distribution)
+            return self._energy_per_cell_from_read_state(candidate_distribution, read_state)
+
+        energy_cells, energy_vjp = jax.vjp(energy_per_cell, current_distribution)
+        energy_value = energy_cells[..., None]
+        energy_grad = energy_vjp(jnp.ones_like(energy_cells))[0].astype(jnp.float32)
+        energy_grad = energy_grad - jnp.mean(energy_grad, axis=-1, keepdims=True)
+        update_step_size_scalar = float(self.bdr.update_step_size)
+        distribution_step = -update_step_size_scalar * energy_grad
+        next_distribution = self._normalize_distribution(current_distribution + distribution_step)
+
+        distribution_tv_delta = 0.5 * jnp.sum(
+            jnp.abs(next_distribution - current_distribution),
+            axis=-1,
+            keepdims=True,
+        )
+        energy_grad_rms = jnp.sqrt(jnp.mean(jnp.square(energy_grad), axis=-1, keepdims=True) + 1e-12)
+        distribution_step_rms = jnp.sqrt(jnp.mean(jnp.square(distribution_step), axis=-1, keepdims=True) + 1e-12)
+        update_step_size = jnp.broadcast_to(
+            jnp.asarray(update_step_size_scalar, dtype=jnp.float32),
+            (*current_distribution.shape[:-1], 1),
+        )
+        path_energy = jnp.mean(jnp.square(next_distribution - current_distribution), axis=-1, keepdims=True)
+        diagnostics = {
+            "update_step_size": update_step_size,
+            "update_rms": energy_grad_rms,
+            "velocity_rms": jnp.zeros_like(energy_grad_rms),
+            "energy_update_rms": energy_grad_rms,
+            "energy_value": energy_value,
+            "energy_grad_rms": energy_grad_rms,
+            "logit_step_rms": distribution_step_rms,
+            "distribution_tv_delta": distribution_tv_delta,
+            "path_energy": path_energy,
+        }
+        return next_distribution, diagnostics, (current_distribution, next_distribution)
 
     def _velocity_step_from_read_state(
         self,
@@ -628,10 +658,10 @@ class BDRModel(nnx.Module):
         current_logits = self._center_logits(current_logits)
         current_distribution = jax.nn.softmax(current_logits, axis=-1)
 
-        def energy_per_cell(candidate_distribution: Array) -> Array:
-            return self._energy_per_cell_from_read_state(candidate_distribution, read_state)
+        def energy_per_cell(candidate_logits: Array) -> Array:
+            return self._energy_per_cell_from_logit_state(candidate_logits, read_state)
 
-        energy_cells, energy_vjp = jax.vjp(energy_per_cell, current_distribution)
+        energy_cells, energy_vjp = jax.vjp(energy_per_cell, current_logits)
         energy_value = energy_cells[..., None]
         energy_grad = self._center_logits(energy_vjp(jnp.ones_like(energy_cells))[0])
         descent_direction = -energy_grad
@@ -670,32 +700,24 @@ class BDRModel(nnx.Module):
         self,
         hidden_state: Array,
         context_condition: Array,
-        state_condition: Array,
+        draft_condition: Array,
     ) -> Array:
         hidden = hidden_state.astype(self.dtype)
-        local_route_conditions = tuple(block.normalized_local_context(context_condition) for block in self.solver_blocks)
-        attn_route_conditions = tuple(block.normalized_attn_context(context_condition) for block in self.solver_blocks)
-        # Within an h-cycle, cheap local propagation runs for every refine step.
-        # The expensive all-to-all attention is reserved for the cycle boundary,
-        # immediately before z update / early-stop check.
         def refine_body(_step: Array, carry: Array) -> Array:
             del _step
             refined = carry
-            for block, route_condition in zip(self.solver_blocks, local_route_conditions, strict=True):
-                refined = block.local_think(refined, context_condition, state_condition, route_condition)
+            for block in self.solver_blocks:
+                refined = block.global_communicate(
+                    refined,
+                    context_condition,
+                    draft_condition,
+                    self.rope_cos,
+                    self.rope_sin,
+                )
+                refined = block.local_think(refined, context_condition, draft_condition)
             return refined
 
-        hidden = jax.lax.fori_loop(0, self.refine_steps, refine_body, hidden)
-        for block, route_condition in zip(self.solver_blocks, attn_route_conditions, strict=True):
-            hidden = block.global_communicate(
-                hidden,
-                context_condition,
-                state_condition,
-                self.rope_cos,
-                self.rope_sin,
-                route_condition,
-            )
-        return hidden
+        return jax.lax.fori_loop(0, self.refine_steps, refine_body, hidden)
 
     def _update_read_state(
         self,
@@ -717,7 +739,7 @@ class BDRModel(nnx.Module):
     ) -> tuple[Array, Array, dict[str, Array], tuple[Array, Array]]:
         # The explicit z state is stopped before context construction; the
         # configured update rule then acts on logits using the refined H.
-        context_condition, state_condition = self._typed_conditions(
+        context_condition, draft_condition = self._typed_conditions(
             tokens,
             jax.lax.stop_gradient(z),
             base_embeddings,
@@ -729,12 +751,14 @@ class BDRModel(nnx.Module):
         hidden_state = self._hidden_h_cycle(
             hidden_state,
             context_condition,
-            state_condition,
+            draft_condition,
         )
         read_state = self._update_read_state(hidden_state)
         del step_index
         if self.bdr.update_rule == "velocity":
             z, update_diagnostics, update_distributions = self._velocity_step_from_read_state(z, read_state)
+        elif self._state_is_probability():
+            z, update_diagnostics, update_distributions = self._energy_probability_descent_from_read_state(z, read_state)
         else:
             z, update_diagnostics, update_distributions = self._energy_descent_from_read_state(z, read_state)
         return (
@@ -752,6 +776,8 @@ class BDRModel(nnx.Module):
             (1.0 - smoothing) * jax.nn.one_hot(labels, self.q_vocab_size, dtype=jnp.float32)
             + smoothing / float(self.q_vocab_size)
         )
+        if self._state_is_probability():
+            return self._normalize_distribution(target_distribution)
         return self._center_logits(jnp.log(jnp.maximum(target_distribution, self.output_logit_eps)))
 
     def fixed_point_update_loss(
@@ -760,6 +786,7 @@ class BDRModel(nnx.Module):
         targets: Array,
         loss_mask: Array,
         *,
+        puzzle_identifiers: Array | None = None,
         train: bool,
         dropout_key: Array | None,
     ) -> Array:
@@ -770,7 +797,7 @@ class BDRModel(nnx.Module):
         change the main z dynamics state.
         """
         target_logits = self.target_z_logits(targets)
-        base_embeddings, _context = self.context_memory(tokens)
+        base_embeddings, _context = self.context_memory(tokens, puzzle_identifiers)
         hidden = self.initial_hidden_state(
             tokens,
             target_logits,
@@ -805,7 +832,7 @@ class BDRModel(nnx.Module):
         dropout_key: Array | None,
         stop_hidden_between_steps: bool = True,
     ) -> tuple[Array, Array]:
-        context_condition, state_condition = self._typed_conditions(
+        context_condition, draft_condition = self._typed_conditions(
             tokens,
             jax.lax.stop_gradient(z_logits),
             base_embeddings,
@@ -817,7 +844,7 @@ class BDRModel(nnx.Module):
         hidden_state = self._hidden_h_cycle(
             hidden_state,
             context_condition,
-            state_condition,
+            draft_condition,
         )
         return self._update_read_state(hidden_state), hidden_state
 
@@ -861,9 +888,14 @@ class BDRModel(nnx.Module):
             dropout_key=dropout_key,
             stop_hidden_between_steps=True,
         )
-        current_logits = self._center_logits(z_logits)
+        current_logits = z_logits if self._state_is_probability() else self._center_logits(z_logits)
         if self.bdr.update_rule == "velocity":
             next_logits, diagnostics, update_distributions = self._velocity_step_from_read_state(current_logits, read_state)
+        elif self._state_is_probability():
+            next_logits, diagnostics, update_distributions = self._energy_probability_descent_from_read_state(
+                current_logits,
+                read_state,
+            )
         else:
             next_logits, diagnostics, update_distributions = self._energy_descent_from_read_state(current_logits, read_state)
         target_logits = self.target_z_logits(targets)
@@ -871,13 +903,22 @@ class BDRModel(nnx.Module):
         mask = loss_mask.astype(bool)
         example_mask = jnp.sum(mask.astype(jnp.float32), axis=-1) > 0
         if wrong_only:
-            pred = jnp.argmax(self._distribution_from_logits(current_logits), axis=-1)
+            pred = jnp.argmax(self._state_distribution(current_logits), axis=-1)
             exact = jnp.all(jnp.where(mask, pred == targets, True), axis=-1)
             example_mask = example_mask & (~exact)
         example_weight = example_mask.astype(jnp.float32)
         normalizer = jnp.maximum(jnp.sum(example_weight), 1.0)
         if self.bdr.update_rule == "energy":
-            target_distribution = self._distribution_from_logits(target_logits)
+            target_energy_cell = self._energy_value_for_logits(target_logits, read_state).astype(jnp.float32)
+            current_energy = self._masked_per_example_mean(current_energy_cell, mask)
+            target_energy = self._masked_per_example_mean(target_energy_cell, mask)
+            rank_loss = jnp.sum(
+                jax.nn.relu(float(self.bdr.wrong_attractor_rank_margin) + target_energy - current_energy)
+                * example_weight
+            ) / normalizer
+            energy_gap = jnp.sum((current_energy - target_energy) * example_weight) / normalizer
+        elif self._state_is_probability():
+            target_distribution = self._normalize_distribution(target_logits)
             target_energy_cell = self._energy_per_cell_from_read_state(target_distribution, read_state).astype(jnp.float32)
             current_energy = self._masked_per_example_mean(current_energy_cell, mask)
             target_energy = self._masked_per_example_mean(target_energy_cell, mask)
@@ -890,7 +931,7 @@ class BDRModel(nnx.Module):
             rank_loss = jnp.asarray(0.0, dtype=jnp.float32)
             energy_gap = jnp.asarray(0.0, dtype=jnp.float32)
 
-        if self.bdr.update_rule == "energy":
+        if self._state_is_probability():
             current_distribution, next_distribution = update_distributions
             update_direction = next_distribution - current_distribution
             target_direction = target_distribution - current_distribution
@@ -923,6 +964,7 @@ class BDRModel(nnx.Module):
         z_logits: Array,
         hidden_state: Array,
         *,
+        puzzle_identifiers: Array | None = None,
         train: bool,
         dropout_key: Array | None,
     ) -> dict[str, Array]:
@@ -931,7 +973,7 @@ class BDRModel(nnx.Module):
         The carry z state is treated as replay from the model's own dynamics.
         A synthetic high-confidence wrong state is added as corrupted recovery.
         """
-        base_embeddings, _context = self.context_memory(tokens)
+        base_embeddings, _context = self.context_memory(tokens, puzzle_identifiers)
         step_index = jnp.asarray(self.total_steps - 1, dtype=jnp.int32)
         carry_terms = self._attractor_recovery_terms(
             tokens,
@@ -952,7 +994,10 @@ class BDRModel(nnx.Module):
             (1.0 - smoothing) * jax.nn.one_hot(wrong_labels, self.q_vocab_size, dtype=jnp.float32)
             + smoothing / float(self.q_vocab_size)
         )
-        wrong_logits = self._center_logits(jnp.log(jnp.maximum(wrong_distribution, self.output_logit_eps)))
+        if self._state_is_probability():
+            wrong_logits = self._normalize_distribution(wrong_distribution)
+        else:
+            wrong_logits = self._center_logits(jnp.log(jnp.maximum(wrong_distribution, self.output_logit_eps)))
         wrong_hidden = self.initial_hidden_state(
             tokens,
             wrong_logits,
@@ -1008,8 +1053,8 @@ class BDRModel(nnx.Module):
         update_distributions: tuple[Array, Array] | None,
     ) -> tuple[Array, dict[str, Array]]:
         if update_distributions is None:
-            old_distribution = self._distribution_from_logits(old_z)
-            new_distribution = self._distribution_from_logits(new_z)
+            old_distribution = self._state_distribution(old_z)
+            new_distribution = self._state_distribution(new_z)
         else:
             old_distribution, new_distribution = update_distributions
         query_mask = (~self.context_mask(inputs)).astype(jnp.float32)
@@ -1066,19 +1111,28 @@ class BDRModel(nnx.Module):
     def context_memory(
         self,
         tokens: Array,
+        puzzle_identifiers: Array | None = None,
     ) -> tuple[Array, Array]:
         context = self.context_mask(tokens)
         token_ids = jnp.clip(tokens, 0, self.input_vocab_size - 1)
-        base_embeddings = (
-            self._embed_tokens(self.puzzle_embed, token_ids)
-            + self._embed_tokens(self.context_embed, context.astype(jnp.int32))
+        base_embeddings = self._embed_tokens(self.token_embed, token_ids) * self.embed_scale
+        if puzzle_identifiers is None:
+            puzzle_identifiers = jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
+        puzzle_identifier = self._embed_tokens(
+            self.puzzle_identifier_embed,
+            jnp.clip(puzzle_identifiers.astype(jnp.int32), 0, self.config.num_puzzle_identifiers - 1)
         )
+        base_embeddings = base_embeddings + puzzle_identifier[:, None, :]
         if self.bdr.position_encoding == "learned":
             base_embeddings = base_embeddings + self._position_embeddings()[None, :, :]
         return base_embeddings, context
 
     def initial_carry(self, batch: dict[str, Array]) -> dict[str, Array]:
         batch_size = batch["inputs"].shape[0]
+        if "puzzle_identifiers" in batch:
+            puzzle_identifiers = batch["puzzle_identifiers"].astype(jnp.int32)
+        else:
+            puzzle_identifiers = jnp.zeros((batch_size,), dtype=jnp.int32)
         return {
             "z": self._zero_z(batch["inputs"]),
             "hidden": jnp.zeros(
@@ -1090,6 +1144,7 @@ class BDRModel(nnx.Module):
             "reset": jnp.ones((batch_size,), dtype=bool),
             "current_inputs": jnp.zeros_like(batch["inputs"]),
             "current_labels": jnp.zeros_like(batch["labels"]),
+            "current_puzzle_identifiers": jnp.zeros_like(puzzle_identifiers),
             "current_example_mask": jnp.zeros_like(batch["inputs"][:, 0], dtype=jnp.float32),
         }
 
@@ -1108,6 +1163,15 @@ class BDRModel(nnx.Module):
         reset_state = reset[:, None, None]
         inputs = jnp.where(reset_cells, batch["inputs"], carry["current_inputs"])
         labels = jnp.where(reset_cells, batch["labels"], carry["current_labels"])
+        if "puzzle_identifiers" in batch:
+            batch_puzzle_identifiers = batch["puzzle_identifiers"].astype(jnp.int32)
+        else:
+            batch_puzzle_identifiers = jnp.zeros((inputs.shape[0],), dtype=jnp.int32)
+        puzzle_identifiers = jnp.where(
+            reset,
+            batch_puzzle_identifiers,
+            carry["current_puzzle_identifiers"],
+        )
         if "example_mask" in batch:
             batch_example_mask = batch["example_mask"].astype(jnp.float32)
         else:
@@ -1115,7 +1179,7 @@ class BDRModel(nnx.Module):
         example_mask = jnp.where(reset, batch_example_mask, carry["current_example_mask"])
         steps = jnp.where(reset, 0, carry["steps"])
 
-        base_embeddings, _context = self.context_memory(inputs)
+        base_embeddings, _context = self.context_memory(inputs, puzzle_identifiers)
         step_index = jnp.minimum(steps, self.total_steps - 1)
         reset_z = self.initial_z(inputs)
         z = jnp.where(reset_state, reset_z, carry["z"])
@@ -1138,7 +1202,7 @@ class BDRModel(nnx.Module):
             dropout_key=dropout_key,
             stop_hidden_between_steps=True,
         )
-        if self.bdr.update_rule == "energy":
+        if self._state_is_probability():
             _current_distribution, next_distribution = update_distributions
             logits = next_distribution
         else:
@@ -1164,6 +1228,7 @@ class BDRModel(nnx.Module):
             "reset": jax.lax.stop_gradient(next_reset),
             "current_inputs": inputs,
             "current_labels": labels,
+            "current_puzzle_identifiers": puzzle_identifiers,
             "current_example_mask": example_mask,
         }
         diagnostics = {
@@ -1191,13 +1256,14 @@ class BDRModel(nnx.Module):
         tokens: Array,
         *,
         initial_z: Array | None = None,
+        puzzle_identifiers: Array | None = None,
         train: bool,
         dropout_key: Array | None = None,
         return_final_only: bool = False,
     ) -> tuple[Array, dict[str, Array]]:
         if initial_z is None:
             initial_z = self.initial_z(tokens)
-        base_embeddings, context = self.context_memory(tokens)
+        base_embeddings, context = self.context_memory(tokens, puzzle_identifiers)
         query_mask = (~context).astype(jnp.float32)
         query_normalizer = jnp.maximum(jnp.sum(query_mask), 1.0)
 
@@ -1217,13 +1283,13 @@ class BDRModel(nnx.Module):
             next_carry = (next_z, next_hidden)
             if return_final_only:
                 return next_carry, None
-            if self.bdr.update_rule == "energy":
+            if self._state_is_probability():
                 _current_distribution, next_distribution = _update_distributions
                 logits = next_distribution
                 confidence = jnp.max(next_distribution, axis=-1)
             else:
                 logits = self._z_to_token_logits(next_z, tokens, step_index)
-                confidence = jnp.max(self._distribution_from_logits(next_z), axis=-1)
+                confidence = jnp.max(self._state_distribution(next_z), axis=-1)
             q_top1_probability = jnp.sum(confidence * query_mask) / query_normalizer
             return next_carry, (
                 logits,
@@ -1313,10 +1379,12 @@ class BDRModel(nnx.Module):
         train: bool,
         dropout_key: Array | None = None,
         initial_z: Array | None = None,
+        puzzle_identifiers: Array | None = None,
     ) -> tuple[Array, dict[str, Array]]:
         return self.run_commit_steps(
             tokens,
             initial_z=initial_z,
+            puzzle_identifiers=puzzle_identifiers,
             train=train,
             dropout_key=dropout_key,
         )
@@ -1328,12 +1396,14 @@ class BDRModel(nnx.Module):
         train: bool,
         dropout_key: Array | None = None,
         initial_z: Array | None = None,
+        puzzle_identifiers: Array | None = None,
     ) -> tuple[Array, dict[str, Array]]:
         return self.forward_all_steps_with_diagnostics(
             tokens,
             train=train,
             dropout_key=dropout_key,
             initial_z=initial_z,
+            puzzle_identifiers=puzzle_identifiers,
         )
 
     def forward_all_steps(
@@ -1342,8 +1412,14 @@ class BDRModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
+        puzzle_identifiers: Array | None = None,
     ) -> Array:
-        logits, _ = self.forward_all_steps_with_diagnostics(tokens, train=train, dropout_key=dropout_key)
+        logits, _ = self.forward_all_steps_with_diagnostics(
+            tokens,
+            train=train,
+            dropout_key=dropout_key,
+            puzzle_identifiers=puzzle_identifiers,
+        )
         return logits
 
     def forward_final(
@@ -1352,8 +1428,14 @@ class BDRModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
+        puzzle_identifiers: Array | None = None,
     ) -> Array:
-        logits, _ = self.forward_final_with_diagnostics(tokens, train=train, dropout_key=dropout_key)
+        logits, _ = self.forward_final_with_diagnostics(
+            tokens,
+            train=train,
+            dropout_key=dropout_key,
+            puzzle_identifiers=puzzle_identifiers,
+        )
         return logits[-1]
 
     def __call__(
@@ -1362,5 +1444,11 @@ class BDRModel(nnx.Module):
         *,
         train: bool,
         dropout_key: Array | None = None,
+        puzzle_identifiers: Array | None = None,
     ) -> Array:
-        return self.forward_final(tokens, train=train, dropout_key=dropout_key)
+        return self.forward_final(
+            tokens,
+            train=train,
+            dropout_key=dropout_key,
+            puzzle_identifiers=puzzle_identifiers,
+        )

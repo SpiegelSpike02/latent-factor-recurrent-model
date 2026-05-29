@@ -352,6 +352,42 @@ class GridModelTests(unittest.TestCase):
         q_view = model._distribution_from_logits(initial_z)
         self.assertTrue(bool(jnp.allclose(q_view, jnp.full_like(q_view, 1.0 / 9.0))))
 
+    def test_bdr_accepts_puzzle_identifiers(self) -> None:
+        model = BDRModel(
+            ModelConfig(
+                vocab_size=5,
+                model_type="bdr",
+                task=TaskConfig(type="arc"),
+                num_puzzle_identifiers=4,
+                seq_len=4,
+                grid_height=2,
+                grid_width=2,
+                d_model=16,
+                bdr=BDRConfig(
+                    commit_steps=1,
+                    num_heads=4,
+                    mlp_ratio=1,
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(313),
+        )
+        tokens = jnp.zeros((2, 4), dtype=jnp.int32)
+        puzzle_identifiers = jnp.asarray([0, 3], dtype=jnp.int32)
+
+        base_embeddings, _context = model.context_memory(tokens, puzzle_identifiers)
+
+        self.assertEqual(model.puzzle_identifier_embed.embedding[...].shape, (4, 16))
+        self.assertEqual(base_embeddings.shape, (2, 4, 16))
+        logits, diagnostics = model.run_commit_steps(
+            tokens,
+            puzzle_identifiers=puzzle_identifiers,
+            train=False,
+            dropout_key=jax.random.key(314),
+        )
+        self.assertEqual(logits.shape, (1, 2, 4, 5))
+        self.assertTrue(bool(jnp.isfinite(diagnostics["path_energy"][0])))
+
     def test_bdr_top2_margin_matches_top_k_without_sort_primitive(self) -> None:
         model = BDRModel(
             ModelConfig(
@@ -419,7 +455,7 @@ class GridModelTests(unittest.TestCase):
         expected_path_energy = jnp.mean(jnp.square(next_distribution - current_distribution), axis=-1, keepdims=True)
         self.assertTrue(bool(jnp.allclose(diagnostics["path_energy"], expected_path_energy, rtol=1e-5, atol=1e-6)))
 
-    def test_bdr_energy_outputs_probabilities_for_loss(self) -> None:
+    def test_bdr_energy_outputs_logits_for_loss(self) -> None:
         model = BDRModel(
             ModelConfig(
                 vocab_size=5,
@@ -443,6 +479,36 @@ class GridModelTests(unittest.TestCase):
         z = jnp.asarray([[[1.5, 0.5, -0.5, -1.0, -0.5]] * 4], dtype=jnp.float32)
         outputs = model._z_to_token_logits(z, tokens, jnp.asarray(0, dtype=jnp.int32))
         targets = jnp.asarray([[0, 1, 2, 3]], dtype=jnp.int32)
+        expected_loss = -jnp.take_along_axis(jax.nn.log_softmax(outputs, axis=-1), targets[..., None], axis=-1).squeeze(-1)
+
+        self.assertTrue(bool(jnp.allclose(jnp.mean(outputs, axis=-1), 0.0, atol=1e-6)))
+        self.assertFalse(bool(jnp.allclose(jnp.sum(outputs, axis=-1), 1.0, atol=1e-6)))
+        self.assertTrue(bool(jnp.allclose(token_cross_entropy(model, outputs, targets), expected_loss, atol=1e-6)))
+
+    def test_bdr_energy_prob_outputs_probabilities_for_loss(self) -> None:
+        model = BDRModel(
+            ModelConfig(
+                vocab_size=5,
+                model_type="bdr",
+                task=TaskConfig(type="arc"),
+                seq_len=4,
+                grid_height=2,
+                grid_width=2,
+                d_model=16,
+                bdr=BDRConfig(
+                    commit_steps=1,
+                    num_heads=4,
+                    mlp_ratio=1,
+                    update_rule="energy_prob",
+                ),
+            ),
+            RuntimeConfig(compute_dtype="float32"),
+            rngs=nnx.Rngs(316),
+        )
+        tokens = jnp.zeros((1, 4), dtype=jnp.int32)
+        z = jnp.asarray([[[0.7, 0.1, 0.1, 0.05, 0.05]] * 4], dtype=jnp.float32)
+        outputs = model._z_to_token_logits(z, tokens, jnp.asarray(0, dtype=jnp.int32))
+        targets = jnp.asarray([[0, 1, 2, 3]], dtype=jnp.int32)
         expected_loss = -jnp.log(jnp.take_along_axis(outputs, targets[..., None], axis=-1).squeeze(-1) + 1e-9)
 
         self.assertTrue(bool(jnp.allclose(jnp.sum(outputs, axis=-1), 1.0, atol=1e-6)))
@@ -459,7 +525,7 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.isfinite(zero_loss)))
         self.assertLess(float(zero_grad[0, 0, 0]), 0.0)
 
-    def test_bdr_energy_attractor_direction_uses_distribution_delta(self) -> None:
+    def test_bdr_energy_prob_attractor_direction_uses_distribution_delta(self) -> None:
         model = BDRModel(
             ModelConfig(
                 vocab_size=5,
@@ -473,7 +539,7 @@ class GridModelTests(unittest.TestCase):
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
-                    update_rule="energy",
+                    update_rule="energy_prob",
                     update_step_size=0.5,
                 ),
             ),
@@ -483,8 +549,8 @@ class GridModelTests(unittest.TestCase):
         tokens = jnp.zeros((1, 4), dtype=jnp.int32)
         targets = jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32)
         loss_mask = jnp.ones((1, 4), dtype=jnp.float32)
-        current_logits = jnp.asarray(
-            [[[1.5, 0.5, -0.5, -1.0, -0.5]] * 4],
+        current_distribution = jnp.asarray(
+            [[[0.7, 0.1, 0.1, 0.05, 0.05]] * 4],
             dtype=jnp.float32,
         )
         hidden = jnp.zeros((1, 4, 16), dtype=jnp.float32)
@@ -494,7 +560,7 @@ class GridModelTests(unittest.TestCase):
             tokens,
             targets,
             loss_mask,
-            current_logits,
+            current_distribution,
             hidden,
             base_embeddings,
             jnp.asarray(0, dtype=jnp.int32),
