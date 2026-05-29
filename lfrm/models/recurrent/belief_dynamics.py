@@ -173,10 +173,10 @@ class BeliefDynamicsReasoner(nnx.Module):
             raise ValueError("BDR step_loss_schedule must be 'uniform', 'linear', or 'quadratic'")
         if bdr.update_rule not in ("energy_prob", "energy_dist", "free_velocity", "proposal"):
             raise ValueError("BDR update_rule must be 'energy_prob', 'energy_dist', 'free_velocity', or 'proposal'")
-        if bdr.draft_view not in ("auto", "logits", "probability"):
-            raise ValueError("BDR draft_view must be 'auto', 'logits', or 'probability'")
-        if bdr.prediction_view not in ("auto", "logits", "probability"):
-            raise ValueError("BDR prediction_view must be 'auto', 'logits', or 'probability'")
+        if bdr.draft_view != "probability":
+            raise ValueError("BDR draft_view must be 'probability'")
+        if bdr.prediction_view not in ("probability", "logits"):
+            raise ValueError("BDR prediction_view must be 'probability' or 'logits'")
         if bdr.update_rule == "energy_prob" and bdr.update_step_size <= 0.0:
             raise ValueError("BDR update_step_size must be positive")
         self.config = config
@@ -201,10 +201,8 @@ class BeliefDynamicsReasoner(nnx.Module):
             self.sudoku_blank_token_id = 0
         self.output_logit_eps = 1e-9
         self.box_height, self.box_width = self._box_shape(config.grid_height, config.grid_width)
-        self.draft_view = self._resolve_draft_view(bdr.update_rule, bdr.draft_view)
-        self.prediction_view = self._resolve_prediction_view(self.draft_view, bdr.prediction_view)
-        if self.draft_view != "probability":
-            raise ValueError(f"BDR update_rule={bdr.update_rule!r} requires draft_view='probability'")
+        self.draft_view = bdr.draft_view
+        self.prediction_view = bdr.prediction_view
 
         rows = jnp.arange(config.seq_len, dtype=jnp.int32) // config.grid_width
         cols = jnp.arange(config.seq_len, dtype=jnp.int32) % config.grid_width
@@ -344,19 +342,6 @@ class BeliefDynamicsReasoner(nnx.Module):
         return max(box_height, 1), max(box_width, 1)
 
     @staticmethod
-    def _resolve_draft_view(update_rule: str, configured: str) -> str:
-        if configured != "auto":
-            return configured
-        del update_rule
-        return "probability"
-
-    @staticmethod
-    def _resolve_prediction_view(draft_view: str, configured: str) -> str:
-        if configured != "auto":
-            return configured
-        return draft_view
-
-    @staticmethod
     def _build_box_indices(grid_height: int, grid_width: int, box_height: int, box_width: int) -> Array:
         indices: list[list[int]] = []
         for box_row in range(grid_height // box_height):
@@ -373,16 +358,9 @@ class BeliefDynamicsReasoner(nnx.Module):
             return tokens > self.sudoku_blank_token_id
         return tokens != 0
 
-    def _center_logits(self, z_logits: Array) -> Array:
-        z_logits = z_logits.astype(jnp.float32)
-        return z_logits - jnp.mean(z_logits, axis=-1, keepdims=True)
-
-    def _distribution_from_logits(self, z_logits: Array) -> Array:
-        """Return the explicit answer distribution view from centered logits."""
-        return jax.nn.softmax(z_logits.astype(jnp.float32), axis=-1)
-
-    def _state_is_probability(self) -> bool:
-        return self.draft_view == "probability"
+    def _center_logits(self, logits: Array) -> Array:
+        logits = logits.astype(jnp.float32)
+        return logits - jnp.mean(logits, axis=-1, keepdims=True)
 
     def outputs_are_probabilities(self) -> bool:
         return self.prediction_view == "probability"
@@ -392,9 +370,7 @@ class BeliefDynamicsReasoner(nnx.Module):
         return distribution / jnp.sum(distribution, axis=-1, keepdims=True)
 
     def _state_distribution(self, state: Array) -> Array:
-        if self._state_is_probability():
-            return self._normalize_distribution(state)
-        return self._distribution_from_logits(state)
+        return self._normalize_distribution(state)
 
     def _top2_margin(self, distribution: Array) -> Array:
         distribution = distribution.astype(jnp.float32)
@@ -413,24 +389,16 @@ class BeliefDynamicsReasoner(nnx.Module):
         return self._center_logits(jnp.log(jnp.maximum(distribution, self.output_logit_eps)))
 
     def _zero_z(self, tokens: Array) -> Array:
-        if self._state_is_probability():
-            return jnp.broadcast_to(
-                jnp.full_like(tokens[..., None], 1.0 / float(self.q_vocab_size), dtype=jnp.float32),
-                (*tokens.shape, self.q_vocab_size),
-            )
-        # Zero centered logits represent the uniform answer distribution.
         return jnp.broadcast_to(
-            jnp.zeros_like(tokens[..., None], dtype=jnp.float32),
+            jnp.full_like(tokens[..., None], 1.0 / float(self.q_vocab_size), dtype=jnp.float32),
             (*tokens.shape, self.q_vocab_size),
         )
 
-    def _z_to_output_logits(self, z_logits: Array, tokens: Array) -> Array:
+    def _z_to_output_logits(self, z: Array, tokens: Array) -> Array:
         del tokens
         if self.outputs_are_probabilities():
-            return self._normalize_distribution(z_logits)
-        if self._state_is_probability():
-            return self._logits_from_distribution(z_logits)
-        return self._center_logits(z_logits)
+            return self._normalize_distribution(z)
+        return self._logits_from_distribution(z)
 
     def initial_z(self, tokens: Array) -> Array:
         return self._zero_z(tokens)
@@ -455,16 +423,16 @@ class BeliefDynamicsReasoner(nnx.Module):
     def _draft_features(
         self,
         tokens: Array,
-        z_logits: Array,
+        z: Array,
         step_index: Array,
     ) -> Array:
         del tokens, step_index
-        return z_logits.astype(jnp.float32)
+        return z.astype(jnp.float32)
 
     def _typed_conditions(
         self,
         tokens: Array,
-        z_logits: Array,
+        z: Array,
         base_embeddings: Array,
         step_index: Array,
         *,
@@ -473,7 +441,7 @@ class BeliefDynamicsReasoner(nnx.Module):
     ) -> tuple[Array, Array]:
         draft_features = self._draft_features(
             tokens,
-            z_logits,
+            z,
             step_index,
         )
         context_input = self.dropout(base_embeddings, deterministic=not train, rngs=dropout_key)
@@ -538,7 +506,7 @@ class BeliefDynamicsReasoner(nnx.Module):
             "energy_update_rms": energy_update_rms,
             "energy_value": energy_value,
             "energy_grad_rms": zero,
-            "logit_step_rms": zero,
+            "probability_step_rms": zero,
             "energy_distribution_step_rms": energy_update_rms,
             "energy_entropy": energy_entropy,
             "proposal_update_rms": zero,
@@ -588,7 +556,7 @@ class BeliefDynamicsReasoner(nnx.Module):
             "energy_update_rms": energy_grad_rms,
             "energy_value": energy_value,
             "energy_grad_rms": energy_grad_rms,
-            "logit_step_rms": distribution_step_rms,
+            "probability_step_rms": distribution_step_rms,
             "energy_distribution_step_rms": jnp.zeros_like(energy_grad_rms),
             "energy_entropy": jnp.zeros_like(energy_grad_rms),
             "proposal_update_rms": jnp.zeros_like(energy_grad_rms),
@@ -629,7 +597,7 @@ class BeliefDynamicsReasoner(nnx.Module):
             "energy_update_rms": zero,
             "energy_value": zero,
             "energy_grad_rms": zero,
-            "logit_step_rms": zero,
+            "probability_step_rms": zero,
             "energy_distribution_step_rms": zero,
             "energy_entropy": zero,
             "proposal_update_rms": proposal_update_rms,
@@ -668,7 +636,7 @@ class BeliefDynamicsReasoner(nnx.Module):
             "energy_update_rms": zero,
             "energy_value": zero,
             "energy_grad_rms": zero,
-            "logit_step_rms": zero,
+            "probability_step_rms": zero,
             "energy_distribution_step_rms": zero,
             "energy_entropy": zero,
             "proposal_update_rms": zero,
@@ -731,7 +699,7 @@ class BeliefDynamicsReasoner(nnx.Module):
         stop_hidden_between_steps: bool = True,
     ) -> tuple[Array, Array, dict[str, Array], tuple[Array, Array]]:
         # The explicit z state is stopped before context construction; the
-        # configured update rule then acts on logits using the refined H.
+        # configured update rule then acts on the refined hidden workspace.
         context_condition, draft_condition = self._typed_conditions(
             tokens,
             jax.lax.stop_gradient(z),
@@ -878,7 +846,7 @@ class BeliefDynamicsReasoner(nnx.Module):
             dropout_key=dropout_key,
         )
         hidden = jnp.where(reset_state, reset_hidden, carry["hidden"])
-        next_z, next_hidden, update_diagnostics, update_distributions = self._commit_step(
+        next_z, next_hidden, update_diagnostics, _update_distributions = self._commit_step(
             inputs,
             z,
             hidden,
@@ -889,11 +857,7 @@ class BeliefDynamicsReasoner(nnx.Module):
             stop_hidden_between_steps=True,
         )
         halt_logits = update_diagnostics["halt_logits"]
-        if self._state_is_probability():
-            _current_distribution, next_distribution = update_distributions
-            logits = next_distribution
-        else:
-            logits = self._z_to_token_logits(next_z, inputs, step_index)
+        logits = self._z_to_token_logits(next_z, inputs, step_index)
         new_steps = steps + 1
         is_last_step = new_steps >= self.total_steps
         if train:
@@ -931,7 +895,7 @@ class BeliefDynamicsReasoner(nnx.Module):
             "energy_update_rms": jnp.mean(update_diagnostics["energy_update_rms"].astype(jnp.float32)),
             "energy_value": jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
             "energy_grad_rms": jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
-            "logit_step_rms": jnp.mean(update_diagnostics["logit_step_rms"].astype(jnp.float32)),
+            "probability_step_rms": jnp.mean(update_diagnostics["probability_step_rms"].astype(jnp.float32)),
             "energy_distribution_step_rms": jnp.mean(update_diagnostics["energy_distribution_step_rms"].astype(jnp.float32)),
             "energy_entropy": jnp.mean(update_diagnostics["energy_entropy"].astype(jnp.float32)),
             "proposal_update_rms": jnp.mean(update_diagnostics["proposal_update_rms"].astype(jnp.float32)),
@@ -976,13 +940,8 @@ class BeliefDynamicsReasoner(nnx.Module):
             next_carry = (next_z, next_hidden)
             if return_final_only:
                 return next_carry, None
-            if self._state_is_probability():
-                _current_distribution, next_distribution = _update_distributions
-                logits = next_distribution
-                confidence = jnp.max(next_distribution, axis=-1)
-            else:
-                logits = self._z_to_token_logits(next_z, tokens, step_index)
-                confidence = jnp.max(self._state_distribution(next_z), axis=-1)
+            logits = self._z_to_token_logits(next_z, tokens, step_index)
+            confidence = jnp.max(self._state_distribution(next_z), axis=-1)
             q_top1_probability = jnp.sum(confidence * query_mask) / query_normalizer
             hidden_delta = jnp.mean(
                 jnp.linalg.norm((next_hidden - prev_hidden_state).astype(jnp.float32), axis=-1)
@@ -998,7 +957,7 @@ class BeliefDynamicsReasoner(nnx.Module):
                 jnp.mean(update_diagnostics["energy_update_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_value"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_grad_rms"].astype(jnp.float32)),
-                jnp.mean(update_diagnostics["logit_step_rms"].astype(jnp.float32)),
+                jnp.mean(update_diagnostics["probability_step_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_distribution_step_rms"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["energy_entropy"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["proposal_update_rms"].astype(jnp.float32)),
@@ -1045,7 +1004,7 @@ class BeliefDynamicsReasoner(nnx.Module):
                 "energy_update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_value": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_grad_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
-                "logit_step_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "probability_step_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_distribution_step_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "energy_entropy": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "proposal_update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
@@ -1067,7 +1026,7 @@ class BeliefDynamicsReasoner(nnx.Module):
             energy_update_rms,
             energy_value,
             energy_grad_rms,
-            logit_step_rms,
+            probability_step_rms,
             energy_distribution_step_rms,
             energy_entropy,
             proposal_update_rms,
@@ -1088,7 +1047,7 @@ class BeliefDynamicsReasoner(nnx.Module):
             "energy_update_rms": energy_update_rms,
             "energy_value": energy_value,
             "energy_grad_rms": energy_grad_rms,
-            "logit_step_rms": logit_step_rms,
+            "probability_step_rms": probability_step_rms,
             "energy_distribution_step_rms": energy_distribution_step_rms,
             "energy_entropy": energy_entropy,
             "proposal_update_rms": proposal_update_rms,

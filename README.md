@@ -1,27 +1,24 @@
 # Recurrent Grid Reasoning
 
 This is a JAX + `flax.nnx` research codebase for recurrent reasoning on 2D grid
-tasks. The current Sudoku MVP is BDR-Sudoku, a belief-first recurrent solver
-that studies learned dynamics over an explicit answer belief.
+tasks. The current Sudoku path is BDR, a belief-first recurrent solver that
+studies learned dynamics over an explicit answer belief.
 
-- `bdr_sudoku`: the current Sudoku path. It uses digit belief logits, recurrent
-  spatial hidden state, local convolutional mixing, global attention, and either
-  velocity or energy-gradient belief updates.
+- `bdr`: the belief dynamics model. It uses a persistent answer distribution,
+  recurrent spatial hidden state, local mixing, global attention, and a
+  configurable belief update rule.
 - `trm`: a Tiny Recursive Model baseline.
+- `urm`: a Universal Recursive Model baseline.
 
 BDR means Belief Dynamics Reasoner. The design separates explicit answer state
-from recurrent computation. The persistent answer coordinate is centered logits
-`z`; its softmax `q` is the per-cell probability view used by the loss and by
-the recurrent solver. The separate hidden field `h` carries grid computation.
-The current energy branch learns a scalar energy over candidate distributions
-and updates `z` by a mirror-descent-like step; the velocity branch learns a free
-logit-space update field.
+from recurrent computation. The persistent answer coordinate `z` is the
+per-cell probability distribution used by the loss and recurrent solver. The
+separate hidden field `h` carries grid computation.
 
-BDR-Sudoku does not use clue-dropout pseudo-labels, symbolic traces, DSL rules,
-or a hand-written Sudoku checker in the loss. Training uses step-carry
-recurrence, supervised CE over target cells, digit permutation augmentation,
-energy/path diagnostics, and optional fixed-point, wrong-attractor, and
-corrupted-recovery auxiliary losses.
+BDR does not use clue-dropout pseudo-labels, symbolic traces, DSL rules, or a
+hand-written checker in the loss. Training uses the shared ACT recurrent path,
+supervised CE over target cells, task-specific augmentation, and compact belief
+dynamics diagnostics.
 
 A short architecture overview lives in [docs/architecture.md](docs/architecture.md).
 
@@ -29,7 +26,7 @@ A short architecture overview lives in [docs/architecture.md](docs/architecture.
 
 The implementation lives under the `lfrm` package:
 
-- `lfrm.models`: BDR-Sudoku and TRM models
+- `lfrm.models`: BDR, TRM, and URM models
 - `lfrm.datasets`: generic grid dataset loading plus Sudoku/Maze dataset building
 - `lfrm.training`: optimizer, loss, metrics, and checkpoint helpers
 - `lfrm.scripts`: console-script entry points
@@ -74,7 +71,7 @@ uv run lfrm-build-arc \
   --num-aug 1000
 ```
 
-Train BDR-Sudoku:
+Train BDR:
 
 ```bash
 uv run lfrm-train --config configs/sudoku_bdr.toml
@@ -86,12 +83,12 @@ CLI flags override config values:
 uv run lfrm-train --config configs/sudoku_bdr.toml --learning-rate 1e-4 --batch-size 16
 ```
 
-BDR-Sudoku recurrent supervision is controlled by `model.bdr.step_loss_schedule`,
+BDR recurrent supervision is controlled by `model.bdr.step_loss_schedule`,
 which selects how per-step CE terms are normalized across commit steps.
 TRM/URM train through the official-style ACT carry path by default; the older
-dense unroll training path has been removed. BDR-Sudoku additionally reports
-given consistency, row/column/box conflict count, target probability, update
-size, distribution movement, and energy-gradient diagnostics.
+dense unroll training path has been removed. BDR additionally reports given
+consistency, row/column/box conflict count, target probability, update size,
+distribution movement, and update-rule diagnostics.
 
 The package also applies project-level JAX defaults before JAX initializes:
 Triton GEMM is enabled with `--xla_gpu_triton_gemm_any=true`, the XLA GPU
@@ -119,5 +116,3 @@ as a `jax-profile` artifact. Disable with `--no-profile-enabled` or
 - Sudoku derives blank-cell supervision from token `1`; Maze writes an explicit
   `given_mask.npy` so known walls, start, and goal cells are treated as givens,
   while open cells are supervised as path/non-path decisions.
-- Old Sudoku LFRM/Mini-GLIDER/BDR-prototype configs are not compatible with the current
-  BDR-Sudoku path. The TRM Sudoku baseline config is still available.

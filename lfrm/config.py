@@ -47,8 +47,8 @@ class BeliefDynamicsConfig:
     halt_exploration_prob: float = 0.1
     step_loss_schedule: str = "uniform"
     update_rule: str = "proposal"
-    draft_view: str = "auto"
-    prediction_view: str = "auto"
+    draft_view: str = "probability"
+    prediction_view: str = "probability"
     update_step_size: float = 0.3
 
 

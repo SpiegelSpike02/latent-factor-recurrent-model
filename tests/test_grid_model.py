@@ -375,8 +375,8 @@ class GridModelTests(unittest.TestCase):
         tokens = jnp.zeros((1, 81), dtype=jnp.int32)
         initial_z = model.initial_z(tokens)
         self.assertTrue(bool(jnp.allclose(initial_z, jnp.full_like(initial_z, 1.0 / 9.0))))
-        q_view = model._state_distribution(initial_z)
-        self.assertTrue(bool(jnp.allclose(q_view, jnp.full_like(q_view, 1.0 / 9.0))))
+        distribution = model._state_distribution(initial_z)
+        self.assertTrue(bool(jnp.allclose(distribution, jnp.full_like(distribution, 1.0 / 9.0))))
 
     def test_bdr_accepts_puzzle_identifiers(self) -> None:
         model = BeliefDynamicsReasoner(

@@ -175,7 +175,7 @@ def _bdr_branch_diagnostics(model: BeliefDynamicsReasoner, diagnostics: dict[str
             "energy_update_rms": diagnostics["energy_update_rms"],
             "energy_value": diagnostics["energy_value"],
             "energy_grad_rms": diagnostics["energy_grad_rms"],
-            "energy_probability_step_rms": diagnostics["logit_step_rms"],
+            "energy_probability_step_rms": diagnostics["probability_step_rms"],
         }
     raise ValueError(f"Unsupported BDR update_rule={update_rule!r}")
 
