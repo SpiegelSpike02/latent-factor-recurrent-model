@@ -7,66 +7,18 @@ import jax.numpy as jnp
 from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
-from lfrm.models.recurrent.layers import (
+from lfrm.models.grid_layers import (
     Array,
     CastedEmbedding,
+    ConvSwiGLU1D,
     FullAttention,
+    build_1d_rope,
     casted_linear_init,
     compute_dtype,
     maybe_cast,
-    swiglu_intermediate_size,
     trunc_normal,
     unscaled_rms_norm,
 )
-
-
-class ConvSwiGLU(nnx.Module):
-    """URM feed-forward block: SwiGLU, sequence depthwise conv, SiLU, down projection."""
-
-    def __init__(self, config: ModelConfig, dtype: jnp.dtype, *, rngs: nnx.Rngs) -> None:
-        urm = config.urm_config
-        if urm.conv_kernel < 1:
-            raise ValueError("URM conv_kernel must be positive")
-        self.dtype = dtype
-        hidden_size = config.d_model
-        intermediate_size = swiglu_intermediate_size(hidden_size, urm.mlp_ratio, min_size=256)
-        self.gate_up = nnx.Linear(
-            hidden_size,
-            2 * intermediate_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.depthwise = nnx.Conv(
-            intermediate_size,
-            intermediate_size,
-            kernel_size=(urm.conv_kernel,),
-            padding=[(urm.conv_kernel // 2, urm.conv_kernel // 2)],
-            feature_group_count=intermediate_size,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            preferred_element_type=dtype,
-            rngs=rngs,
-        )
-        self.down = nnx.Linear(
-            intermediate_size,
-            hidden_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-
-    def __call__(self, h: Array) -> Array:
-        gate, up = jnp.split(self.gate_up(maybe_cast(h, self.dtype)), 2, axis=-1)
-        x = jax.nn.silu(gate) * up
-        x = self.depthwise(x)[:, : h.shape[1], :]
-        x = jax.nn.silu(x)
-        return self.down(x)
 
 
 class URMBlock(nnx.Module):
@@ -81,7 +33,15 @@ class URMBlock(nnx.Module):
             rngs=rngs,
         )
         self.attention_norm = unscaled_rms_norm(config.d_model, self.norm_eps, dtype, rngs)
-        self.conv_swiglu = ConvSwiGLU(config, dtype, rngs=rngs)
+        self.conv_swiglu = ConvSwiGLU1D(
+            config.d_model,
+            config.urm_config.mlp_ratio,
+            config.urm_config.conv_kernel,
+            dtype,
+            min_intermediate_size=256,
+            use_bias=True,
+            rngs=rngs,
+        )
         self.mlp_norm = unscaled_rms_norm(config.d_model, self.norm_eps, dtype, rngs)
 
     def __call__(self, h: Array, rope_cos: Array, rope_sin: Array) -> Array:
@@ -169,12 +129,9 @@ class UnifiedReasoningModel(nnx.Module):
         head_dim = config.d_model // urm.num_heads
         if head_dim % 2 != 0:
             raise ValueError("URM RoPE requires an even attention head dimension")
-        positions = jnp.arange(self.total_seq_len, dtype=jnp.float32)
-        inv_freq = 1.0 / (urm.rope_theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
-        freqs = jnp.einsum("n,d->nd", positions, inv_freq)
-        rope = jnp.concatenate((freqs, freqs), axis=-1)
-        self.rope_cos = nnx.data(jnp.cos(rope))
-        self.rope_sin = nnx.data(jnp.sin(rope))
+        rope_cos, rope_sin = build_1d_rope(self.total_seq_len, head_dim, urm.rope_theta)
+        self.rope_cos = nnx.data(rope_cos)
+        self.rope_sin = nnx.data(rope_sin)
 
         self.init_hidden = nnx.data(
             trunc_normal(rngs.params(), (config.d_model,), std=1.0, dtype=self.dtype)

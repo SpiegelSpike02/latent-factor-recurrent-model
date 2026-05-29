@@ -30,10 +30,11 @@ class TRMConfig:
 
 
 @dataclass(frozen=True)
-class BDRConfig:
+class BeliefDynamicsConfig:
     commit_steps: int = 6
-    refine_steps: int = 2
-    block_depth: int = 1
+    h_cycles: int = 1
+    l_cycles: int = 2
+    l_layers: int = 1
     hidden_state_dim: int = 0
     num_heads: int = 4
     mlp_ratio: int = 2
@@ -43,6 +44,7 @@ class BDRConfig:
     position_encoding: str = "rope"
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
+    halt_exploration_prob: float = 0.1
     step_loss_schedule: str = "uniform"
     update_rule: str = "proposal"
     draft_view: str = "auto"
@@ -57,13 +59,6 @@ class BDRConfig:
     wrong_attractor_rank_margin: float = 1.0
     wrong_attractor_update_floor: float = 0.5
     corrupted_recovery_weight: float = 0.0
-    early_stop_enabled: bool = True
-    early_stop_min_steps: int = 4
-    early_stop_patience: int = 2
-    early_stop_distribution_delta_threshold: float = 1e-3
-    early_stop_flip_threshold: float = 0.0
-    early_stop_margin_threshold: float = 0.5
-    early_stop_require_constraints: bool = True
 
 
 @dataclass(frozen=True)
@@ -98,7 +93,7 @@ class ModelConfig:
     loss_type: str = "softmax"
     task: TaskConfig | None = None
     trm: TRMConfig | None = None
-    bdr: BDRConfig | None = None
+    bdr: BeliefDynamicsConfig | None = None
     urm: URMConfig | None = None
 
     @property
@@ -110,8 +105,8 @@ class ModelConfig:
         return self.trm or TRMConfig()
 
     @property
-    def bdr_config(self) -> BDRConfig:
-        return self.bdr or BDRConfig()
+    def bdr_config(self) -> BeliefDynamicsConfig:
+        return self.bdr or BeliefDynamicsConfig()
 
     @property
     def urm_config(self) -> URMConfig:

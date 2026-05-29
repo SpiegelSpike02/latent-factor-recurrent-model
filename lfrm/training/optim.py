@@ -119,6 +119,8 @@ def _uses_puzzle_embedding(config: ExperimentConfig) -> bool:
         return config.model.trm_config.puzzle_embed_len > 0 or config.model.trm_config.puzzle_embed_ndim > 0
     if config.model.model_type == "urm":
         return config.model.urm_config.puzzle_embed_len > 0 or config.model.urm_config.puzzle_embed_ndim > 0
+    if config.model.model_type == "bdr":
+        return config.model.num_puzzle_identifiers > 0
     return False
 
 

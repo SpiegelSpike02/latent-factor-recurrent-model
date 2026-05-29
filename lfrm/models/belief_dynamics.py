@@ -8,78 +8,17 @@ from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
 from .common import Array, casted_linear_init, compute_dtype, gather_embedding_rows, maybe_cast, trunc_normal_init
-from .recurrent.layers import (
-    dot_product_attention,
-    multi_head_attention_with_rope,
-    swiglu_intermediate_size,
+from .grid_layers import (
+    CastedEmbedding,
+    ConvSwiGLU2D,
+    FullAttention,
+    build_2d_axial_rope,
+    run_truncated_h_cycles,
     unscaled_rms_norm,
 )
 
 
-class BDRLocalConvSwiGLU(nnx.Module):
-    def __init__(
-        self,
-        config: ModelConfig,
-        hidden_dim: int,
-        mlp_ratio: int,
-        dtype: jnp.dtype,
-        *,
-        rngs: nnx.Rngs,
-    ) -> None:
-        bdr = config.bdr_config
-        if bdr.local_kernel < 1 or bdr.local_kernel % 2 == 0:
-            raise ValueError("BDR local_kernel must be a positive odd integer")
-        self.config = config
-        self.hidden_dim = hidden_dim
-        self.dtype = dtype
-        intermediate_size = swiglu_intermediate_size(hidden_dim, mlp_ratio, min_size=hidden_dim)
-        self.gate_up = nnx.Linear(
-            hidden_dim,
-            2 * intermediate_size,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-        self.depthwise = nnx.Conv(
-            intermediate_size,
-            intermediate_size,
-            kernel_size=(bdr.local_kernel, bdr.local_kernel),
-            padding="SAME",
-            feature_group_count=intermediate_size,
-            use_bias=True,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            preferred_element_type=dtype,
-            rngs=rngs,
-        )
-        self.down = nnx.Linear(
-            intermediate_size,
-            hidden_dim,
-            use_bias=False,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            kernel_init=casted_linear_init,
-            rngs=rngs,
-        )
-
-    def __call__(self, h: Array) -> Array:
-        batch_size = h.shape[0]
-        gate, up = jnp.split(self.gate_up(maybe_cast(h, self.dtype)), 2, axis=-1)
-        x = jax.nn.silu(gate) * up
-        x = x.reshape(
-            batch_size,
-            self.config.grid_height,
-            self.config.grid_width,
-            x.shape[-1],
-        )
-        x = self.depthwise(x)
-        x = x.reshape(batch_size, self.config.seq_len, x.shape[-1])
-        return self.down(jax.nn.silu(x))
-
-
-class BDRSolverBlock(nnx.Module):
+class BeliefDynamicsBlock(nnx.Module):
     def __init__(
         self,
         config: ModelConfig,
@@ -92,18 +31,11 @@ class BDRSolverBlock(nnx.Module):
     ) -> None:
         self.config = config
         self.dtype = dtype
-        self.self_attention = nnx.MultiHeadAttention(
+        self.self_attention = FullAttention(
+            hidden_dim,
             num_heads,
-            in_features=hidden_dim,
-            qkv_features=hidden_dim,
-            out_features=hidden_dim,
-            dtype=dtype,
-            param_dtype=jnp.float32,
-            use_bias=False,
-            dropout_rate=0.0,
-            attention_fn=dot_product_attention,
-            kernel_init=casted_linear_init,
-            out_kernel_init=casted_linear_init,
+            dtype,
+            name="BDR",
             rngs=rngs,
         )
         bdr = config.bdr_config
@@ -111,13 +43,14 @@ class BDRSolverBlock(nnx.Module):
         self.local_norm = unscaled_rms_norm(hidden_dim, bdr.rms_norm_eps, dtype, rngs)
         self.attn_scale = float(bdr.attn_scale)
         self.local_scale = float(bdr.local_scale)
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-        self.local_mlp = BDRLocalConvSwiGLU(
-            config,
+        self.local_mlp = ConvSwiGLU2D(
             hidden_dim,
             mlp_ratio,
-            dtype=dtype,
+            bdr.local_kernel,
+            config.grid_height,
+            config.grid_width,
+            dtype,
+            min_intermediate_size=hidden_dim,
             rngs=rngs,
         )
 
@@ -144,17 +77,10 @@ class BDRSolverBlock(nnx.Module):
         rope_cos: Array | None,
         rope_sin: Array | None,
     ) -> Array:
-        return multi_head_attention_with_rope(
-            self.self_attention,
+        return self.self_attention(
             hidden_state,
-            hidden_state,
-            hidden_state,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            dtype=self.dtype,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
-            name="BDR draft-conditioned attention",
         )
 
     def global_communicate(
@@ -186,7 +112,7 @@ class BDRSolverBlock(nnx.Module):
         return (h.astype(jnp.float32) + self.local_scale * local).astype(self.dtype)
 
 
-class BDRModel(nnx.Module):
+class BeliefDynamicsReasoner(nnx.Module):
     """Z-state recurrent solver for fixed-size grid reasoning tasks.
 
     The recurrent state stores centered answer logits ``z``. Its softmax is the
@@ -202,7 +128,7 @@ class BDRModel(nnx.Module):
         rngs: nnx.Rngs,
     ) -> None:
         if config.model_type != "bdr":
-            raise ValueError("BDRModel requires model_type='bdr'")
+            raise ValueError("BeliefDynamicsReasoner requires model_type='bdr'")
         if config.grid_height * config.grid_width != config.seq_len:
             raise ValueError("grid_height * grid_width must equal seq_len")
         if config.task_type == "sudoku" and config.vocab_size != 9:
@@ -210,8 +136,8 @@ class BDRModel(nnx.Module):
         bdr = config.bdr_config
         if bdr.commit_steps < 1:
             raise ValueError("BDR commit_steps must be at least 1")
-        if min(bdr.refine_steps, bdr.block_depth) < 1:
-            raise ValueError("BDR refine_steps and block_depth must be at least 1")
+        if min(bdr.h_cycles, bdr.l_cycles, bdr.l_layers) < 1:
+            raise ValueError("BDR h_cycles, l_cycles, and l_layers must be at least 1")
         hidden_dim = int(bdr.hidden_state_dim) if bdr.hidden_state_dim > 0 else config.d_model
         if hidden_dim < 1:
             raise ValueError("BDR hidden_state_dim must be positive or 0 for d_model")
@@ -252,22 +178,13 @@ class BDRModel(nnx.Module):
             raise ValueError("BDR wrong_attractor_rank_margin must be non-negative")
         if bdr.wrong_attractor_update_floor < 0.0:
             raise ValueError("BDR wrong_attractor_update_floor must be non-negative")
-        if bdr.early_stop_min_steps < 1:
-            raise ValueError("BDR early_stop_min_steps must be at least 1")
-        if bdr.early_stop_patience < 1:
-            raise ValueError("BDR early_stop_patience must be at least 1")
-        if bdr.early_stop_distribution_delta_threshold < 0.0:
-            raise ValueError("BDR early_stop_distribution_delta_threshold must be non-negative")
-        if bdr.early_stop_flip_threshold < 0.0:
-            raise ValueError("BDR early_stop_flip_threshold must be non-negative")
-        if bdr.early_stop_margin_threshold < 0.0:
-            raise ValueError("BDR early_stop_margin_threshold must be non-negative")
         self.config = config
         self.runtime = runtime
         self.bdr = bdr
         self.commit_steps = int(bdr.commit_steps)
         self.total_steps = self.commit_steps
-        self.refine_steps = int(bdr.refine_steps)
+        self.h_cycles = int(bdr.h_cycles)
+        self.l_cycles = int(bdr.l_cycles)
         self.hidden_dim = hidden_dim
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
@@ -305,12 +222,11 @@ class BDRModel(nnx.Module):
             embedding_init=embed_init,
             rngs=rngs,
         )
-        self.puzzle_identifier_embed = nnx.Embed(
+        self.puzzle_embed = CastedEmbedding(
             config.num_puzzle_identifiers,
             config.d_model,
             dtype=self.dtype,
-            param_dtype=jnp.float32,
-            embedding_init=nnx.initializers.zeros,
+            init_std=0.0,
             rngs=rngs,
         )
         if bdr.position_encoding == "learned":
@@ -320,14 +236,9 @@ class BDRModel(nnx.Module):
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
         if bdr.position_encoding == "rope":
             head_dim = self.hidden_dim // bdr.num_heads
-            axis_dim = head_dim // 2
-            inv_freq = 1.0 / (bdr.rope_theta ** (jnp.arange(0, axis_dim, 2, dtype=jnp.float32) / axis_dim))
-            row_freqs = rows.astype(jnp.float32)[:, None] * inv_freq[None, :]
-            col_freqs = cols.astype(jnp.float32)[:, None] * inv_freq[None, :]
-            freqs = jnp.concatenate((row_freqs, col_freqs), axis=-1)
-            rope = jnp.concatenate((freqs, freqs), axis=-1)
-            self.rope_cos = nnx.data(jnp.cos(rope))
-            self.rope_sin = nnx.data(jnp.sin(rope))
+            rope_cos, rope_sin = build_2d_axial_rope(rows, cols, head_dim, bdr.rope_theta)
+            self.rope_cos = nnx.data(rope_cos)
+            self.rope_sin = nnx.data(rope_sin)
         else:
             self.rope_cos = None
             self.rope_sin = None
@@ -352,7 +263,7 @@ class BDRModel(nnx.Module):
         self.update_readout_norm = unscaled_rms_norm(self.hidden_dim, bdr.rms_norm_eps, self.dtype, rngs)
         self.solver_blocks = nnx.List(
             [
-                BDRSolverBlock(
+                BeliefDynamicsBlock(
                     config,
                     self.hidden_dim,
                     bdr.num_heads,
@@ -360,8 +271,17 @@ class BDRModel(nnx.Module):
                     self.dtype,
                     rngs=rngs,
                 )
-                for _ in range(bdr.block_depth)
+                for _ in range(bdr.l_layers)
             ]
+        )
+        self.halt_head = nnx.Linear(
+            self.hidden_dim,
+            1,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            kernel_init=nnx.initializers.zeros,
+            bias_init=nnx.initializers.constant(-5.0),
+            rngs=rngs,
         )
         self.energy_state_to_hidden = nnx.Linear(
             self.q_vocab_size,
@@ -748,21 +668,29 @@ class BDRModel(nnx.Module):
         draft_condition: Array,
     ) -> Array:
         hidden = hidden_state.astype(self.dtype)
-        def refine_body(_step: Array, carry: Array) -> Array:
-            del _step
-            refined = carry
-            for block in self.solver_blocks:
-                refined = block.global_communicate(
-                    refined,
-                    context_condition,
-                    draft_condition,
-                    self.rope_cos,
-                    self.rope_sin,
-                )
-                refined = block.local_think(refined, context_condition, draft_condition)
-            return refined
 
-        return jax.lax.fori_loop(0, self.refine_steps, refine_body, hidden)
+        def latent_update(state: Array) -> Array:
+            def refine_body(_step: Array, carry: Array) -> Array:
+                del _step
+                refined = carry
+                for block in self.solver_blocks:
+                    refined = block.global_communicate(
+                        refined,
+                        context_condition,
+                        draft_condition,
+                        self.rope_cos,
+                        self.rope_sin,
+                    )
+                    refined = block.local_think(refined, context_condition, draft_condition)
+                return refined
+
+            return jax.lax.fori_loop(0, self.l_cycles, refine_body, state)
+
+        return run_truncated_h_cycles(
+            hidden,
+            h_cycles=self.h_cycles,
+            latent_update=latent_update,
+        )
 
     def _update_read_state(
         self,
@@ -810,6 +738,10 @@ class BDRModel(nnx.Module):
             z, update_diagnostics, update_distributions = self._energy_probability_descent_from_read_state(z, read_state)
         else:
             raise ValueError(f"Unsupported BDR update_rule={self.bdr.update_rule!r}")
+        update_diagnostics = {
+            **update_diagnostics,
+            "halt_logits": self._halt_logits(read_state, tokens),
+        }
         return (
             z,
             hidden_state,
@@ -1097,69 +1029,6 @@ class BDRModel(nnx.Module):
             "corrupted_recovery_energy_gap": corrupted_terms["energy_gap"],
         }
 
-    def _sudoku_constraint_ok(self, prediction_digits: Array, inputs: Array) -> Array:
-        given_mask = inputs > self.sudoku_blank_token_id
-        given_digits = jnp.clip(inputs - 1, 0, self.q_vocab_size - 1)
-        givens_ok = jnp.all(jnp.where(given_mask, prediction_digits == given_digits, True), axis=-1)
-        grid = prediction_digits.reshape((prediction_digits.shape[0], self.config.grid_height, self.config.grid_width))
-        grid_one_hot = jax.nn.one_hot(grid, self.q_vocab_size)
-        row_ok = jnp.all(jnp.all(jnp.sum(grid_one_hot, axis=2) == 1, axis=-1), axis=-1)
-        col_ok = jnp.all(jnp.all(jnp.sum(grid_one_hot, axis=1) == 1, axis=-1), axis=-1)
-        flat = prediction_digits
-        box_values = jnp.take(flat, self.box_indices, axis=1)
-        box_ok = jnp.all(jnp.all(jnp.sum(jax.nn.one_hot(box_values, self.q_vocab_size), axis=2) == 1, axis=-1), axis=-1)
-        return givens_ok & row_ok & col_ok & box_ok
-
-    def _early_stop(
-        self,
-        old_z: Array,
-        new_z: Array,
-        inputs: Array,
-        new_steps: Array,
-        update_diagnostics: dict[str, Array],
-        update_distributions: tuple[Array, Array] | None,
-    ) -> tuple[Array, dict[str, Array]]:
-        if update_distributions is None:
-            old_distribution = self._state_distribution(old_z)
-            new_distribution = self._state_distribution(new_z)
-        else:
-            old_distribution, new_distribution = update_distributions
-        query_mask = (~self.context_mask(inputs)).astype(jnp.float32)
-        query_normalizer = jnp.maximum(jnp.sum(query_mask, axis=-1), 1.0)
-        distribution_delta_cell = 0.5 * jnp.sum(jnp.abs(new_distribution - old_distribution), axis=-1)
-        distribution_delta = jnp.sum(distribution_delta_cell * query_mask, axis=-1) / query_normalizer
-        old_pred = jnp.argmax(old_distribution, axis=-1)
-        new_pred = jnp.argmax(new_distribution, axis=-1)
-        flip_rate = jnp.sum((old_pred != new_pred).astype(jnp.float32) * query_mask, axis=-1) / query_normalizer
-        update_rms_cell = update_diagnostics["update_rms"][..., 0].astype(jnp.float32)
-        update_rms = jnp.sum(update_rms_cell * query_mask, axis=-1) / query_normalizer
-        margin = self._top2_margin(new_distribution)[..., 0]
-        margin_min = jnp.min(jnp.where(query_mask.astype(bool), margin, jnp.inf), axis=-1)
-        has_query = jnp.sum(query_mask, axis=-1) > 0
-        margin_min = jnp.where(has_query, margin_min, jnp.max(margin, axis=-1))
-        if self.config.task_type == "sudoku":
-            constraint_ok = self._sudoku_constraint_ok(new_pred, inputs)
-        else:
-            constraint_ok = jnp.ones((inputs.shape[0],), dtype=bool)
-        if not bool(self.bdr.early_stop_require_constraints):
-            constraint_ok = jnp.ones_like(constraint_ok)
-        stable = (
-            bool(self.bdr.early_stop_enabled)
-            & (new_steps >= int(self.bdr.early_stop_min_steps))
-            & (distribution_delta <= float(self.bdr.early_stop_distribution_delta_threshold))
-            & (flip_rate <= float(self.bdr.early_stop_flip_threshold))
-            & (margin_min >= float(self.bdr.early_stop_margin_threshold))
-            & constraint_ok
-        )
-        diagnostics = {
-            "early_stop_update_rms": jnp.mean(update_rms.astype(jnp.float32)),
-            "early_stop_distribution_delta": jnp.mean(distribution_delta.astype(jnp.float32)),
-            "early_stop_flip_rate": jnp.mean(flip_rate.astype(jnp.float32)),
-            "early_stop_margin_min": jnp.mean(margin_min.astype(jnp.float32)),
-            "early_stop_constraint_rate": jnp.mean(constraint_ok.astype(jnp.float32)),
-        }
-        return stable, diagnostics
-
     def initial_hidden_state(
         self,
         tokens: Array,
@@ -1179,17 +1048,21 @@ class BDRModel(nnx.Module):
         self,
         tokens: Array,
         puzzle_identifiers: Array | None = None,
+        puzzle_embeddings: Array | None = None,
     ) -> tuple[Array, Array]:
         context = self.context_mask(tokens)
         token_ids = jnp.clip(tokens, 0, self.input_vocab_size - 1)
         base_embeddings = self._embed_tokens(self.token_embed, token_ids) * self.embed_scale
-        if puzzle_identifiers is None:
-            puzzle_identifiers = jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
-        puzzle_identifier = self._embed_tokens(
-            self.puzzle_identifier_embed,
-            jnp.clip(puzzle_identifiers.astype(jnp.int32), 0, self.config.num_puzzle_identifiers - 1)
-        )
-        base_embeddings = base_embeddings + puzzle_identifier[:, None, :]
+        if puzzle_embeddings is None:
+            if puzzle_identifiers is None:
+                puzzle_identifiers = jnp.zeros((tokens.shape[0],), dtype=jnp.int32)
+            puzzle_embedding = self.puzzle_embed(
+                jnp.clip(puzzle_identifiers.astype(jnp.int32), 0, self.config.num_puzzle_identifiers - 1),
+                train=True,
+            )
+        else:
+            puzzle_embedding = puzzle_embeddings
+        base_embeddings = base_embeddings + puzzle_embedding[:, None, :]
         if self.bdr.position_encoding == "learned":
             base_embeddings = base_embeddings + self._position_embeddings()[None, :, :]
         return base_embeddings, context
@@ -1207,25 +1080,35 @@ class BDRModel(nnx.Module):
                 dtype=self.dtype,
             ),
             "steps": jnp.zeros((batch_size,), dtype=jnp.int32),
-            "stable_steps": jnp.zeros((batch_size,), dtype=jnp.int32),
-            "reset": jnp.ones((batch_size,), dtype=bool),
+            "halted": jnp.ones((batch_size,), dtype=bool),
             "current_inputs": jnp.zeros_like(batch["inputs"]),
             "current_labels": jnp.zeros_like(batch["labels"]),
             "current_puzzle_identifiers": jnp.zeros_like(puzzle_identifiers),
-            "current_example_mask": jnp.zeros_like(batch["inputs"][:, 0], dtype=jnp.float32),
         }
 
-    def forward_carry_step(
+    def _halt_logits(self, read_state: Array, tokens: Array) -> Array:
+        query_mask = (~self.context_mask(tokens)).astype(jnp.float32)
+        fallback_mask = jnp.ones_like(query_mask)
+        has_query = jnp.sum(query_mask, axis=-1, keepdims=True) > 0.0
+        mask = jnp.where(has_query, query_mask, fallback_mask)
+        pooled = (
+            jnp.sum(read_state.astype(jnp.float32) * mask[..., None], axis=1)
+            / jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1.0)
+        )
+        return self.halt_head(maybe_cast(pooled, self.dtype)).astype(jnp.float32)[..., 0]
+
+    def forward_act_step(
         self,
         carry: dict[str, Array],
         batch: dict[str, Array],
         *,
         train: bool,
         dropout_key: Array | None = None,
+        puzzle_embeddings: Array | None = None,
     ) -> tuple[dict[str, Array], Array, dict[str, Array]]:
         if dropout_key is None:
             dropout_key = jax.random.key(0)
-        reset = carry["reset"]
+        reset = carry["halted"]
         reset_cells = reset[:, None]
         reset_state = reset[:, None, None]
         inputs = jnp.where(reset_cells, batch["inputs"], carry["current_inputs"])
@@ -1239,18 +1122,12 @@ class BDRModel(nnx.Module):
             batch_puzzle_identifiers,
             carry["current_puzzle_identifiers"],
         )
-        if "example_mask" in batch:
-            batch_example_mask = batch["example_mask"].astype(jnp.float32)
-        else:
-            batch_example_mask = jnp.ones_like(reset, dtype=jnp.float32)
-        example_mask = jnp.where(reset, batch_example_mask, carry["current_example_mask"])
         steps = jnp.where(reset, 0, carry["steps"])
 
-        base_embeddings, _context = self.context_memory(inputs, puzzle_identifiers)
+        base_embeddings, _context = self.context_memory(inputs, puzzle_identifiers, puzzle_embeddings)
         step_index = jnp.minimum(steps, self.total_steps - 1)
         reset_z = self.initial_z(inputs)
         z = jnp.where(reset_state, reset_z, carry["z"])
-        stable_steps = jnp.where(reset, 0, carry["stable_steps"])
         reset_hidden = self.initial_hidden_state(
             inputs,
             reset_z,
@@ -1269,6 +1146,7 @@ class BDRModel(nnx.Module):
             dropout_key=dropout_key,
             stop_hidden_between_steps=True,
         )
+        halt_logits = update_diagnostics["halt_logits"]
         if self._state_is_probability():
             _current_distribution, next_distribution = update_distributions
             logits = next_distribution
@@ -1276,34 +1154,34 @@ class BDRModel(nnx.Module):
             logits = self._z_to_token_logits(next_z, inputs, step_index)
         new_steps = steps + 1
         is_last_step = new_steps >= self.total_steps
-        early_stop, early_stop_diagnostics = self._early_stop(
-            z,
-            next_z,
-            inputs,
-            new_steps,
-            update_diagnostics,
-            update_distributions,
-        )
-        stable_steps = jnp.where(early_stop, stable_steps + 1, 0)
-        stable_reset = stable_steps >= int(self.bdr.early_stop_patience)
-        next_reset = is_last_step | stable_reset
+        if train:
+            next_halted = is_last_step | (halt_logits > 0.0)
+            if self.total_steps > 1 and self.bdr.halt_exploration_prob > 0.0:
+                explore_key, min_step_key = jax.random.split(dropout_key)
+                use_random_min = jax.random.uniform(explore_key, (inputs.shape[0],)) < self.bdr.halt_exploration_prob
+                random_min_steps = jax.random.randint(
+                    min_step_key,
+                    (inputs.shape[0],),
+                    minval=2,
+                    maxval=self.total_steps + 1,
+                )
+                min_steps = jnp.where(use_random_min, random_min_steps, 1)
+                next_halted = next_halted & (new_steps >= min_steps)
+        else:
+            next_halted = is_last_step
         new_carry = {
             "z": jax.lax.stop_gradient(next_z),
             "hidden": jax.lax.stop_gradient(next_hidden),
             "steps": jax.lax.stop_gradient(new_steps),
-            "stable_steps": jax.lax.stop_gradient(stable_steps),
-            "reset": jax.lax.stop_gradient(next_reset),
+            "halted": jax.lax.stop_gradient(next_halted),
             "current_inputs": inputs,
             "current_labels": labels,
             "current_puzzle_identifiers": puzzle_identifiers,
-            "current_example_mask": example_mask,
         }
         diagnostics = {
-            "carry_step": jnp.mean(new_steps.astype(jnp.float32)),
-            "max_step_reset_rate": jnp.mean(is_last_step.astype(jnp.float32)),
-            "early_stop_rate": jnp.mean(stable_reset.astype(jnp.float32)),
-            "stability_rate": jnp.mean(early_stop.astype(jnp.float32)),
-            "stable_steps": jnp.mean(stable_steps.astype(jnp.float32)),
+            "halt_logits": halt_logits,
+            "act_step": jnp.mean(new_steps.astype(jnp.float32)),
+            "halted_rate": jnp.mean(next_halted.astype(jnp.float32)),
             "reset_rate": jnp.mean(reset.astype(jnp.float32)),
             "update_step_size": jnp.mean(update_diagnostics["update_step_size"].astype(jnp.float32)),
             "update_rms": jnp.mean(update_diagnostics["update_rms"].astype(jnp.float32)),
@@ -1320,7 +1198,6 @@ class BDRModel(nnx.Module):
             "free_velocity_negative_rate": jnp.mean(update_diagnostics["free_velocity_negative_rate"].astype(jnp.float32)),
             "distribution_tv_delta": jnp.mean(update_diagnostics["distribution_tv_delta"].astype(jnp.float32)),
             "path_energy": jnp.mean(update_diagnostics["path_energy"].astype(jnp.float32)),
-            **early_stop_diagnostics,
         }
         return new_carry, logits, diagnostics
 
@@ -1343,6 +1220,7 @@ class BDRModel(nnx.Module):
         def scan_step(carry, scan_inputs):
             step_index, step_dropout_key = scan_inputs
             z, hidden_state = carry
+            prev_hidden_state = hidden_state
             next_z, next_hidden, update_diagnostics, _update_distributions = self._commit_step(
                 tokens,
                 z,
@@ -1364,8 +1242,13 @@ class BDRModel(nnx.Module):
                 logits = self._z_to_token_logits(next_z, tokens, step_index)
                 confidence = jnp.max(self._state_distribution(next_z), axis=-1)
             q_top1_probability = jnp.sum(confidence * query_mask) / query_normalizer
+            hidden_delta = jnp.mean(
+                jnp.linalg.norm((next_hidden - prev_hidden_state).astype(jnp.float32), axis=-1)
+            )
             return next_carry, (
                 logits,
+                update_diagnostics["halt_logits"],
+                hidden_delta,
                 q_top1_probability,
                 jnp.mean(update_diagnostics["update_step_size"].astype(jnp.float32)),
                 jnp.mean(update_diagnostics["update_rms"].astype(jnp.float32)),
@@ -1411,6 +1294,8 @@ class BDRModel(nnx.Module):
             logits = self._z_to_token_logits(z_final, tokens, final_step)
             diagnostics = {
                 "q_top1_probability": jnp.zeros((self.total_steps,), dtype=jnp.float32),
+                "halt_logits": jnp.zeros((self.total_steps, tokens.shape[0]), dtype=jnp.float32),
+                "hidden_delta_mean": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
                 "update_step_size": jnp.zeros((self.total_steps,), dtype=jnp.float32),
                 "update_rms": jnp.zeros((self.total_steps,), dtype=jnp.float32),
@@ -1431,6 +1316,8 @@ class BDRModel(nnx.Module):
             return logits, diagnostics
         (
             step_logits,
+            halt_logits,
+            hidden_delta_mean,
             q_top1_probability,
             update_step_size,
             update_rms,
@@ -1450,6 +1337,8 @@ class BDRModel(nnx.Module):
         ) = scan_outputs
         diagnostics = {
             "q_top1_probability": q_top1_probability,
+            "halt_logits": halt_logits,
+            "hidden_delta_mean": hidden_delta_mean,
             "unroll_steps": jnp.asarray(self.total_steps, dtype=jnp.float32),
             "update_step_size": update_step_size,
             "update_rms": update_rms,

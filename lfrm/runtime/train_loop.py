@@ -34,12 +34,11 @@ from lfrm.runtime.sharding import (
 )
 from lfrm.training import (
     build_ema_update_runner,
-    build_bdr_step_carry_train_step_runner,
     build_state_copy_runner,
+    build_act_train_step_runner,
     build_eval_step_runner,
+    build_recurrent_eval_step_runner,
     build_train_step_runner,
-    build_trm_act_train_step_runner,
-    build_trm_eval_step_runner,
     create_ema_model,
     create_model,
     create_optimizer,
@@ -82,8 +81,8 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
         raise ValueError("epochs must be positive")
     if config.train.log_epochs <= 0:
         raise ValueError("log_epochs must be positive")
-    if config.train.train_mode not in ("act", "step_carry"):
-        raise ValueError("train_mode must be 'act' or 'step_carry'")
+    if config.train.train_mode != "act":
+        raise ValueError("train_mode must be 'act'")
     if config.eval.nums < 0:
         raise ValueError("eval nums must be non-negative; use 0 to disable eval")
     if not config.eval.full_dataset:
@@ -117,19 +116,13 @@ def validate_runtime_config(config: ExperimentConfig) -> None:
             raise ValueError("profile_steps must be positive when profiling is enabled")
     if config.model.model_type not in ("trm", "urm", "bdr") and config.train.train_mode != "act":
         raise ValueError("train_mode is only supported for recurrent model types")
-    if config.train.train_mode == "step_carry" and config.model.model_type != "bdr":
-        raise ValueError("train_mode='step_carry' is currently only implemented for model_type='bdr'")
-    if config.model.model_type == "bdr" and config.train.train_mode != "step_carry":
-        raise ValueError("BDR training supports only train_mode='step_carry'")
 
 
 def training_uses_carry(config: ExperimentConfig) -> bool:
-    return config.model.model_type in ("bdr", "trm", "urm") and config.train.train_mode in ("act", "step_carry")
+    return config.model.model_type in ("bdr", "trm", "urm") and config.train.train_mode == "act"
 
 
 def halt_loss_weight_for_mode(config: ExperimentConfig) -> float:
-    if config.model.model_type == "bdr":
-        return 0.0
     return config.train.halt_loss_weight
 
 
@@ -148,16 +141,10 @@ def validate_data_parallel_batching(config: ExperimentConfig, data_parallel_size
 
 def build_step_runners(config: ExperimentConfig):
     halt_loss_weight = halt_loss_weight_for_mode(config)
-    if config.model.model_type == "bdr":
-        train_step_fn = build_bdr_step_carry_train_step_runner()
-        eval_step_fn = build_eval_step_runner(
+    if config.model.model_type in ("bdr", "trm", "urm"):
+        train_step_fn = build_act_train_step_runner(config, halt_loss_weight)
+        eval_step_fn = build_recurrent_eval_step_runner(
             halt_loss_weight,
-            config.train.terminal_residual_weight,
-        )
-    elif config.model.model_type in ("trm", "urm"):
-        train_step_fn = build_trm_act_train_step_runner(config, config.train.halt_loss_weight)
-        eval_step_fn = build_trm_eval_step_runner(
-            config.train.halt_loss_weight,
             collect_diagnostics=config.eval.diagnostics,
         )
     else:
@@ -193,7 +180,7 @@ def print_run_overview(
         ("vocab_size", overview["vocab_size"]),
         ("input_vocab_size", overview["input_vocab_size"]),
     ]
-    if config.model.model_type in ("trm", "urm"):
+    if config.model.model_type in ("trm", "urm", "bdr"):
         fields.append(("num_puzzle_identifiers", overview["num_puzzle_identifiers"]))
     fields.extend(
         [
@@ -416,9 +403,9 @@ def run_training(
     )
 
     current_batch = prefetcher.next()
-    use_step_carry = training_uses_carry(config)
+    use_carry = training_uses_carry(config)
     console_model_label = "bdr" if config.model.model_type == "bdr" else config.model.model_type
-    train_carry = place_tree(model.initial_carry(current_batch), data_sharding) if use_step_carry else None
+    train_carry = place_tree(model.initial_carry(current_batch), data_sharding) if use_carry else None
     eval_steps = eval_update_steps(config)
     profile_active = False
     profile_finished = False
@@ -440,7 +427,7 @@ def run_training(
                     jax.profiler.start_trace(str(profile_dir))
                     profile_active = True
                 is_eval_step = step in eval_steps
-                if use_step_carry:
+                if use_carry:
                     assert train_carry is not None
                     train_key, step_key = jax.random.split(train_key)
                     metrics, train_carry = train_step_fn(

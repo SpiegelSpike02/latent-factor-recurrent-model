@@ -5,11 +5,11 @@ from dataclasses import replace
 from flax import nnx
 
 from lfrm.config import ExperimentConfig
-from lfrm.models import BDRModel, TinyRecursiveModel, UnifiedReasoningModel
+from lfrm.models import BeliefDynamicsReasoner, TinyRecursiveModel, UnifiedReasoningModel
 from lfrm.training.optim import build_optimizer, trainable_param_filter, uses_sparse_puzzle_embedding
 
 
-GridReasoningModel = BDRModel | TinyRecursiveModel | UnifiedReasoningModel
+GridReasoningModel = BeliefDynamicsReasoner | TinyRecursiveModel | UnifiedReasoningModel
 
 
 def create_model(config: ExperimentConfig) -> GridReasoningModel:
@@ -21,7 +21,7 @@ def create_model(config: ExperimentConfig) -> GridReasoningModel:
             rngs=nnx.Rngs(config.train.seed),
         )
     if model_config.model_type == "bdr":
-        return BDRModel(
+        return BeliefDynamicsReasoner(
             model_config,
             config.runtime,
             rngs=nnx.Rngs(config.train.seed),

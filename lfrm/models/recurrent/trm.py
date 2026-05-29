@@ -7,11 +7,12 @@ import jax.numpy as jnp
 from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
-from lfrm.models.recurrent.layers import (
+from lfrm.models.grid_layers import (
     Array,
     CastedEmbedding,
     FullAttention,
     SwiGLU,
+    build_1d_rope,
     casted_linear_init,
     compute_dtype,
     maybe_cast,
@@ -310,11 +311,7 @@ class TinyRecursiveModel(nnx.Module):
 
         if trm.position_encoding == "rope":
             head_dim = config.d_model // trm.num_heads
-            inv_freq = 1.0 / (trm.rope_theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
-            freqs = jnp.outer(jnp.arange(self.total_seq_len, dtype=jnp.float32), inv_freq)
-            rope = jnp.concatenate([freqs, freqs], axis=-1)
-            self.rope_cos = jnp.cos(rope)
-            self.rope_sin = jnp.sin(rope)
+            self.rope_cos, self.rope_sin = build_1d_rope(self.total_seq_len, head_dim, trm.rope_theta)
         else:
             self.rope_cos = None
             self.rope_sin = None

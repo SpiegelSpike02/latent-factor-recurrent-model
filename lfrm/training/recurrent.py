@@ -3,7 +3,6 @@ from __future__ import annotations
 import jax
 from flax import nnx
 
-from lfrm.models import TinyRecursiveModel
 from lfrm.training.optim import scheduled_lr, trainable_param_filter, uses_sparse_puzzle_embedding
 from lfrm.training.puzzle_embedding import (
     act_sparse_puzzle_ids,
@@ -11,12 +10,13 @@ from lfrm.training.puzzle_embedding import (
     update_sparse_puzzle_embeddings,
 )
 from lfrm.training.steps import (
-    trm_act_loss_and_metrics,
-    trm_eval_loss_and_metrics,
+    act_loss_and_metrics,
+    recurrent_eval_loss_and_metrics,
 )
+from lfrm.training.factory import GridReasoningModel
 
 
-def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
+def build_act_train_step_runner(config, halt_loss_weight: float = 0.5):
     use_sparse_puzzle_embed = uses_sparse_puzzle_embedding(config)
     puzzle_lr_schedule = scheduled_lr(
         peak_value=config.optimizer.puzzle_embed_learning_rate,
@@ -29,7 +29,7 @@ def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
     diff_filter = trainable_param_filter(config)
 
     def train_step(
-        model: TinyRecursiveModel,
+        model: GridReasoningModel,
         optimizer: nnx.Optimizer,
         carry: dict[str, jax.Array],
         batch: dict[str, jax.Array],
@@ -45,7 +45,7 @@ def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
         )
 
         def objective(model, puzzle_embeddings, carry, batch, train, dropout_key):
-            return trm_act_loss_and_metrics(
+            return act_loss_and_metrics(
                 model,
                 carry,
                 batch,
@@ -95,12 +95,12 @@ def build_trm_act_train_step_runner(config, halt_loss_weight: float = 0.5):
     return nnx.jit(train_step, donate_argnums=(2,))
 
 
-def build_trm_eval_step_runner(halt_loss_weight: float = 0.5, *, collect_diagnostics: bool = False):
+def build_recurrent_eval_step_runner(halt_loss_weight: float = 0.5, *, collect_diagnostics: bool = False):
     def eval_step(
-        model: TinyRecursiveModel,
+        model: GridReasoningModel,
         batch: dict[str, jax.Array],
     ) -> dict[str, jax.Array]:
-        _, metrics = trm_eval_loss_and_metrics(
+        _, metrics = recurrent_eval_loss_and_metrics(
             model,
             batch,
             halt_loss_weight,

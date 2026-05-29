@@ -9,7 +9,7 @@ from lfrm.config import (
     EMAConfig,
     ExperimentConfig,
     EvalConfig,
-    BDRConfig,
+    BeliefDynamicsConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
@@ -35,13 +35,15 @@ GROUPED_NESTED_KEYS = {
     "bdr": {
         "dynamics": {
             "commit_steps",
-            "refine_steps",
-            "block_depth",
+            "h_cycles",
+            "l_cycles",
+            "l_layers",
             "step_loss_schedule",
             "update_rule",
             "draft_view",
             "prediction_view",
             "update_step_size",
+            "halt_exploration_prob",
         },
         "objective": {
             "path_energy_weight",
@@ -53,15 +55,6 @@ GROUPED_NESTED_KEYS = {
             "wrong_attractor_rank_margin",
             "wrong_attractor_update_floor",
             "corrupted_recovery_weight",
-        },
-        "early_stop": {
-            "early_stop_enabled",
-            "early_stop_min_steps",
-            "early_stop_patience",
-            "early_stop_distribution_delta_threshold",
-            "early_stop_flip_threshold",
-            "early_stop_margin_threshold",
-            "early_stop_require_constraints",
         },
         "hidden": {
             "hidden_state_dim",
@@ -159,8 +152,9 @@ ALLOWED_NESTED_KEYS = {
     },
     "bdr": {
         "commit_steps",
-        "refine_steps",
-        "block_depth",
+        "h_cycles",
+        "l_cycles",
+        "l_layers",
         "hidden_state_dim",
         "num_heads",
         "mlp_ratio",
@@ -175,6 +169,7 @@ ALLOWED_NESTED_KEYS = {
         "draft_view",
         "prediction_view",
         "update_step_size",
+        "halt_exploration_prob",
         "path_energy_weight",
         "fixed_point_update_weight",
         "fixed_point_label_smoothing",
@@ -184,19 +179,10 @@ ALLOWED_NESTED_KEYS = {
         "wrong_attractor_rank_margin",
         "wrong_attractor_update_floor",
         "corrupted_recovery_weight",
-        "early_stop_enabled",
-        "early_stop_min_steps",
-        "early_stop_patience",
-        "early_stop_distribution_delta_threshold",
-        "early_stop_flip_threshold",
-        "early_stop_margin_threshold",
-        "early_stop_require_constraints",
         "dynamics",
         "objective",
-        "early_stop",
         "hidden",
         "position",
-        "halt",
     },
     "urm": {
         "recurrent_steps",
@@ -315,9 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-epochs", type=int, default=10)
     parser.add_argument(
         "--train-mode",
-        choices=("act", "step_carry"),
+        choices=("act",),
         default="act",
-        help="Recurrent training path. TRM/URM use act; BDR uses step_carry.",
+        help="Recurrent training path.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--halt-loss-weight", type=float, default=0.0)
@@ -347,8 +333,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trm-no-act-continue", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trm-step-loss-weights", type=float, nargs="*", default=None)
     parser.add_argument("--bdr-commit-steps", type=int, default=6)
-    parser.add_argument("--bdr-refine-steps", type=int, default=2)
-    parser.add_argument("--bdr-block-depth", type=int, default=1)
+    parser.add_argument("--bdr-h-cycles", type=int, default=1)
+    parser.add_argument("--bdr-l-cycles", type=int, default=2)
+    parser.add_argument("--bdr-l-layers", type=int, default=1)
     parser.add_argument("--bdr-hidden-state-dim", type=int, default=0)
     parser.add_argument("--bdr-num-heads", type=int, default=4)
     parser.add_argument("--bdr-mlp-ratio", type=int, default=2)
@@ -363,6 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bdr-draft-view", choices=("auto", "logits", "probability"), default="auto")
     parser.add_argument("--bdr-prediction-view", choices=("auto", "logits", "probability"), default="auto")
     parser.add_argument("--bdr-update-step-size", type=float, default=0.3)
+    parser.add_argument("--bdr-halt-exploration-prob", type=float, default=0.1)
     parser.add_argument("--bdr-path-energy-weight", type=float, default=1e-4)
     parser.add_argument("--bdr-fixed-point-update-weight", type=float, default=0.0)
     parser.add_argument("--bdr-fixed-point-label-smoothing", type=float, default=1e-3)
@@ -372,13 +360,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bdr-wrong-attractor-rank-margin", type=float, default=1.0)
     parser.add_argument("--bdr-wrong-attractor-update-floor", type=float, default=0.5)
     parser.add_argument("--bdr-corrupted-recovery-weight", type=float, default=0.0)
-    parser.add_argument("--bdr-early-stop-enabled", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--bdr-early-stop-min-steps", type=int, default=4)
-    parser.add_argument("--bdr-early-stop-patience", type=int, default=2)
-    parser.add_argument("--bdr-early-stop-distribution-delta-threshold", type=float, default=1e-3)
-    parser.add_argument("--bdr-early-stop-flip-threshold", type=float, default=0.0)
-    parser.add_argument("--bdr-early-stop-margin-threshold", type=float, default=0.5)
-    parser.add_argument("--bdr-early-stop-require-constraints", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
     parser.add_argument("--urm-l-cycles", type=int, default=6)
@@ -505,10 +486,11 @@ def build_config(
             no_act_continue=args.trm_no_act_continue,
             step_loss_weights=tuple(args.trm_step_loss_weights) if args.trm_step_loss_weights is not None else None,
         ),
-        bdr=BDRConfig(
+        bdr=BeliefDynamicsConfig(
             commit_steps=args.bdr_commit_steps,
-            refine_steps=args.bdr_refine_steps,
-            block_depth=args.bdr_block_depth,
+            h_cycles=args.bdr_h_cycles,
+            l_cycles=args.bdr_l_cycles,
+            l_layers=args.bdr_l_layers,
             hidden_state_dim=args.bdr_hidden_state_dim,
             num_heads=args.bdr_num_heads,
             mlp_ratio=args.bdr_mlp_ratio,
@@ -523,6 +505,7 @@ def build_config(
             draft_view=args.bdr_draft_view,
             prediction_view=args.bdr_prediction_view,
             update_step_size=args.bdr_update_step_size,
+            halt_exploration_prob=args.bdr_halt_exploration_prob,
             path_energy_weight=args.bdr_path_energy_weight,
             fixed_point_update_weight=args.bdr_fixed_point_update_weight,
             fixed_point_label_smoothing=args.bdr_fixed_point_label_smoothing,
@@ -532,13 +515,6 @@ def build_config(
             wrong_attractor_rank_margin=args.bdr_wrong_attractor_rank_margin,
             wrong_attractor_update_floor=args.bdr_wrong_attractor_update_floor,
             corrupted_recovery_weight=args.bdr_corrupted_recovery_weight,
-            early_stop_enabled=args.bdr_early_stop_enabled,
-            early_stop_min_steps=args.bdr_early_stop_min_steps,
-            early_stop_patience=args.bdr_early_stop_patience,
-            early_stop_distribution_delta_threshold=args.bdr_early_stop_distribution_delta_threshold,
-            early_stop_flip_threshold=args.bdr_early_stop_flip_threshold,
-            early_stop_margin_threshold=args.bdr_early_stop_margin_threshold,
-            early_stop_require_constraints=args.bdr_early_stop_require_constraints,
         ),
         urm=URMConfig(
             recurrent_steps=args.urm_recurrent_steps,

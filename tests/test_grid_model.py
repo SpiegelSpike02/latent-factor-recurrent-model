@@ -15,7 +15,7 @@ from lfrm.config import (
     DataConfig,
     EvalConfig,
     ExperimentConfig,
-    BDRConfig,
+    BeliefDynamicsConfig,
     ModelConfig,
     OptimizerConfig,
     RuntimeConfig,
@@ -33,11 +33,10 @@ from lfrm.runtime import (
     small_metric_items,
     updates_from_epochs,
 )
-from lfrm.models import BDRModel, TinyRecursiveModel
+from lfrm.models import BeliefDynamicsReasoner, TinyRecursiveModel
 from lfrm.training import (
-    build_bdr_step_carry_train_step_runner,
+    build_act_train_step_runner,
     build_train_step_runner,
-    build_trm_act_train_step_runner,
     create_model,
     create_optimizer,
     load_checkpoint,
@@ -47,6 +46,7 @@ from lfrm.training import (
 )
 from lfrm.training.losses import token_cross_entropy
 from lfrm.training.optim import scheduled_lr
+from lfrm.models.grid_layers import run_truncated_h_cycles
 
 
 def _sudoku_input_tokens(puzzle: str) -> jax.Array:
@@ -177,7 +177,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=9,
                 d_model=16,
                 rollout_steps=1,
-                bdr=BDRConfig(commit_steps=1, num_heads=4),
+                bdr=BeliefDynamicsConfig(commit_steps=1, num_heads=4),
             ),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),
@@ -185,7 +185,7 @@ class GridModelTests(unittest.TestCase):
             runtime=RuntimeConfig(compute_dtype="float32"),
             wandb=WandbConfig(),
         )
-        self.assertIsInstance(create_model(bdr_config), BDRModel)
+        self.assertIsInstance(create_model(bdr_config), BeliefDynamicsReasoner)
         invalid = ExperimentConfig(
             model=ModelConfig(vocab_size=11, model_type="legacy_shared_block"),
             optimizer=OptimizerConfig(),
@@ -207,6 +207,32 @@ class GridModelTests(unittest.TestCase):
         loss, grad = jax.value_and_grad(objective)(logits)
         self.assertTrue(bool(jnp.isfinite(loss)))
         self.assertTrue(bool(jnp.all(jnp.isfinite(grad))))
+
+    def test_run_truncated_h_cycles_keeps_only_final_gradient(self) -> None:
+        def state_objective(x):
+            return run_truncated_h_cycles(
+                x,
+                h_cycles=3,
+                latent_update=lambda state: state * 3.0,
+            )
+
+        value, state_grad = jax.value_and_grad(state_objective)(
+            jnp.asarray(2.0, dtype=jnp.float32)
+        )
+        self.assertEqual(float(value), 54.0)
+        self.assertEqual(float(state_grad), 0.0)
+
+        def parameter_objective(weight):
+            return run_truncated_h_cycles(
+                jnp.asarray(2.0, dtype=jnp.float32),
+                h_cycles=3,
+                latent_update=lambda state: state * weight,
+            )
+
+        _, weight_grad = jax.value_and_grad(parameter_objective)(
+            jnp.asarray(3.0, dtype=jnp.float32)
+        )
+        self.assertEqual(float(weight_grad), 18.0)
 
     def test_trm_forward_and_losses_are_finite(self) -> None:
         model = TinyRecursiveModel(
@@ -280,7 +306,7 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, 9, 11))
 
     def test_bdr_forward_is_finite_without_optional_energy(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=9,
                 input_vocab_size=10,
@@ -290,7 +316,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=9,
                 d_model=16,
                 rollout_steps=2,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
@@ -327,7 +353,7 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(final_only_diagnostics["q_top1_probability"].shape, (2,))
 
     def test_bdr_initial_z_is_uniform(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=9,
                 input_vocab_size=10,
@@ -337,7 +363,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=9,
                 d_model=16,
                 rollout_steps=3,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=3,
                     num_heads=4,
                     mlp_ratio=1,
@@ -353,7 +379,7 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.allclose(q_view, jnp.full_like(q_view, 1.0 / 9.0))))
 
     def test_bdr_accepts_puzzle_identifiers(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=5,
                 model_type="bdr",
@@ -363,10 +389,15 @@ class GridModelTests(unittest.TestCase):
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
+                    fixed_point_update_weight=0.0,
+                    wrong_attractor_rank_weight=0.0,
+                    wrong_attractor_direction_weight=0.0,
+                    wrong_attractor_nonzero_weight=0.0,
+                    corrupted_recovery_weight=0.0,
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -377,7 +408,7 @@ class GridModelTests(unittest.TestCase):
 
         base_embeddings, _context = model.context_memory(tokens, puzzle_identifiers)
 
-        self.assertEqual(model.puzzle_identifier_embed.embedding[...].shape, (4, 16))
+        self.assertEqual(model.puzzle_embed.weights[...].shape, (4, 16))
         self.assertEqual(base_embeddings.shape, (2, 4, 16))
         logits, diagnostics = model.run_commit_steps(
             tokens,
@@ -389,7 +420,7 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.isfinite(diagnostics["path_energy"][0])))
 
     def test_bdr_top2_margin_matches_top_k_without_sort_primitive(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=5,
                 input_vocab_size=6,
@@ -399,7 +430,7 @@ class GridModelTests(unittest.TestCase):
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                bdr=BDRConfig(commit_steps=1, num_heads=4),
+                bdr=BeliefDynamicsConfig(commit_steps=1, num_heads=4),
             ),
             RuntimeConfig(compute_dtype="float32"),
             rngs=nnx.Rngs(37),
@@ -415,7 +446,7 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.allclose(model._top2_margin(distribution), expected)))
 
     def test_bdr_energy_prob_step_updates_probability_simplex(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=5,
                 model_type="bdr",
@@ -424,7 +455,7 @@ class GridModelTests(unittest.TestCase):
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -456,7 +487,7 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.allclose(diagnostics["path_energy"], expected_path_energy, rtol=1e-5, atol=1e-6)))
 
     def test_bdr_default_outputs_probabilities_for_loss(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=5,
                 model_type="bdr",
@@ -465,7 +496,7 @@ class GridModelTests(unittest.TestCase):
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -485,7 +516,7 @@ class GridModelTests(unittest.TestCase):
         self.assertTrue(bool(jnp.allclose(token_cross_entropy(model, outputs, targets), expected_loss, atol=1e-6)))
 
     def test_bdr_energy_prob_outputs_probabilities_for_loss(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=5,
                 model_type="bdr",
@@ -494,7 +525,7 @@ class GridModelTests(unittest.TestCase):
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -534,7 +565,7 @@ class GridModelTests(unittest.TestCase):
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -554,7 +585,7 @@ class GridModelTests(unittest.TestCase):
         )
         model = create_model(config)
         optimizer = create_optimizer(model, config)
-        train_step = build_bdr_step_carry_train_step_runner()
+        train_step = build_act_train_step_runner(config, config.train.halt_loss_weight)
         batch = {
             "inputs": jnp.zeros((2, 4), dtype=jnp.int32),
             "labels": jnp.asarray([[1, 2, 3, 4], [4, 3, 2, 1]], dtype=jnp.int32),
@@ -587,7 +618,7 @@ class GridModelTests(unittest.TestCase):
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -607,7 +638,7 @@ class GridModelTests(unittest.TestCase):
         )
         model = create_model(config)
         optimizer = create_optimizer(model, config)
-        train_step = build_bdr_step_carry_train_step_runner()
+        train_step = build_act_train_step_runner(config, config.train.halt_loss_weight)
         batch = {
             "inputs": jnp.zeros((2, 4), dtype=jnp.int32),
             "labels": jnp.asarray([[1, 2, 3, 4], [4, 3, 2, 1]], dtype=jnp.int32),
@@ -630,7 +661,7 @@ class GridModelTests(unittest.TestCase):
         self.assertNotIn("energy_grad_rms", metrics)
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
 
-    def test_bdr_energy_dist_uses_label_energy_rank_without_eta_metric(self) -> None:
+    def test_bdr_energy_dist_reports_branch_metrics_without_eta_metric(self) -> None:
         config = ExperimentConfig(
             task=TaskConfig(type="arc"),
             model=ModelConfig(
@@ -640,13 +671,13 @@ class GridModelTests(unittest.TestCase):
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
                     update_rule="energy_dist",
                     fixed_point_update_weight=0.0,
-                    wrong_attractor_rank_weight=1.0,
+                    wrong_attractor_rank_weight=0.0,
                     wrong_attractor_direction_weight=0.0,
                     wrong_attractor_nonzero_weight=0.0,
                     corrupted_recovery_weight=0.0,
@@ -660,7 +691,7 @@ class GridModelTests(unittest.TestCase):
         )
         model = create_model(config)
         optimizer = create_optimizer(model, config)
-        train_step = build_bdr_step_carry_train_step_runner()
+        train_step = build_act_train_step_runner(config, config.train.halt_loss_weight)
         batch = {
             "inputs": jnp.zeros((2, 4), dtype=jnp.int32),
             "labels": jnp.asarray([[1, 2, 3, 4], [4, 3, 2, 1]], dtype=jnp.int32),
@@ -678,13 +709,12 @@ class GridModelTests(unittest.TestCase):
 
         self.assertIn("energy_distribution_step_rms", metrics)
         self.assertIn("energy_entropy", metrics)
-        self.assertIn("wrong_attractor_rank_loss", metrics)
         self.assertNotIn("update_step_size", metrics)
         self.assertNotIn("energy_grad_rms", metrics)
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
 
     def test_bdr_energy_dist_rank_is_cell_level_margin(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=3,
                 model_type="bdr",
@@ -693,7 +723,7 @@ class GridModelTests(unittest.TestCase):
                 grid_height=1,
                 grid_width=2,
                 d_model=12,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=1,
                     num_heads=3,
                     mlp_ratio=1,
@@ -740,7 +770,7 @@ class GridModelTests(unittest.TestCase):
         self.assertAlmostEqual(float(terms["rank_loss"]), expected_cell_loss, places=6)
 
     def test_bdr_energy_prob_attractor_direction_uses_distribution_delta(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=5,
                 model_type="bdr",
@@ -749,7 +779,7 @@ class GridModelTests(unittest.TestCase):
                 grid_height=2,
                 grid_width=2,
                 d_model=16,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -788,7 +818,7 @@ class GridModelTests(unittest.TestCase):
         self.assertLessEqual(float(terms["direction_cosine"]), 1.0)
 
     def test_bdr_losses_are_finite(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=9,
                 input_vocab_size=10,
@@ -798,7 +828,7 @@ class GridModelTests(unittest.TestCase):
                 grid_width=9,
                 d_model=16,
                 rollout_steps=2,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
@@ -857,7 +887,7 @@ class GridModelTests(unittest.TestCase):
         self.assertEqual(metrics["step_loss_weights"].shape, (2,))
 
     def test_bdr_arc_canvas_belief_loss_is_finite(self) -> None:
-        model = BDRModel(
+        model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=12,
                 model_type="bdr",
@@ -868,7 +898,7 @@ class GridModelTests(unittest.TestCase):
                 d_model=16,
                 rollout_steps=2,
                 loss_type="stablemax",
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=2,
                     num_heads=4,
                     mlp_ratio=1,
@@ -894,16 +924,17 @@ class GridModelTests(unittest.TestCase):
 
     def test_bdr_train_step_updates_parameters(self) -> None:
         config = ExperimentConfig(
+            task=TaskConfig(type="arc"),
             model=ModelConfig(
-                vocab_size=9,
-                input_vocab_size=10,
+                vocab_size=5,
+                input_vocab_size=5,
                 model_type="bdr",
-                seq_len=81,
-                grid_height=9,
-                grid_width=9,
+                seq_len=4,
+                grid_height=2,
+                grid_width=2,
                 d_model=16,
                 rollout_steps=1,
-                bdr=BDRConfig(
+                bdr=BeliefDynamicsConfig(
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
@@ -918,14 +949,10 @@ class GridModelTests(unittest.TestCase):
         model = create_model(config)
         self.assertNotIn("init_hidden", str(nnx.state(model, nnx.Param)))
         optimizer = create_optimizer(model, config)
-        train_step = build_bdr_step_carry_train_step_runner()
-        puzzle = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
-        solution = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
-        tokens = _sudoku_input_tokens(puzzle)
-        labels = _sudoku_label_tokens(solution)
+        train_step = build_act_train_step_runner(config, config.train.halt_loss_weight)
         batch = {
-            "inputs": tokens,
-            "labels": labels,
+            "inputs": jnp.asarray([[0, 1, 2, 3]], dtype=jnp.int32),
+            "labels": jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32),
             "puzzle_identifiers": jnp.asarray([0], dtype=jnp.int32),
         }
         carry = model.initial_carry(batch)
@@ -1091,7 +1118,7 @@ class GridModelTests(unittest.TestCase):
         )
         model = create_model(config)
         optimizer = create_optimizer(model, config)
-        train_step = build_trm_act_train_step_runner(config, config.train.halt_loss_weight)
+        train_step = build_act_train_step_runner(config, config.train.halt_loss_weight)
         batch = {
             "inputs": jnp.asarray(
                 [[2, 1, 3, 1, 1, 4, 1, 5, 1], [3, 1, 2, 1, 1, 5, 1, 4, 1]],
@@ -1193,7 +1220,7 @@ class GridModelTests(unittest.TestCase):
         )
         model = create_model(config)
         optimizer = create_optimizer(model, config)
-        train_step = build_trm_act_train_step_runner(config, config.train.halt_loss_weight)
+        train_step = build_act_train_step_runner(config, config.train.halt_loss_weight)
         batch = {
             "inputs": jnp.full((2, 16), 2, dtype=jnp.int32),
             "labels": jnp.full((2, 16), 3, dtype=jnp.int32),
@@ -1237,7 +1264,7 @@ class GridModelTests(unittest.TestCase):
 
     def test_num_heads_must_divide_d_model(self) -> None:
         with self.assertRaisesRegex(ValueError, "divisible by num_heads"):
-            BDRModel(
+            BeliefDynamicsReasoner(
                 ModelConfig(
                     vocab_size=9,
                     input_vocab_size=10,
@@ -1247,7 +1274,7 @@ class GridModelTests(unittest.TestCase):
                     grid_width=9,
                     d_model=10,
                     rollout_steps=1,
-                    bdr=BDRConfig(commit_steps=1, num_heads=4),
+                    bdr=BeliefDynamicsConfig(commit_steps=1, num_heads=4),
                 ),
                 RuntimeConfig(compute_dtype="float32"),
                 rngs=nnx.Rngs(0),
@@ -1287,8 +1314,9 @@ class GridModelTests(unittest.TestCase):
                 "\n"
                 "[model.bdr]\n"
                 "commit_steps = 4\n"
-                "refine_steps = 4\n"
-                "block_depth = 1\n"
+                "h_cycles = 2\n"
+                "l_cycles = 4\n"
+                "l_layers = 1\n"
                 "hidden_state_dim = 16\n"
                 "num_heads = 4\n"
                 "step_loss_schedule = \"quadratic\"\n"
@@ -1306,8 +1334,9 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["model_type"], "bdr")
             self.assertEqual(loaded["task_type"], "sudoku")
             self.assertEqual(loaded["bdr_commit_steps"], 4)
-            self.assertEqual(loaded["bdr_refine_steps"], 4)
-            self.assertEqual(loaded["bdr_block_depth"], 1)
+            self.assertEqual(loaded["bdr_h_cycles"], 2)
+            self.assertEqual(loaded["bdr_l_cycles"], 4)
+            self.assertEqual(loaded["bdr_l_layers"], 1)
             self.assertEqual(loaded["bdr_hidden_state_dim"], 16)
             self.assertEqual(loaded["bdr_num_heads"], 4)
             self.assertEqual(loaded["bdr_step_loss_schedule"], "quadratic")
@@ -1317,6 +1346,18 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["bdr_path_energy_weight"], 0.0001)
             self.assertEqual(loaded["bdr_fixed_point_update_weight"], 0.0002)
             self.assertEqual(loaded["bdr_fixed_point_label_smoothing"], 0.002)
+
+            legacy_bdr_path = Path(tmpdir) / "legacy_bdr.toml"
+            legacy_bdr_path.write_text(
+                "[model]\n"
+                "model_type = \"bdr\"\n"
+                "\n"
+                "[model.bdr]\n"
+                "refine_steps = 4\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Unsupported \\[model.bdr\\] field"):
+                load_toml_config(str(legacy_bdr_path))
 
             eval_config_path = Path(tmpdir) / "eval.toml"
             eval_config_path.write_text(

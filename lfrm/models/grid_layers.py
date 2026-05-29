@@ -195,12 +195,187 @@ class FullAttention(nnx.Module):
         )
 
 
+class ConvSwiGLU1D(nnx.Module):
+    """Sequence depthwise-conv SwiGLU block used by recurrent grid models."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        expansion: float,
+        kernel_size: int,
+        dtype: jnp.dtype,
+        *,
+        min_intermediate_size: int = 256,
+        use_bias: bool = True,
+        rngs: nnx.Rngs,
+    ) -> None:
+        if kernel_size < 1:
+            raise ValueError("ConvSwiGLU1D kernel_size must be positive")
+        intermediate_size = swiglu_intermediate_size(
+            hidden_size,
+            expansion,
+            min_size=min_intermediate_size,
+        )
+        self.dtype = dtype
+        self.gate_up = nnx.Linear(
+            hidden_size,
+            2 * intermediate_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.depthwise = nnx.Conv(
+            intermediate_size,
+            intermediate_size,
+            kernel_size=(kernel_size,),
+            padding=[(kernel_size // 2, kernel_size // 2)],
+            feature_group_count=intermediate_size,
+            use_bias=use_bias,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            preferred_element_type=dtype,
+            rngs=rngs,
+        )
+        self.down = nnx.Linear(
+            intermediate_size,
+            hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+
+    def __call__(self, h: Array) -> Array:
+        gate, up = jnp.split(self.gate_up(maybe_cast(h, self.dtype)), 2, axis=-1)
+        x = jax.nn.silu(gate) * up
+        x = self.depthwise(x)[:, : h.shape[1], :]
+        return self.down(jax.nn.silu(x))
+
+
+class ConvSwiGLU2D(nnx.Module):
+    """Grid depthwise-conv SwiGLU block for fixed-height 2D token grids."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        expansion: float,
+        kernel_size: int,
+        grid_height: int,
+        grid_width: int,
+        dtype: jnp.dtype,
+        *,
+        min_intermediate_size: int = 1,
+        use_bias: bool = True,
+        rngs: nnx.Rngs,
+    ) -> None:
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("ConvSwiGLU2D kernel_size must be a positive odd integer")
+        intermediate_size = swiglu_intermediate_size(
+            hidden_size,
+            expansion,
+            min_size=min_intermediate_size,
+        )
+        self.grid_height = int(grid_height)
+        self.grid_width = int(grid_width)
+        self.dtype = dtype
+        self.gate_up = nnx.Linear(
+            hidden_size,
+            2 * intermediate_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+        self.depthwise = nnx.Conv(
+            intermediate_size,
+            intermediate_size,
+            kernel_size=(kernel_size, kernel_size),
+            padding="SAME",
+            feature_group_count=intermediate_size,
+            use_bias=use_bias,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            preferred_element_type=dtype,
+            rngs=rngs,
+        )
+        self.down = nnx.Linear(
+            intermediate_size,
+            hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=jnp.float32,
+            kernel_init=casted_linear_init,
+            rngs=rngs,
+        )
+
+    def __call__(self, h: Array) -> Array:
+        batch_size = h.shape[0]
+        gate, up = jnp.split(self.gate_up(maybe_cast(h, self.dtype)), 2, axis=-1)
+        x = jax.nn.silu(gate) * up
+        x = x.reshape(batch_size, self.grid_height, self.grid_width, x.shape[-1])
+        x = self.depthwise(x)
+        x = x.reshape(batch_size, self.grid_height * self.grid_width, x.shape[-1])
+        return self.down(jax.nn.silu(x))
+
+
+def build_1d_rope(num_positions: int, head_dim: int, theta: float) -> tuple[Array, Array]:
+    if head_dim % 2 != 0:
+        raise ValueError("1D RoPE head dimension must be even")
+    positions = jnp.arange(num_positions, dtype=jnp.float32)
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+    freqs = jnp.einsum("n,d->nd", positions, inv_freq)
+    rope = jnp.concatenate((freqs, freqs), axis=-1)
+    return jnp.cos(rope), jnp.sin(rope)
+
+
+def build_2d_axial_rope(
+    rows: Array,
+    cols: Array,
+    head_dim: int,
+    theta: float,
+) -> tuple[Array, Array]:
+    if head_dim % 4 != 0:
+        raise ValueError("2D axial RoPE head dimension must be divisible by 4")
+    axis_dim = head_dim // 2
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, axis_dim, 2, dtype=jnp.float32) / axis_dim))
+    row_freqs = rows.astype(jnp.float32)[:, None] * inv_freq[None, :]
+    col_freqs = cols.astype(jnp.float32)[:, None] * inv_freq[None, :]
+    freqs = jnp.concatenate((row_freqs, col_freqs), axis=-1)
+    rope = jnp.concatenate((freqs, freqs), axis=-1)
+    return jnp.cos(rope), jnp.sin(rope)
+
+
+def run_truncated_h_cycles(
+    initial_state: Array,
+    *,
+    h_cycles: int,
+    latent_update,
+) -> Array:
+    """Run H cycles with gradients only through the final latent update."""
+    if h_cycles < 1:
+        raise ValueError("h_cycles must be at least 1")
+
+    def h_cycle_body(_: int, state: Array) -> Array:
+        return jax.lax.stop_gradient(latent_update(state))
+
+    state = jax.lax.fori_loop(0, h_cycles - 1, h_cycle_body, initial_state)
+    return latent_update(state)
+
+
 __all__ = [
     "Array",
     "CastedEmbedding",
+    "ConvSwiGLU1D",
+    "ConvSwiGLU2D",
     "FullAttention",
     "SwiGLU",
     "apply_rope",
+    "build_1d_rope",
+    "build_2d_axial_rope",
     "casted_linear_init",
     "compute_dtype",
     "dot_product_attention",
@@ -208,6 +383,7 @@ __all__ = [
     "multi_head_attention_with_rope",
     "rms_norm",
     "rotate_half",
+    "run_truncated_h_cycles",
     "swiglu_intermediate_size",
     "trunc_normal",
     "trunc_normal_init",

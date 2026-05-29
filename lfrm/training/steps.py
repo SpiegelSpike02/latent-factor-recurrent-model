@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from lfrm.models import BDRModel, TinyRecursiveModel, UnifiedReasoningModel
+from lfrm.models import BeliefDynamicsReasoner, TinyRecursiveModel, UnifiedReasoningModel
 from lfrm.training.factory import GridReasoningModel
 from lfrm.training.losses import (
     output_probabilities,
@@ -66,7 +66,7 @@ def _permute_sudoku_digits(
 
 
 def _sudoku_board_metrics(
-    model: BDRModel,
+    model: GridReasoningModel,
     predictions: jax.Array,
     inputs: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
@@ -103,7 +103,7 @@ def _sudoku_board_metrics(
     return context_consistency, conflicts
 
 
-def _bdr_region_masks(model: BDRModel, inputs: jax.Array, loss_mask: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _bdr_region_masks(model: BeliefDynamicsReasoner, inputs: jax.Array, loss_mask: jax.Array) -> tuple[jax.Array, jax.Array]:
     if model.config.task_type != "sudoku":
         zero_context = jnp.zeros_like(loss_mask, dtype=jnp.float32)
         return zero_context, (loss_mask > 0.0).astype(jnp.float32)
@@ -140,7 +140,7 @@ def _normalized_step_loss_weights(configured: tuple[float, ...] | None, rollout_
     return weights / jnp.maximum(jnp.sum(weights), 1e-6)
 
 
-def _bdr_step_loss_weights(model: BDRModel, rollout_steps: int) -> jax.Array:
+def _bdr_step_loss_weights(model: BeliefDynamicsReasoner, rollout_steps: int) -> jax.Array:
     progress = jnp.arange(1, rollout_steps + 1, dtype=jnp.float32) / float(rollout_steps)
     if model.bdr.step_loss_schedule == "quadratic":
         weights = jnp.square(progress)
@@ -151,7 +151,7 @@ def _bdr_step_loss_weights(model: BDRModel, rollout_steps: int) -> jax.Array:
     return weights / jnp.maximum(jnp.sum(weights), 1e-6)
 
 
-def _bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
+def _bdr_branch_diagnostics(model: BeliefDynamicsReasoner, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
     update_rule = model.bdr.update_rule
     if update_rule == "proposal":
         return {
@@ -180,18 +180,18 @@ def _bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax.Array]) 
     raise ValueError(f"Unsupported BDR update_rule={update_rule!r}")
 
 
-def _mean_bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
+def _mean_bdr_branch_diagnostics(model: BeliefDynamicsReasoner, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
     return {name: jnp.mean(value) for name, value in _bdr_branch_diagnostics(model, diagnostics).items()}
 
 
-def _per_step_bdr_branch_diagnostics(model: BDRModel, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
+def _per_step_bdr_branch_diagnostics(model: BeliefDynamicsReasoner, diagnostics: dict[str, jax.Array]) -> dict[str, jax.Array]:
     return {
         f"per_step_{name}": value
         for name, value in _bdr_branch_diagnostics(model, diagnostics).items()
     }
 
 
-def _bdr_attractor_metrics(model: BDRModel, losses: dict[str, jax.Array]) -> dict[str, jax.Array]:
+def _bdr_attractor_metrics(model: BeliefDynamicsReasoner, losses: dict[str, jax.Array]) -> dict[str, jax.Array]:
     metrics: dict[str, jax.Array] = {}
     has_energy_rank = model.bdr.update_rule in ("energy_prob", "energy_dist")
     if float(model.bdr.wrong_attractor_rank_weight) != 0.0 and has_energy_rank:
@@ -215,6 +215,8 @@ def _bdr_attractor_metrics(model: BDRModel, losses: dict[str, jax.Array]) -> dic
 
 
 def _trm_step_loss_weights(model: GridReasoningModel, rollout_steps: int) -> jax.Array:
+    if isinstance(model, BeliefDynamicsReasoner):
+        return _bdr_step_loss_weights(model, rollout_steps)
     recurrent_config = getattr(model, "trm", None) or getattr(model, "urm", None)
     return _normalized_step_loss_weights(getattr(recurrent_config, "step_loss_weights", None), rollout_steps)
 
@@ -243,334 +245,6 @@ def _canonicalize_common_metric_names(metrics: dict[str, jax.Array]) -> dict[str
     return metrics
 
 
-def bdr_loss_and_metrics(
-    model: BDRModel,
-    batch: dict[str, jax.Array],
-    train: bool,
-    dropout_key: jax.Array | None,
-) -> tuple[jax.Array, dict[str, jax.Array]]:
-    if train:
-        raise ValueError("BDR training uses step-carry only; dense BDR training has been removed")
-    if dropout_key is None:
-        dropout_key = jax.random.key(0)
-    augment_key, solve_key, terminal_key, attractor_key = jax.random.split(dropout_key, 4)
-    if model.config.task_type == "sudoku":
-        inputs, targets = _permute_sudoku_digits(
-            batch["inputs"],
-            batch["labels"],
-            augment_key,
-            train=train,
-        )
-    else:
-        inputs, targets = batch["inputs"], batch["labels"]
-    puzzle_identifiers = batch.get("puzzle_identifiers")
-    example_mask = _example_mask(batch, targets)
-    loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
-    zero = jnp.asarray(0.0, dtype=jnp.float32)
-    context_mask, query_mask = _bdr_region_masks(model, inputs, loss_mask)
-    metric_loss_mask = loss_mask
-
-    initial_z = model.initial_z(inputs)
-    normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32)), 1.0)
-    per_example_normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32), axis=-1), 1.0)
-    step_logits, diagnostics = model.run_commit_steps(
-        inputs,
-        initial_z=initial_z,
-        puzzle_identifiers=puzzle_identifiers,
-        train=False,
-        dropout_key=solve_key,
-    )
-    step_targets = jnp.broadcast_to(targets[None, :, :], step_logits.shape[:-1])
-    step_loss_mask = loss_mask[None, :, :]
-    token_loss = token_cross_entropy(model, step_logits, step_targets)
-    per_step_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=(1, 2)) / normalizer
-    final_logits = step_logits[-1]
-    step_loss_weights = _bdr_step_loss_weights(model, per_step_loss.shape[0])
-    step_ce_loss = jnp.sum(step_loss_weights * per_step_loss)
-    per_step_path_energy = diagnostics["path_energy"].astype(jnp.float32)
-    path_energy_loss = jnp.sum(step_loss_weights * per_step_path_energy)
-    if float(model.bdr.fixed_point_update_weight) != 0.0:
-        fixed_point_update_loss = model.fixed_point_update_loss(
-            inputs,
-            targets,
-            loss_mask,
-            puzzle_identifiers=puzzle_identifiers,
-            train=train,
-            dropout_key=terminal_key,
-        )
-    else:
-        fixed_point_update_loss = zero
-    use_attractor_losses = (
-        float(model.bdr.wrong_attractor_rank_weight) != 0.0
-        or float(model.bdr.wrong_attractor_direction_weight) != 0.0
-        or float(model.bdr.wrong_attractor_nonzero_weight) != 0.0
-        or float(model.bdr.corrupted_recovery_weight) != 0.0
-    )
-    if use_attractor_losses:
-        base_embeddings, _context = model.context_memory(inputs, puzzle_identifiers)
-        probe_hidden = model.initial_hidden_state(
-            inputs,
-            final_logits,
-            base_embeddings,
-            train=train,
-            dropout_key=attractor_key,
-        )
-        attractor_losses = model.attractor_recovery_losses(
-            inputs,
-            targets,
-            loss_mask,
-            final_logits,
-            probe_hidden,
-            puzzle_identifiers=puzzle_identifiers,
-            train=train,
-            dropout_key=attractor_key,
-        )
-        attractor_metrics = _bdr_attractor_metrics(model, attractor_losses)
-    else:
-        attractor_losses = {
-            "wrong_attractor_rank_loss": zero,
-            "wrong_attractor_direction_loss": zero,
-            "wrong_attractor_nonzero_loss": zero,
-            "wrong_attractor_active_rate": zero,
-            "wrong_attractor_direction_cosine": zero,
-            "wrong_attractor_energy_gap": zero,
-            "corrupted_recovery_loss": zero,
-            "corrupted_recovery_rank_loss": zero,
-            "corrupted_recovery_direction_cosine": zero,
-            "corrupted_recovery_energy_gap": zero,
-        }
-        attractor_metrics = {}
-    solution_loss = per_step_loss[-1]
-    loss = (
-        step_ce_loss
-        + float(model.bdr.path_energy_weight) * path_energy_loss
-        + float(model.bdr.fixed_point_update_weight) * fixed_point_update_loss
-        + float(model.bdr.wrong_attractor_rank_weight) * attractor_losses["wrong_attractor_rank_loss"]
-        + float(model.bdr.wrong_attractor_direction_weight) * attractor_losses["wrong_attractor_direction_loss"]
-        + float(model.bdr.wrong_attractor_nonzero_weight) * attractor_losses["wrong_attractor_nonzero_loss"]
-        + float(model.bdr.corrupted_recovery_weight) * attractor_losses["corrupted_recovery_loss"]
-    )
-
-    predictions = _output_predictions_to_tokens(model, final_logits)
-    metric_correct = (predictions == targets).astype(jnp.float32) * metric_loss_mask.astype(jnp.float32)
-    metric_normalizer = jnp.maximum(jnp.sum(metric_loss_mask.astype(jnp.float32)), 1.0)
-    cell_accuracy = jnp.sum(metric_correct) / metric_normalizer
-    context_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
-    query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
-    supervised_cells_per_example = jnp.sum(metric_loss_mask.astype(jnp.float32), axis=-1)
-    correct_per_example = jnp.sum(metric_correct, axis=-1)
-    exact_examples = jnp.where(
-        supervised_cells_per_example > 0,
-        correct_per_example == supervised_cells_per_example,
-        True,
-    )
-    exact_f32 = exact_examples.astype(jnp.float32)
-    exact_accuracy = _masked_example_mean(exact_f32, example_mask)
-    exact_count = jnp.sum(exact_f32 * example_mask)
-    target_probability_cells = token_target_probability(model, final_logits, targets)
-    target_probability = jnp.sum(target_probability_cells * loss_mask.astype(jnp.float32)) / normalizer
-    context_target_probability = _masked_probability(target_probability_cells, context_mask)
-    query_target_probability = _masked_probability(target_probability_cells, query_mask)
-    q_top1_probability = _masked_output_confidence(model, final_logits, metric_loss_mask)
-    per_step_example_loss = jnp.sum(token_loss * step_loss_mask.astype(jnp.float32), axis=-1) / per_example_normalizer[None, :]
-    oracle_step = _masked_example_mean(jnp.argmin(per_step_example_loss, axis=0).astype(jnp.float32), example_mask)
-    per_step_q_top1_probability = jnp.sum(
-        jnp.max(output_probabilities(model, step_logits), axis=-1)
-        * step_loss_mask.astype(jnp.float32),
-        axis=(1, 2),
-    ) / normalizer
-    metrics = {
-        "loss": loss,
-        "token_loss": step_ce_loss,
-        "final_token_loss": solution_loss,
-        "mean_token_loss": jnp.mean(per_step_loss),
-        "path_energy_loss": path_energy_loss,
-        "fixed_point_update_loss": fixed_point_update_loss,
-        **attractor_metrics,
-        "final_target_probability": target_probability,
-        "accuracy": cell_accuracy,
-        "query_accuracy": query_accuracy,
-        "exact_accuracy": exact_accuracy,
-        "exact_count": exact_count,
-        "query_target_probability": query_target_probability,
-        "oracle_step": oracle_step.astype(jnp.float32) + 1.0,
-        "step_loss_weights": step_loss_weights,
-        "q_top1_probability": q_top1_probability,
-        "distribution_tv_delta": jnp.mean(diagnostics["distribution_tv_delta"]),
-        "path_energy": jnp.mean(diagnostics["path_energy"]),
-        **_mean_bdr_branch_diagnostics(model, diagnostics),
-    }
-    if model.config.task_type == "sudoku":
-        metrics.update(
-            {
-                "context_accuracy": context_accuracy,
-                "context_target_probability": context_target_probability,
-            }
-        )
-    metrics.update(
-        {
-            "per_step_loss": per_step_loss,
-            "per_step_q_top1_probability": per_step_q_top1_probability,
-            "per_step_distribution_tv_delta": diagnostics["distribution_tv_delta"],
-            "per_step_path_energy": diagnostics["path_energy"],
-            **_per_step_bdr_branch_diagnostics(model, diagnostics),
-        }
-    )
-    if model.config.task_type == "sudoku":
-        context_consistency, conflicts = _sudoku_board_metrics(model, predictions, inputs)
-        metrics.update(
-            {
-                "context_consistency": context_consistency,
-                "conflicts": conflicts,
-            }
-        )
-    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
-    return loss, _canonicalize_common_metric_names(metrics)
-
-
-def bdr_carry_loss_and_metrics(
-    model: BDRModel,
-    carry: dict[str, jax.Array],
-    batch: dict[str, jax.Array],
-    train: bool,
-    dropout_key: jax.Array | None,
-) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
-    if dropout_key is None:
-        dropout_key = jax.random.key(0)
-    step_key, terminal_key, attractor_key = jax.random.split(dropout_key, 3)
-    new_carry, logits, diagnostics = model.forward_carry_step(
-        carry,
-        batch,
-        train=train,
-        dropout_key=step_key,
-    )
-    inputs = new_carry["current_inputs"]
-    targets = new_carry["current_labels"]
-    puzzle_identifiers = new_carry.get("current_puzzle_identifiers")
-    example_mask = new_carry["current_example_mask"].astype(jnp.float32)
-    loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
-    normalizer = jnp.maximum(jnp.sum(loss_mask.astype(jnp.float32)), 1.0)
-    token_loss = token_cross_entropy(model, logits, targets)
-    ce_loss = jnp.sum(token_loss * loss_mask.astype(jnp.float32)) / normalizer
-    predictions = _output_predictions_to_tokens(model, logits)
-    metric_correct = (predictions == targets).astype(jnp.float32) * loss_mask.astype(jnp.float32)
-    context_mask, query_mask = _bdr_region_masks(model, inputs, loss_mask)
-    accuracy = jnp.sum(metric_correct) / normalizer
-    context_accuracy = _masked_cell_accuracy(predictions, targets, context_mask)
-    query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
-    supervised_cells_per_example = jnp.sum(loss_mask.astype(jnp.float32), axis=-1)
-    correct_per_example = jnp.sum(metric_correct, axis=-1)
-    exact_examples = jnp.where(
-        supervised_cells_per_example > 0,
-        correct_per_example == supervised_cells_per_example,
-        True,
-    )
-    exact_f32 = exact_examples.astype(jnp.float32)
-    exact_accuracy = _masked_example_mean(exact_f32, example_mask)
-    exact_count = jnp.sum(exact_f32 * example_mask)
-    target_probability_cells = token_target_probability(model, logits, targets)
-    target_probability = jnp.sum(target_probability_cells * loss_mask.astype(jnp.float32)) / normalizer
-    context_target_probability = _masked_probability(target_probability_cells, context_mask)
-    query_target_probability = _masked_probability(target_probability_cells, query_mask)
-    path_energy_loss = diagnostics["path_energy"].astype(jnp.float32)
-    if float(model.bdr.fixed_point_update_weight) != 0.0:
-        fixed_point_update_loss = model.fixed_point_update_loss(
-            inputs,
-            targets,
-            loss_mask,
-            puzzle_identifiers=puzzle_identifiers,
-            train=train,
-            dropout_key=terminal_key,
-        )
-    else:
-        fixed_point_update_loss = jnp.asarray(0.0, dtype=jnp.float32)
-    use_attractor_losses = (
-        float(model.bdr.wrong_attractor_rank_weight) != 0.0
-        or float(model.bdr.wrong_attractor_direction_weight) != 0.0
-        or float(model.bdr.wrong_attractor_nonzero_weight) != 0.0
-        or float(model.bdr.corrupted_recovery_weight) != 0.0
-    )
-    if use_attractor_losses:
-        attractor_losses = model.attractor_recovery_losses(
-            inputs,
-            targets,
-            loss_mask,
-            new_carry["z"],
-            new_carry["hidden"],
-            puzzle_identifiers=puzzle_identifiers,
-            train=train,
-            dropout_key=attractor_key,
-        )
-        attractor_metrics = _bdr_attractor_metrics(model, attractor_losses)
-    else:
-        zero = jnp.asarray(0.0, dtype=jnp.float32)
-        attractor_losses = {
-            "wrong_attractor_rank_loss": zero,
-            "wrong_attractor_direction_loss": zero,
-            "wrong_attractor_nonzero_loss": zero,
-            "wrong_attractor_active_rate": zero,
-            "wrong_attractor_direction_cosine": zero,
-            "wrong_attractor_energy_gap": zero,
-            "corrupted_recovery_loss": zero,
-            "corrupted_recovery_rank_loss": zero,
-            "corrupted_recovery_direction_cosine": zero,
-            "corrupted_recovery_energy_gap": zero,
-        }
-        attractor_metrics = {}
-    loss = (
-        ce_loss
-        + float(model.bdr.path_energy_weight) * path_energy_loss
-        + float(model.bdr.fixed_point_update_weight) * fixed_point_update_loss
-        + float(model.bdr.wrong_attractor_rank_weight) * attractor_losses["wrong_attractor_rank_loss"]
-        + float(model.bdr.wrong_attractor_direction_weight) * attractor_losses["wrong_attractor_direction_loss"]
-        + float(model.bdr.wrong_attractor_nonzero_weight) * attractor_losses["wrong_attractor_nonzero_loss"]
-        + float(model.bdr.corrupted_recovery_weight) * attractor_losses["corrupted_recovery_loss"]
-    )
-    metrics = {
-        "loss": loss,
-        "token_loss": ce_loss,
-        "path_energy_loss": path_energy_loss,
-        "fixed_point_update_loss": fixed_point_update_loss,
-        **attractor_metrics,
-        "accuracy": accuracy,
-        "query_accuracy": query_accuracy,
-        "exact_accuracy": exact_accuracy,
-        "exact_count": exact_count,
-        "final_target_probability": target_probability,
-        "query_target_probability": query_target_probability,
-        "carry_step": diagnostics["carry_step"],
-        "reset_rate": diagnostics["reset_rate"],
-        "max_step_reset_rate": diagnostics["max_step_reset_rate"],
-        "early_stop_rate": diagnostics["early_stop_rate"],
-        "stability_rate": diagnostics["stability_rate"],
-        "stable_steps": diagnostics["stable_steps"],
-        "early_stop_update_rms": diagnostics["early_stop_update_rms"],
-        "early_stop_distribution_delta": diagnostics["early_stop_distribution_delta"],
-        "early_stop_flip_rate": diagnostics["early_stop_flip_rate"],
-        "early_stop_margin_min": diagnostics["early_stop_margin_min"],
-        "early_stop_constraint_rate": diagnostics["early_stop_constraint_rate"],
-        "distribution_tv_delta": diagnostics["distribution_tv_delta"],
-        "path_energy": diagnostics["path_energy"],
-        **_bdr_branch_diagnostics(model, diagnostics),
-    }
-    if model.config.task_type == "sudoku":
-        metrics.update(
-            {
-                "context_accuracy": context_accuracy,
-                "context_target_probability": context_target_probability,
-            }
-        )
-        context_consistency, conflicts = _sudoku_board_metrics(model, predictions, inputs)
-        metrics.update(
-            {
-                "context_consistency": context_consistency,
-                "conflicts": conflicts,
-            }
-        )
-    metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
-    return loss, (_canonicalize_common_metric_names(metrics), new_carry)
-
-
 def loss_and_metrics(
     model: GridReasoningModel,
     batch: dict[str, jax.Array],
@@ -579,19 +253,11 @@ def loss_and_metrics(
     halt_loss_weight: float = 0.0,
     terminal_residual_weight: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    if isinstance(model, BDRModel):
-        del terminal_residual_weight
-        return bdr_loss_and_metrics(
-            model,
-            batch,
-            train,
-            dropout_key,
-        )
-    if isinstance(model, (TinyRecursiveModel, UnifiedReasoningModel)):
+    if isinstance(model, (BeliefDynamicsReasoner, TinyRecursiveModel, UnifiedReasoningModel)):
         del terminal_residual_weight
         if train:
-            raise ValueError("TRM/URM training uses ACT carry mode; dense unroll training has been removed")
-        return trm_eval_loss_and_metrics(
+            raise ValueError("Recurrent model training uses ACT carry mode; dense unroll training has been removed")
+        return recurrent_eval_loss_and_metrics(
             model,
             batch,
             halt_loss_weight,
@@ -762,8 +428,8 @@ def loss_and_metrics(
     return loss, _canonicalize_common_metric_names(metrics)
 
 
-def trm_act_loss_and_metrics(
-    model: TinyRecursiveModel,
+def act_loss_and_metrics(
+    model: GridReasoningModel,
     carry: dict[str, jax.Array],
     batch: dict[str, jax.Array],
     train: bool,
@@ -771,13 +437,17 @@ def trm_act_loss_and_metrics(
     halt_loss_weight: float = 0.5,
     puzzle_embeddings: jax.Array | None = None,
 ) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
+    if dropout_key is None:
+        dropout_key = jax.random.key(0)
+    step_key, fixed_point_key, attractor_key = jax.random.split(dropout_key, 3)
     new_carry, logits, diagnostics = model.forward_act_step(
         carry,
         batch,
         train=train,
-        dropout_key=dropout_key,
+        dropout_key=step_key,
         puzzle_embeddings=puzzle_embeddings,
     )
+    inputs = new_carry["current_inputs"]
     targets = new_carry["current_labels"]
     example_mask = _example_mask(batch, targets)
     loss_mask = _apply_example_mask(supervised_loss_mask(model, targets), example_mask)
@@ -815,6 +485,76 @@ def trm_act_loss_and_metrics(
 
     halt_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(diagnostics["halt_logits"], exact_targets))
     loss = lm_loss_value + halt_loss_weight * halt_loss
+    bdr_metrics: dict[str, jax.Array] = {}
+    if isinstance(model, BeliefDynamicsReasoner):
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
+        puzzle_identifiers = new_carry.get("current_puzzle_identifiers")
+        path_energy_loss = diagnostics["path_energy"].astype(jnp.float32)
+        if float(model.bdr.fixed_point_update_weight) != 0.0:
+            fixed_point_update_loss = model.fixed_point_update_loss(
+                inputs,
+                targets,
+                loss_mask,
+                puzzle_identifiers=puzzle_identifiers,
+                train=train,
+                dropout_key=fixed_point_key,
+            )
+        else:
+            fixed_point_update_loss = zero
+        use_attractor_losses = (
+            float(model.bdr.wrong_attractor_rank_weight) != 0.0
+            or float(model.bdr.wrong_attractor_direction_weight) != 0.0
+            or float(model.bdr.wrong_attractor_nonzero_weight) != 0.0
+            or float(model.bdr.corrupted_recovery_weight) != 0.0
+        )
+        if use_attractor_losses:
+            attractor_losses = model.attractor_recovery_losses(
+                inputs,
+                targets,
+                loss_mask,
+                new_carry["z"],
+                new_carry["hidden"],
+                puzzle_identifiers=puzzle_identifiers,
+                train=train,
+                dropout_key=attractor_key,
+            )
+            attractor_metrics = _bdr_attractor_metrics(model, attractor_losses)
+        else:
+            attractor_losses = {
+                "wrong_attractor_rank_loss": zero,
+                "wrong_attractor_direction_loss": zero,
+                "wrong_attractor_nonzero_loss": zero,
+                "corrupted_recovery_loss": zero,
+            }
+            attractor_metrics = {}
+        loss = (
+            loss
+            + float(model.bdr.path_energy_weight) * path_energy_loss
+            + float(model.bdr.fixed_point_update_weight) * fixed_point_update_loss
+            + float(model.bdr.wrong_attractor_rank_weight) * attractor_losses["wrong_attractor_rank_loss"]
+            + float(model.bdr.wrong_attractor_direction_weight) * attractor_losses["wrong_attractor_direction_loss"]
+            + float(model.bdr.wrong_attractor_nonzero_weight) * attractor_losses["wrong_attractor_nonzero_loss"]
+            + float(model.bdr.corrupted_recovery_weight) * attractor_losses["corrupted_recovery_loss"]
+        )
+        context_mask, query_mask = _bdr_region_masks(model, inputs, loss_mask)
+        query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
+        target_probability_cells = token_target_probability(model, logits, targets)
+        bdr_metrics = {
+            "path_energy_loss": path_energy_loss,
+            "fixed_point_update_loss": fixed_point_update_loss,
+            **attractor_metrics,
+            "query_accuracy": query_accuracy,
+            "query_target_probability": _masked_probability(target_probability_cells, query_mask),
+            "distribution_tv_delta": diagnostics["distribution_tv_delta"],
+            "path_energy": diagnostics["path_energy"],
+            **_bdr_branch_diagnostics(model, diagnostics),
+        }
+        if model.config.task_type == "sudoku":
+            bdr_metrics["context_accuracy"] = _masked_cell_accuracy(predictions, targets, context_mask)
+            bdr_metrics["context_target_probability"] = _masked_probability(target_probability_cells, context_mask)
+            context_consistency, conflicts = _sudoku_board_metrics(model, predictions, inputs)
+            bdr_metrics["context_consistency"] = context_consistency
+            bdr_metrics["conflicts"] = conflicts
 
     target_probability = token_target_probability(model, logits, targets)
     per_example_target_probability = (
@@ -843,12 +583,13 @@ def trm_act_loss_and_metrics(
         "halted_rate": diagnostics["halted_rate"],
         "reset_rate": diagnostics["reset_rate"],
     }
+    metrics.update(bdr_metrics)
     metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
     return loss, (_canonicalize_common_metric_names(metrics), new_carry)
 
 
-def trm_eval_loss_and_metrics(
-    model: TinyRecursiveModel,
+def recurrent_eval_loss_and_metrics(
+    model: GridReasoningModel,
     batch: dict[str, jax.Array],
     halt_loss_weight: float = 0.5,
     *,
@@ -862,7 +603,7 @@ def trm_eval_loss_and_metrics(
     metric_normalizer = jnp.maximum(jnp.sum(loss_mask), 1.0)
     per_example_normalizer = jnp.maximum(jnp.sum(loss_mask, axis=-1), 1.0)
 
-    model_forward_kwargs = {"puzzle_identifiers": batch["puzzle_identifiers"]}
+    model_forward_kwargs = {"puzzle_identifiers": batch.get("puzzle_identifiers")}
     if isinstance(model, TinyRecursiveModel):
         model_forward_kwargs["compute_terminal_residual"] = False
         model_forward_kwargs["collect_diagnostics"] = collect_diagnostics
@@ -968,6 +709,8 @@ def trm_eval_loss_and_metrics(
         metrics.update(
             {
                 "oracle_step": _masked_example_mean(oracle_step.astype(jnp.float32) + 1.0, example_mask),
+                "mean_token_loss": jnp.mean(per_step_loss),
+                "step_loss_weights": _trm_step_loss_weights(model, step_logits.shape[0]),
                 "per_step_loss": per_step_loss,
                 "per_step_accuracy": per_step_accuracy,
                 "per_step_hidden_delta": model_diagnostics["hidden_delta_mean"],
@@ -994,4 +737,36 @@ def trm_eval_loss_and_metrics(
             if key in ("path_precision", "path_recall", "path_f1")
         }
     )
+    if isinstance(model, BeliefDynamicsReasoner):
+        context_mask, query_mask = _bdr_region_masks(model, inputs, loss_mask)
+        final_target_probability_cells = token_target_probability(model, final_logits, targets)
+        metrics.update(
+            {
+                "query_accuracy": _masked_cell_accuracy(final_predictions, targets, query_mask),
+                "query_target_probability": _masked_probability(final_target_probability_cells, query_mask),
+                "distribution_tv_delta": jnp.mean(model_diagnostics["distribution_tv_delta"]),
+                "path_energy": jnp.mean(model_diagnostics["path_energy"]),
+                "path_energy_loss": jnp.mean(model_diagnostics["path_energy"]),
+                **_mean_bdr_branch_diagnostics(model, model_diagnostics),
+            }
+        )
+        if model.config.task_type == "sudoku":
+            context_consistency, conflicts = _sudoku_board_metrics(model, final_predictions, inputs)
+            metrics.update(
+                {
+                    "context_accuracy": _masked_cell_accuracy(final_predictions, targets, context_mask),
+                    "context_target_probability": _masked_probability(final_target_probability_cells, context_mask),
+                    "context_consistency": context_consistency,
+                    "conflicts": conflicts,
+                }
+            )
+        if collect_diagnostics:
+            metrics.update(
+                {
+                    "per_step_q_top1_probability": model_diagnostics["q_top1_probability"],
+                    "per_step_distribution_tv_delta": model_diagnostics["distribution_tv_delta"],
+                    "per_step_path_energy": model_diagnostics["path_energy"],
+                    **_per_step_bdr_branch_diagnostics(model, model_diagnostics),
+                }
+            )
     return loss, _canonicalize_common_metric_names(metrics)

@@ -6,14 +6,14 @@ import sys
 import textwrap
 
 
-def test_bdr_step_carry_runs_with_two_data_parallel_devices() -> None:
+def test_bdr_act_runs_with_two_data_parallel_devices() -> None:
     script = r"""
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from lfrm.config import (
-    BDRConfig,
+    BeliefDynamicsConfig,
     DataConfig,
     EvalConfig,
     ExperimentConfig,
@@ -32,36 +32,36 @@ from lfrm.runtime.sharding import (
     place_tree,
     replicated_sharding,
 )
-from lfrm.training.bdr import build_bdr_step_carry_train_step_runner
+from lfrm.training.recurrent import build_act_train_step_runner
 from lfrm.training.factory import create_model, create_optimizer
 
 config = ExperimentConfig(
-    task=TaskConfig(type="sudoku"),
+    task=TaskConfig(type="arc"),
     model=ModelConfig(
-        vocab_size=9,
-        input_vocab_size=10,
+        vocab_size=5,
+        input_vocab_size=5,
         model_type="bdr",
-        seq_len=81,
-        grid_height=9,
-        grid_width=9,
-        d_model=64,
-        bdr=BDRConfig(
+        seq_len=4,
+        grid_height=2,
+        grid_width=2,
+        d_model=16,
+        bdr=BeliefDynamicsConfig(
             commit_steps=2,
-            refine_steps=1,
-            block_depth=1,
-            hidden_state_dim=64,
+            l_cycles=1,
+            l_layers=1,
+            hidden_state_dim=16,
             num_heads=4,
             mlp_ratio=1,
             update_rule="proposal",
-            fixed_point_update_weight=1e-3,
+            fixed_point_update_weight=0.0,
+            wrong_attractor_rank_weight=0.0,
             wrong_attractor_direction_weight=0.0,
             wrong_attractor_nonzero_weight=0.0,
             corrupted_recovery_weight=0.0,
-            early_stop_require_constraints=False,
         ),
     ),
     optimizer=OptimizerConfig(learning_rate=1e-4, weight_decay=0.0),
-    train=TrainConfig(batch_size=4, train_mode="step_carry"),
+    train=TrainConfig(batch_size=4, train_mode="act"),
     eval=EvalConfig(batch_size=4),
     data=DataConfig(dataset_path="unused"),
     runtime=RuntimeConfig(data_parallel_devices=2),
@@ -80,14 +80,14 @@ place_module_replicated(optimizer, state_sharding)
 rng = np.random.default_rng(0)
 batch = device_put_batch_sharded(
     {
-        "inputs": rng.integers(0, 10, size=(4, 81), dtype=np.int32),
-        "labels": rng.integers(0, 9, size=(4, 81), dtype=np.int32),
+        "inputs": rng.integers(0, 5, size=(4, 4), dtype=np.int32),
+        "labels": rng.integers(1, 5, size=(4, 4), dtype=np.int32),
         "puzzle_identifiers": np.zeros((4,), dtype=np.int32),
     },
     data_sharding,
 )
 carry = place_tree(model.initial_carry(batch), data_sharding)
-train_step = build_bdr_step_carry_train_step_runner()
+train_step = build_act_train_step_runner(config, config.train.halt_loss_weight)
 
 with jax.sharding.set_mesh(mesh):
     metrics, new_carry = train_step(
@@ -102,7 +102,7 @@ with jax.sharding.set_mesh(mesh):
 
 assert batch["inputs"].sharding.spec == jax.sharding.PartitionSpec("data")
 assert new_carry["z"].sharding.spec == jax.sharding.PartitionSpec("data", None, None)
-assert new_carry["current_example_mask"].sharding.spec == jax.sharding.PartitionSpec("data")
+assert new_carry["halted"].sharding.spec == jax.sharding.PartitionSpec("data")
 assert metrics["loss"].sharding.spec == jax.sharding.PartitionSpec()
 """
     env = os.environ.copy()
@@ -145,7 +145,7 @@ from lfrm.runtime.sharding import (
     replicated_sharding,
 )
 from lfrm.training.factory import create_model, create_optimizer
-from lfrm.training.recurrent import build_trm_act_train_step_runner
+from lfrm.training.recurrent import build_act_train_step_runner
 
 config = ExperimentConfig(
     task=TaskConfig(type="sudoku"),
@@ -194,7 +194,7 @@ batch = device_put_batch_sharded(
     data_sharding,
 )
 carry = place_tree(model.initial_carry(batch), data_sharding)
-train_step = build_trm_act_train_step_runner(config, halt_loss_weight=0.0)
+train_step = build_act_train_step_runner(config, halt_loss_weight=0.0)
 
 with jax.sharding.set_mesh(mesh):
     metrics, new_carry = train_step(
@@ -251,7 +251,7 @@ from lfrm.runtime.sharding import (
     replicated_sharding,
 )
 from lfrm.training.factory import create_model, create_optimizer
-from lfrm.training.recurrent import build_trm_act_train_step_runner
+from lfrm.training.recurrent import build_act_train_step_runner
 
 config = ExperimentConfig(
     task=TaskConfig(type="sudoku"),
@@ -300,7 +300,7 @@ batch = device_put_batch_sharded(
     data_sharding,
 )
 carry = place_tree(model.initial_carry(batch), data_sharding)
-train_step = build_trm_act_train_step_runner(config, halt_loss_weight=0.0)
+train_step = build_act_train_step_runner(config, halt_loss_weight=0.0)
 
 with jax.sharding.set_mesh(mesh):
     metrics, new_carry = train_step(

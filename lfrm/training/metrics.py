@@ -198,17 +198,9 @@ BDR_SCALAR_METRICS = (
     "corrupted_recovery_rank_loss",
     "corrupted_recovery_direction_cosine",
     "corrupted_recovery_energy_gap",
-    "carry_step",
+    "act_step",
+    "halted_rate",
     "reset_rate",
-    "max_step_reset_rate",
-    "early_stop_rate",
-    "stability_rate",
-    "stable_steps",
-    "early_stop_update_rms",
-    "early_stop_distribution_delta",
-    "early_stop_flip_rate",
-    "early_stop_margin_min",
-    "early_stop_constraint_rate",
 )
 WANDB_HISTORY_EXCLUDED_SCALAR_METRICS: set[str] = set()
 TERMINAL_DIAGNOSTIC_METRICS = (
@@ -294,19 +286,11 @@ BDR_CONSOLE_GROUPS = (
         ),
     ),
     (
-        "early_stop",
+        "act",
         (
-            "carry_step",
+            "act_step",
+            "halted_rate",
             "reset_rate",
-            "max_step_reset_rate",
-            "early_stop_rate",
-            "stability_rate",
-            "stable_steps",
-            "early_stop_update_rms",
-            "early_stop_distribution_delta",
-            "early_stop_flip_rate",
-            "early_stop_margin_min",
-            "early_stop_constraint_rate",
         ),
     ),
     (

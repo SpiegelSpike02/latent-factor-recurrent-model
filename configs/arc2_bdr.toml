@@ -18,8 +18,9 @@ loss_type = "softmax"
 
 [model.bdr.dynamics]
 commit_steps = 48
-refine_steps = 4
-block_depth = 2
+h_cycles = 2
+l_cycles = 4
+l_layers = 2
 step_loss_schedule = "uniform"
 update_rule = "proposal"
 draft_view = "probability"
@@ -29,15 +30,6 @@ prediction_view = "probability"
 path_energy_weight = 0.0
 fixed_point_update_weight = 3e-4
 fixed_point_label_smoothing = 3e-3
-
-[model.bdr.early_stop]
-early_stop_enabled = true
-early_stop_min_steps = 4
-early_stop_patience = 2
-early_stop_distribution_delta_threshold = 1e-3
-early_stop_flip_threshold = 0.0
-early_stop_margin_threshold = 0.5
-early_stop_require_constraints = false
 
 [model.bdr.hidden]
 hidden_state_dim = 256
@@ -66,7 +58,8 @@ grad_clip_norm = 1.0
 batch_size = 768
 epochs = 100000
 log_epochs = 10
-train_mode = "step_carry"
+train_mode = "act"
+halt_loss_weight = 0.5
 seed = 0
 checkpoint_dir = "checkpoints"
 
@@ -90,5 +83,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "arc2-bdr-core-c48-r4-d2-b768"
+name = "arc2-bdr-core-h2-l4x2-c48-act-b768"
 mode = "online"
