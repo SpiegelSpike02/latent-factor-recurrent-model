@@ -778,8 +778,9 @@ class BeliefDynamicsReasoner(nnx.Module):
         train: bool,
         dropout_key: Array | None,
     ) -> Array:
-        del z, base_embeddings, train, dropout_key
-        return jnp.zeros((tokens.shape[0], self.total_seq_len, self.hidden_dim), dtype=self.dtype)
+        del z, train, dropout_key
+        zeros = jnp.zeros_like(base_embeddings[..., :1], dtype=self.dtype)
+        return jnp.broadcast_to(zeros, (tokens.shape[0], self.total_seq_len, self.hidden_dim))
 
     def context_memory(
         self,
