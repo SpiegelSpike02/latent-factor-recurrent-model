@@ -35,7 +35,7 @@ local_scale = 1.0
 rms_norm_eps = 1e-5
 
 [model.bdr.position]
-position_encoding = "rope"
+position_encoding = "rope2d"
 rope_theta = 10000.0
 
 [optimizer]

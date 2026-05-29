@@ -404,7 +404,7 @@ class GridModelTests(unittest.TestCase):
         base_embeddings, _context = model.context_memory(tokens, puzzle_identifiers)
 
         self.assertEqual(model.puzzle_embed.weights[...].shape, (4, 16))
-        self.assertEqual(base_embeddings.shape, (2, 4, 16))
+        self.assertEqual(base_embeddings.shape, (2, 5, 16))
         logits, diagnostics = model.run_commit_steps(
             tokens,
             puzzle_identifiers=puzzle_identifiers,

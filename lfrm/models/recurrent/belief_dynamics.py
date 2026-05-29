@@ -19,6 +19,7 @@ from lfrm.models.grid_layers import (
     CastedEmbedding,
     ConvSwiGLU2D,
     FullAttention,
+    build_1d_rope,
     build_2d_axial_rope,
     run_truncated_h_cycles,
     unscaled_rms_norm,
@@ -50,6 +51,7 @@ class BeliefDynamicsBlock(nnx.Module):
         self.local_norm = unscaled_rms_norm(hidden_dim, bdr.rms_norm_eps, dtype, rngs)
         self.attn_scale = float(bdr.attn_scale)
         self.local_scale = float(bdr.local_scale)
+        self.prefix_len = 1 if bdr.position_encoding == "rope" else 0
         self.local_mlp = ConvSwiGLU2D(
             hidden_dim,
             mlp_ratio,
@@ -114,9 +116,14 @@ class BeliefDynamicsBlock(nnx.Module):
         draft_condition: Array,
     ) -> Array:
         del context_condition, draft_condition
-        local_input = self.local_norm(h.astype(jnp.float32)).astype(self.dtype)
+        prefix = h[:, : self.prefix_len, :] if self.prefix_len > 0 else None
+        grid_h = h[:, self.prefix_len :, :] if self.prefix_len > 0 else h
+        local_input = self.local_norm(grid_h.astype(jnp.float32)).astype(self.dtype)
         local = self.local_mlp(local_input).astype(jnp.float32)
-        return (h.astype(jnp.float32) + self.local_scale * local).astype(self.dtype)
+        mixed = (grid_h.astype(jnp.float32) + self.local_scale * local).astype(self.dtype)
+        if prefix is None:
+            return mixed
+        return jnp.concatenate((prefix, mixed), axis=1)
 
 
 class BeliefDynamicsReasoner(nnx.Module):
@@ -156,10 +163,12 @@ class BeliefDynamicsReasoner(nnx.Module):
             raise ValueError("BDR mlp_ratio must be at least 1")
         if bdr.local_kernel < 1 or bdr.local_kernel % 2 == 0:
             raise ValueError("BDR local_kernel must be a positive odd integer")
-        if bdr.position_encoding not in ("rope", "learned", "none"):
-            raise ValueError("BDR position_encoding must be 'rope', 'learned', or 'none'")
-        if bdr.position_encoding == "rope" and (hidden_dim // bdr.num_heads) % 4 != 0:
-            raise ValueError("BDR axial RoPE head dimension must be divisible by 4")
+        if bdr.position_encoding not in ("rope", "rope2d", "learned", "none"):
+            raise ValueError("BDR position_encoding must be 'rope', 'rope2d', 'learned', or 'none'")
+        if bdr.position_encoding == "rope" and (hidden_dim // bdr.num_heads) % 2 != 0:
+            raise ValueError("BDR 1D RoPE head dimension must be divisible by 2")
+        if bdr.position_encoding == "rope2d" and (hidden_dim // bdr.num_heads) % 4 != 0:
+            raise ValueError("BDR 2D axial RoPE head dimension must be divisible by 4")
         if bdr.step_loss_schedule not in ("uniform", "linear", "quadratic"):
             raise ValueError("BDR step_loss_schedule must be 'uniform', 'linear', or 'quadratic'")
         if bdr.update_rule not in ("energy_prob", "energy_dist", "free_velocity", "proposal"):
@@ -178,6 +187,8 @@ class BeliefDynamicsReasoner(nnx.Module):
         self.h_cycles = int(bdr.h_cycles)
         self.l_cycles = int(bdr.l_cycles)
         self.hidden_dim = hidden_dim
+        self.prefix_len = 1 if bdr.position_encoding == "rope" else 0
+        self.total_seq_len = config.seq_len + self.prefix_len
         self.dtype = compute_dtype(runtime.compute_dtype)
         self.embed_scale = math.sqrt(config.d_model)
         if config.task_type == "sudoku":
@@ -227,6 +238,11 @@ class BeliefDynamicsReasoner(nnx.Module):
             self.box_embed = nnx.Embed(self.num_boxes, config.d_model, dtype=self.dtype, param_dtype=jnp.float32, embedding_init=embed_init, rngs=rngs)
         self.dropout = nnx.Dropout(config.dropout_rate, rngs=rngs)
         if bdr.position_encoding == "rope":
+            head_dim = self.hidden_dim // bdr.num_heads
+            rope_cos, rope_sin = build_1d_rope(self.total_seq_len, head_dim, bdr.rope_theta)
+            self.rope_cos = nnx.data(rope_cos)
+            self.rope_sin = nnx.data(rope_sin)
+        elif bdr.position_encoding == "rope2d":
             head_dim = self.hidden_dim // bdr.num_heads
             rope_cos, rope_sin = build_2d_axial_rope(rows, cols, head_dim, bdr.rope_theta)
             self.rope_cos = nnx.data(rope_cos)
@@ -431,6 +447,11 @@ class BeliefDynamicsReasoner(nnx.Module):
     def _embed_tokens(self, embedding: nnx.Embed, token_ids: Array) -> Array:
         return maybe_cast(gather_embedding_rows(embedding.embedding, token_ids.astype(jnp.int32)), self.dtype)
 
+    def _with_prefix_condition(self, prefix: Array | None, grid_condition: Array) -> Array:
+        if prefix is None:
+            return grid_condition
+        return jnp.concatenate((prefix, grid_condition), axis=1)
+
     def _draft_features(
         self,
         tokens: Array,
@@ -459,6 +480,12 @@ class BeliefDynamicsReasoner(nnx.Module):
         draft_input = self.dropout(draft_features, deterministic=not train, rngs=dropout_key)
         context_condition = self.context_to_hidden(maybe_cast(context_input, self.dtype)).astype(self.dtype)
         draft_condition = self.draft_to_hidden(maybe_cast(draft_input, self.dtype)).astype(self.dtype)
+        if self.prefix_len == 0:
+            return context_condition, draft_condition
+        draft_condition = self._with_prefix_condition(
+            jnp.zeros_like(context_condition[:, : self.prefix_len, :]),
+            draft_condition,
+        )
         return context_condition, draft_condition
 
     def _z_to_token_logits(self, z: Array, tokens: Array, step_index: Array) -> Array:
@@ -688,7 +715,8 @@ class BeliefDynamicsReasoner(nnx.Module):
         self,
         hidden_state: Array,
     ) -> Array:
-        return self.update_readout_norm(hidden_state.astype(jnp.float32)).astype(self.dtype)
+        visible_hidden = hidden_state[:, self.prefix_len :, :] if self.prefix_len > 0 else hidden_state
+        return self.update_readout_norm(visible_hidden.astype(jnp.float32)).astype(self.dtype)
 
     def _commit_step(
         self,
@@ -751,10 +779,7 @@ class BeliefDynamicsReasoner(nnx.Module):
         dropout_key: Array | None,
     ) -> Array:
         del z, base_embeddings, train, dropout_key
-        return jnp.broadcast_to(
-            jnp.zeros_like(tokens[..., None], dtype=self.dtype),
-            (tokens.shape[0], self.config.seq_len, self.hidden_dim),
-        )
+        return jnp.zeros((tokens.shape[0], self.total_seq_len, self.hidden_dim), dtype=self.dtype)
 
     def context_memory(
         self,
@@ -774,7 +799,11 @@ class BeliefDynamicsReasoner(nnx.Module):
             )
         else:
             puzzle_embedding = puzzle_embeddings
-        base_embeddings = base_embeddings + puzzle_embedding[:, None, :]
+        if self.prefix_len > 0:
+            prefix = puzzle_embedding.reshape(tokens.shape[0], self.prefix_len, self.config.d_model)
+            base_embeddings = jnp.concatenate((prefix.astype(base_embeddings.dtype), base_embeddings), axis=1)
+        else:
+            base_embeddings = base_embeddings + puzzle_embedding[:, None, :]
         if self.bdr.position_encoding == "learned":
             base_embeddings = base_embeddings + self._position_embeddings()[None, :, :]
         return base_embeddings, context
@@ -788,7 +817,7 @@ class BeliefDynamicsReasoner(nnx.Module):
         return {
             "z": self._zero_z(batch["inputs"]),
             "hidden": jnp.zeros(
-                (batch_size, self.config.seq_len, self.hidden_dim),
+                (batch_size, self.total_seq_len, self.hidden_dim),
                 dtype=self.dtype,
             ),
             "steps": jnp.zeros((batch_size,), dtype=jnp.int32),

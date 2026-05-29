@@ -321,7 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bdr-local-kernel", type=int, default=3)
     parser.add_argument("--bdr-attn-scale", type=float, default=0.2)
     parser.add_argument("--bdr-local-scale", type=float, default=0.2)
-    parser.add_argument("--bdr-position-encoding", choices=("rope", "learned", "none"), default="rope")
+    parser.add_argument("--bdr-position-encoding", choices=("rope", "rope2d", "learned", "none"), default="rope")
     parser.add_argument("--bdr-rms-norm-eps", type=float, default=1e-5)
     parser.add_argument("--bdr-rope-theta", type=float, default=10000.0)
     parser.add_argument("--bdr-step-loss-schedule", choices=("uniform", "linear", "quadratic"), default="uniform")
