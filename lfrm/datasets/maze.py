@@ -223,6 +223,7 @@ def build_maze_dataset(
             "grid_height": grid_height,
             "grid_width": grid_width,
             "vocab_size": 6,
+            "input_vocab_size": 6,
             "num_puzzle_identifiers": 1,
             "num_examples": num_examples,
             "total_groups": selected_examples,

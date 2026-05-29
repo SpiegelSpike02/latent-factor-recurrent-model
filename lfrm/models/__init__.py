@@ -1,4 +1,3 @@
-from .belief_dynamics import BeliefDynamicsReasoner
-from .recurrent import TinyRecursiveModel, UnifiedReasoningModel
+from .recurrent import BeliefDynamicsReasoner, TinyRecursiveModel, UnifiedReasoningModel
 
 __all__ = ["BeliefDynamicsReasoner", "TinyRecursiveModel", "UnifiedReasoningModel"]

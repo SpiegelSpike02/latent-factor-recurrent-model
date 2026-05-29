@@ -9,7 +9,7 @@ from lfrm.training.puzzle_embedding import (
     sparse_puzzle_embeddings,
     update_sparse_puzzle_embeddings,
 )
-from lfrm.training.steps import (
+from lfrm.training.objectives import (
     act_loss_and_metrics,
     recurrent_eval_loss_and_metrics,
 )

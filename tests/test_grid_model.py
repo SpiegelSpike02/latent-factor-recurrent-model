@@ -187,7 +187,7 @@ class GridModelTests(unittest.TestCase):
         )
         self.assertIsInstance(create_model(bdr_config), BeliefDynamicsReasoner)
         invalid = ExperimentConfig(
-            model=ModelConfig(vocab_size=11, model_type="legacy_shared_block"),
+            model=ModelConfig(vocab_size=11, model_type="unsupported_shared_block"),
             optimizer=OptimizerConfig(),
             train=TrainConfig(),
             data=DataConfig(),
@@ -197,7 +197,7 @@ class GridModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bdr"):
             create_model(invalid)
 
-    def test_stablemax_forward_backward_are_finite(self) -> None:
+    def test_stablemax_value_and_gradient_are_finite(self) -> None:
         logits = jnp.asarray([[100.0, -100.0, 0.0], [-2.0, 3.0, 0.5]], dtype=jnp.float32)
         targets = jnp.asarray([0, 1], dtype=jnp.int32)
 
@@ -817,7 +817,7 @@ class GridModelTests(unittest.TestCase):
         self.assertGreaterEqual(float(terms["direction_cosine"]), -1.0)
         self.assertLessEqual(float(terms["direction_cosine"]), 1.0)
 
-    def test_bdr_losses_are_finite(self) -> None:
+    def test_bdr_objectives_are_finite(self) -> None:
         model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=9,
@@ -852,21 +852,6 @@ class GridModelTests(unittest.TestCase):
             False,
             jax.random.key(33),
         )
-        legacy_keys = {
-            "ce_loss",
-            "final_ce_loss",
-            "mean_ce_loss",
-            "blank_ce_loss",
-            "step_weighted_ce_loss",
-            "final_blank_ce_loss",
-            "mean_blank_ce_loss",
-            "blank_cell_accuracy",
-            "solved_rate",
-            "solved_count",
-            "invalid_board_rate",
-            "conflict_count",
-        }
-        self.assertFalse(legacy_keys & set(metrics))
         for key in (
             "loss",
             "token_loss",
@@ -1280,28 +1265,28 @@ class GridModelTests(unittest.TestCase):
                 rngs=nnx.Rngs(0),
             )
 
-    def test_config_loader_rejects_legacy_fields(self) -> None:
+    def test_config_loader_rejects_unknown_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "legacy.toml"
+            config_path = Path(tmpdir) / "unknown_model_field.toml"
             config_path.write_text(
                 "[model]\n"
                 "model_type = \"bdr\"\n"
-                "legacy_field = \"old\"\n",
+                "unknown_field = \"bad\"\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "Unsupported \\[model\\] field"):
                 load_toml_config(str(config_path))
 
-            train_legacy_path = Path(tmpdir) / "legacy_train.toml"
-            train_legacy_path.write_text(
+            train_config_path = Path(tmpdir) / "unknown_train_field.toml"
+            train_config_path.write_text(
                 "[train]\n"
-                "microbatch_size = 8\n",
+                "unknown_field = 8\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "Unsupported \\[train\\] field"):
-                load_toml_config(str(train_legacy_path))
+                load_toml_config(str(train_config_path))
 
-    def test_config_loader_accepts_bdr_and_trm_step_weights(self) -> None:
+    def test_config_loader_accepts_bdr_and_recurrent_step_weights(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "bdr.toml"
             config_path.write_text(
@@ -1346,18 +1331,6 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["bdr_path_energy_weight"], 0.0001)
             self.assertEqual(loaded["bdr_fixed_point_update_weight"], 0.0002)
             self.assertEqual(loaded["bdr_fixed_point_label_smoothing"], 0.002)
-
-            legacy_bdr_path = Path(tmpdir) / "legacy_bdr.toml"
-            legacy_bdr_path.write_text(
-                "[model]\n"
-                "model_type = \"bdr\"\n"
-                "\n"
-                "[model.bdr]\n"
-                "refine_steps = 4\n",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ValueError, "Unsupported \\[model.bdr\\] field"):
-                load_toml_config(str(legacy_bdr_path))
 
             eval_config_path = Path(tmpdir) / "eval.toml"
             eval_config_path.write_text(

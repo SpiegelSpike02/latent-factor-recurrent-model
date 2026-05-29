@@ -217,46 +217,6 @@ INTEGER_SCALAR_METRICS = {
     "selected_exact_count",
     "final_exact_count",
 }
-LEGACY_METRIC_NAMES = {
-    "ce_loss",
-    "final_ce_loss",
-    "mean_ce_loss",
-    "active_ce_loss",
-    "lm_loss",
-    "final_lm_loss",
-    "mean_lm_loss",
-    "active_lm_loss",
-    "selected_lm_loss",
-    "q_halt_loss",
-    "blank_ce_loss",
-    "final_blank_ce_loss",
-    "mean_blank_ce_loss",
-    "step_weighted_ce_loss",
-    "blank_cell_accuracy",
-    "solved_rate",
-    "solved_count",
-    "target_probability",
-    "current_target_probability",
-    "current_blank_cell_accuracy",
-    "current_solved_rate",
-    "current_solved_count",
-    "halted_count",
-    "halt_selected_blank_ce_loss",
-    "halt_selected_blank_cell_accuracy",
-    "halt_selected_solved_rate",
-    "halt_selected_solved_count",
-    "halt_selected_step",
-    "halt_selected_path_precision",
-    "halt_selected_path_recall",
-    "halt_selected_path_f1",
-    "final_blank_cell_accuracy",
-    "final_solved_rate",
-    "final_solved_count",
-    "invalid_board_rate",
-    "conflict_count",
-    "q_confidence",
-    "distribution_delta",
-}
 BDR_CONSOLE_GROUPS = (
     (
         "objective",
@@ -364,12 +324,6 @@ CONSOLE_GROUPS_BY_MODEL = {
 }
 
 
-def assert_no_legacy_metrics(metrics: dict[str, Any]) -> None:
-    legacy = sorted(set(metrics) & LEGACY_METRIC_NAMES)
-    if legacy:
-        raise AssertionError(f"Legacy metric keys are no longer allowed: {legacy}")
-
-
 def format_scalar_metric(name: str, value: Any) -> str:
     array = np.asarray(value)
     scalar = float(array)
@@ -407,7 +361,6 @@ def optional_scalar_log(
     *,
     exclude_history: set[str] | None = None,
 ) -> dict[str, float]:
-    assert_no_legacy_metrics(metrics)
     log: dict[str, float] = {}
     excluded = exclude_history or set()
     for name in names:
@@ -421,7 +374,6 @@ def optional_scalar_log(
 
 
 def optional_summary_log(prefix: str, metrics: dict[str, Any], names: set[str]) -> dict[str, float]:
-    assert_no_legacy_metrics(metrics)
     log: dict[str, float] = {}
     for name in names:
         if name in metrics:
@@ -432,7 +384,6 @@ def optional_summary_log(prefix: str, metrics: dict[str, Any], names: set[str]) 
 
 
 def grouped_scalar_summary(metrics: dict[str, Any], names: tuple[str, ...], model_type: str | None = None) -> str:
-    assert_no_legacy_metrics(metrics)
     allowed = set(names)
     groups = CONSOLE_GROUPS_BY_MODEL.get(model_type or "", METRIC_GROUPS)
     lines: list[str] = []

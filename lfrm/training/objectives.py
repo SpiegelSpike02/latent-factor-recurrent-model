@@ -214,35 +214,17 @@ def _bdr_attractor_metrics(model: BeliefDynamicsReasoner, losses: dict[str, jax.
     return metrics
 
 
-def _trm_step_loss_weights(model: GridReasoningModel, rollout_steps: int) -> jax.Array:
+def _recurrent_step_loss_weights(model: GridReasoningModel, rollout_steps: int) -> jax.Array:
     if isinstance(model, BeliefDynamicsReasoner):
         return _bdr_step_loss_weights(model, rollout_steps)
     recurrent_config = getattr(model, "trm", None) or getattr(model, "urm", None)
     return _normalized_step_loss_weights(getattr(recurrent_config, "step_loss_weights", None), rollout_steps)
 
 
-def _trm_selected_step(halt_logits: jax.Array) -> jax.Array:
+def _selected_step(halt_logits: jax.Array) -> jax.Array:
     step_halted = halt_logits > 0.0
     step_halted = step_halted.at[-1, :].set(True)
     return jnp.argmax(step_halted.astype(jnp.int32), axis=0)
-
-
-def _canonicalize_common_metric_names(metrics: dict[str, jax.Array]) -> dict[str, jax.Array]:
-    rename_pairs = (
-        ("ce_loss", "token_loss"),
-        ("lm_loss", "token_loss"),
-        ("final_ce_loss", "final_token_loss"),
-        ("final_lm_loss", "final_token_loss"),
-        ("mean_ce_loss", "mean_token_loss"),
-        ("mean_lm_loss", "mean_token_loss"),
-        ("selected_lm_loss", "selected_token_loss"),
-        ("q_halt_loss", "halt_loss"),
-    )
-    for old_name, new_name in rename_pairs:
-        if old_name in metrics:
-            value = metrics.pop(old_name)
-            metrics.setdefault(new_name, value)
-    return metrics
 
 
 def loss_and_metrics(
@@ -297,7 +279,7 @@ def loss_and_metrics(
     per_step_example_loss = jnp.sum(token_loss * step_loss_mask, axis=-1) / per_example_normalizer[None, :]
 
     rollout_steps = effective_step_logits.shape[0]
-    step_weights = _trm_step_loss_weights(model, rollout_steps)
+    step_weights = _recurrent_step_loss_weights(model, rollout_steps)
     lm_loss_value = jnp.sum(step_weights * per_step_loss)
     supervised_cells_per_example = jnp.sum(loss_mask, axis=-1)
     step_predictions = _output_predictions_to_tokens(model, effective_step_logits)
@@ -319,7 +301,7 @@ def loss_and_metrics(
             jnp.sum(example_mask) * halt_logits.shape[0],
             1.0,
         )
-        selected_step = _trm_selected_step(halt_logits)
+        selected_step = _selected_step(halt_logits)
         gather_index = selected_step[None, :, None, None]
         selected_logits = jnp.take_along_axis(
             effective_step_logits,
@@ -425,7 +407,7 @@ def loss_and_metrics(
     ):
         if key in diagnostics:
             metrics[key] = diagnostics[key]
-    return loss, _canonicalize_common_metric_names(metrics)
+    return loss, metrics
 
 
 def act_loss_and_metrics(
@@ -585,7 +567,7 @@ def act_loss_and_metrics(
     }
     metrics.update(bdr_metrics)
     metrics.update(_maybe_path_metrics(model, predictions, targets, loss_mask))
-    return loss, (_canonicalize_common_metric_names(metrics), new_carry)
+    return loss, (metrics, new_carry)
 
 
 def recurrent_eval_loss_and_metrics(
@@ -630,7 +612,7 @@ def recurrent_eval_loss_and_metrics(
         True,
     )
     halt_logits = model_diagnostics["halt_logits"]
-    selected_step = _trm_selected_step(halt_logits)
+    selected_step = _selected_step(halt_logits)
     gather_index = selected_step[None, :, None, None]
     selected_logits = jnp.take_along_axis(
         step_logits,
@@ -710,7 +692,7 @@ def recurrent_eval_loss_and_metrics(
             {
                 "oracle_step": _masked_example_mean(oracle_step.astype(jnp.float32) + 1.0, example_mask),
                 "mean_token_loss": jnp.mean(per_step_loss),
-                "step_loss_weights": _trm_step_loss_weights(model, step_logits.shape[0]),
+                "step_loss_weights": _recurrent_step_loss_weights(model, step_logits.shape[0]),
                 "per_step_loss": per_step_loss,
                 "per_step_accuracy": per_step_accuracy,
                 "per_step_hidden_delta": model_diagnostics["hidden_delta_mean"],
@@ -769,4 +751,4 @@ def recurrent_eval_loss_and_metrics(
                     **_per_step_bdr_branch_diagnostics(model, model_diagnostics),
                 }
             )
-    return loss, _canonicalize_common_metric_names(metrics)
+    return loss, metrics

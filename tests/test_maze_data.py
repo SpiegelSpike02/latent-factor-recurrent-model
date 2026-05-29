@@ -42,6 +42,7 @@ class MazeDatasetTests(unittest.TestCase):
             dataset = load_dataset(dataset_path=str(output_dir))
             self.assertEqual(dataset.spec.kind, "maze")
             self.assertEqual(dataset.spec.vocab_size, 6)
+            self.assertEqual(dataset.spec.input_vocab_size, 6)
             self.assertEqual(dataset.spec.seq_len, 9)
             self.assertEqual(dataset.train_inputs.shape, (16, 9))
             self.assertEqual(dataset.eval_inputs.shape, (1, 9))

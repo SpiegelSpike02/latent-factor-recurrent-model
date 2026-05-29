@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,7 +64,7 @@ class SudokuDataTests(unittest.TestCase):
             self.assertTrue(np.all(dataset.train_puzzle_identifiers == 0))
             self.assertTrue((output_dir / "train" / "inputs.npy").is_file())
             self.assertTrue((output_dir / "train" / "labels.npy").is_file())
-            self.assertFalse((output_dir / "train" / "puzzle_identifiers.npy").exists())
+            self.assertTrue((output_dir / "train" / "puzzle_identifiers.npy").is_file())
             self.assertTrue((output_dir / "train" / "puzzle_indices.npy").is_file())
             self.assertTrue((output_dir / "train" / "group_indices.npy").is_file())
             self.assertFalse((output_dir / "train" / "given_mask.npy").exists())
@@ -77,7 +76,7 @@ class SudokuDataTests(unittest.TestCase):
             self.assertEqual(batch["puzzle_identifiers"].shape, (2,))
             self.assertTrue(np.all(batch["puzzle_identifiers"] == 0))
 
-    def test_load_sudoku_dataset_without_puzzle_identifiers_file(self) -> None:
+    def test_load_sudoku_dataset_requires_puzzle_identifiers_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             csv_dir = root / "csv"
@@ -95,18 +94,10 @@ class SudokuDataTests(unittest.TestCase):
                 num_aug=1,
                 seed=0,
             )
-            for split in ("train", "test"):
-                split_dir = output_dir / split
-                metadata_path = split_dir / "dataset.json"
-                metadata = json.loads(metadata_path.read_text())
-                metadata.pop("num_puzzle_identifiers")
-                metadata_path.write_text(json.dumps(metadata))
+            (output_dir / "train" / "puzzle_identifiers.npy").unlink()
 
-            dataset = load_dataset(dataset_path=str(output_dir))
-
-            self.assertEqual(dataset.spec.num_puzzle_identifiers, 1)
-            self.assertTrue(np.all(dataset.train_puzzle_identifiers == 0))
-            self.assertTrue(np.all(dataset.eval_puzzle_identifiers == 0))
+            with self.assertRaisesRegex(FileNotFoundError, "Missing puzzle_identifiers"):
+                load_dataset(dataset_path=str(output_dir))
 
     def test_build_sudoku_parser_exposes_progress_every(self) -> None:
         args = build_parser().parse_args(

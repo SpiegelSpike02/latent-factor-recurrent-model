@@ -27,10 +27,7 @@ def stablemax_cross_entropy_with_integer_labels(logits: jax.Array, targets: jax.
 def outputs_are_probabilities(model: object) -> bool:
     if hasattr(model, "outputs_are_probabilities"):
         return bool(model.outputs_are_probabilities())
-    return (
-        getattr(getattr(model, "config", None), "model_type", None) == "bdr"
-        and getattr(getattr(model, "bdr", None), "prediction_view", None) == "probability"
-    )
+    return False
 
 
 def output_probabilities(model: object, outputs: jax.Array) -> jax.Array:

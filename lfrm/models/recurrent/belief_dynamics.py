@@ -7,8 +7,15 @@ import jax.numpy as jnp
 from flax import nnx
 
 from lfrm.config import ModelConfig, RuntimeConfig
-from .common import Array, casted_linear_init, compute_dtype, gather_embedding_rows, maybe_cast, trunc_normal_init
-from .grid_layers import (
+from lfrm.models.common import (
+    Array,
+    casted_linear_init,
+    compute_dtype,
+    gather_embedding_rows,
+    maybe_cast,
+    trunc_normal_init,
+)
+from lfrm.models.grid_layers import (
     CastedEmbedding,
     ConvSwiGLU2D,
     FullAttention,
@@ -1088,9 +1095,9 @@ class BeliefDynamicsReasoner(nnx.Module):
 
     def _halt_logits(self, read_state: Array, tokens: Array) -> Array:
         query_mask = (~self.context_mask(tokens)).astype(jnp.float32)
-        fallback_mask = jnp.ones_like(query_mask)
+        all_cells_mask = jnp.ones_like(query_mask)
         has_query = jnp.sum(query_mask, axis=-1, keepdims=True) > 0.0
-        mask = jnp.where(has_query, query_mask, fallback_mask)
+        mask = jnp.where(has_query, query_mask, all_cells_mask)
         pooled = (
             jnp.sum(read_state.astype(jnp.float32) * mask[..., None], axis=1)
             / jnp.maximum(jnp.sum(mask, axis=-1, keepdims=True), 1.0)

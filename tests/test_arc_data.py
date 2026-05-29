@@ -44,6 +44,7 @@ class ARCDataTests(unittest.TestCase):
             self.assertEqual(dataset.spec.grid_height, 30)
             self.assertEqual(dataset.spec.grid_width, 30)
             self.assertEqual(dataset.spec.vocab_size, 12)
+            self.assertEqual(dataset.spec.input_vocab_size, 12)
             self.assertEqual(dataset.train_inputs.shape[1], 900)
             self.assertEqual(dataset.eval_inputs.shape[1], 900)
             self.assertEqual(dataset.train_inputs.dtype.name, "uint8")

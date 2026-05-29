@@ -19,7 +19,7 @@ from lfrm.training.recurrent import (
     build_recurrent_eval_step_runner,
 )
 from lfrm.training.supervised import build_eval_step_runner, build_train_step_runner
-from lfrm.training.steps import (
+from lfrm.training.objectives import (
     act_loss_and_metrics,
     loss_and_metrics,
     recurrent_eval_loss_and_metrics,

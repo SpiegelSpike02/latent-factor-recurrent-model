@@ -159,7 +159,7 @@ def build_sudoku_dataset(
         num_examples = selected_examples * (num_augments + 1)
         bytes_estimate = num_examples * (
             81 * np.dtype(np.uint8).itemsize * 2
-            + np.dtype(np.int32).itemsize * 2
+            + np.dtype(np.int32).itemsize * 3
         ) + (selected_examples + 1) * np.dtype(np.int32).itemsize
         _progress(
             f"[{split_name}] writing {_format_count(num_examples)} examples "
@@ -184,6 +184,12 @@ def build_sudoku_dataset(
             dtype=np.int32,
             shape=(selected_examples + 1,),
         )
+        puzzle_identifiers = open_memmap(
+            split_dir / "puzzle_identifiers.npy",
+            mode="w+",
+            dtype=np.int32,
+            shape=(num_examples,),
+        )
         output_idx = 0
         group_idx = 0
         puzzle_indices[0] = 0
@@ -199,6 +205,7 @@ def build_sudoku_dataset(
                 encoded_input = _encode_sudoku_input(aug_board)
                 encoded_inputs[output_idx] = encoded_input
                 encoded_labels[output_idx] = _encode_sudoku_label(aug_solution)
+                puzzle_identifiers[output_idx] = 0
                 output_idx += 1
                 puzzle_indices[output_idx] = output_idx
                 if progress_every > 0 and output_idx % progress_every == 0:
@@ -206,6 +213,7 @@ def build_sudoku_dataset(
                     encoded_labels.flush()
                     puzzle_indices.flush()
                     group_indices.flush()
+                    puzzle_identifiers.flush()
                     _progress(
                         f"[{split_name}] wrote {_format_count(output_idx)} / {_format_count(num_examples)} examples",
                         progress_every,
@@ -218,6 +226,7 @@ def build_sudoku_dataset(
         encoded_labels.flush()
         puzzle_indices.flush()
         group_indices.flush()
+        puzzle_identifiers.flush()
         metadata = {
             "kind": "sudoku",
             "task_type": "classification",

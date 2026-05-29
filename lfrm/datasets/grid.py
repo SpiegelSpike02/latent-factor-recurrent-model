@@ -40,6 +40,22 @@ class GridDataset:
     spec: DatasetSpec
 
 
+REQUIRED_METADATA_KEYS = (
+    "kind",
+    "task_type",
+    "vocab_size",
+    "input_vocab_size",
+    "num_puzzle_identifiers",
+    "total_groups",
+    "total_puzzles",
+    "mean_puzzle_examples",
+    "seq_len",
+    "grid_height",
+    "grid_width",
+    "num_examples",
+)
+
+
 def load_dataset(*, dataset_path: str) -> GridDataset:
     root = Path(dataset_path)
     train_dir = root / "train"
@@ -52,10 +68,11 @@ def load_dataset(*, dataset_path: str) -> GridDataset:
     train_metadata = json.loads((train_dir / "dataset.json").read_text())
     eval_metadata = json.loads((eval_dir / "dataset.json").read_text())
 
-    train_metadata = _normalize_grid_metadata(train_metadata)
-    eval_metadata = _normalize_grid_metadata(eval_metadata)
+    _validate_grid_metadata(train_metadata, train_dir)
+    _validate_grid_metadata(eval_metadata, eval_dir)
 
     shared_keys = (
+        "kind",
         "seq_len",
         "vocab_size",
         "input_vocab_size",
@@ -84,7 +101,7 @@ def load_dataset(*, dataset_path: str) -> GridDataset:
     _validate_indices(eval_puzzle_indices, eval_group_indices, eval_inputs.shape[0], eval_dir)
 
     spec = DatasetSpec(
-        kind=str(train_metadata.get("kind", "grid")),
+        kind=str(train_metadata["kind"]),
         task_type=str(train_metadata["task_type"]),
         vocab_size=int(train_metadata["vocab_size"]),
         input_vocab_size=int(train_metadata["input_vocab_size"]),
@@ -245,7 +262,7 @@ def _load_optional_split_array(split_dir: Path, name: str) -> np.ndarray | None:
 def _load_puzzle_identifiers(split_dir: Path, num_examples: int, puzzle_indices: np.ndarray | None) -> np.ndarray:
     path = split_dir / "puzzle_identifiers.npy"
     if not path.is_file():
-        return np.zeros((num_examples,), dtype=np.int32)
+        raise FileNotFoundError(f"Missing puzzle_identifiers: {path}")
     identifiers = np.load(path, mmap_mode="r")
     if identifiers.shape == (num_examples,):
         return identifiers
@@ -330,20 +347,7 @@ def _validate_puzzle_identifiers(identifiers: np.ndarray, num_puzzle_identifiers
         )
 
 
-def _normalize_grid_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(metadata)
-    seq_len = int(normalized["seq_len"])
-    if "grid_height" not in normalized or "grid_width" not in normalized:
-        side = int(round(seq_len ** 0.5))
-        if side * side != seq_len:
-            raise ValueError("Missing grid metadata and seq_len is not a square number")
-        normalized["grid_height"] = side
-        normalized["grid_width"] = side
-    normalized.setdefault("kind", "grid")
-    normalized.setdefault("input_vocab_size", normalized["vocab_size"])
-    if "num_puzzle_identifiers" not in normalized:
-        normalized["num_puzzle_identifiers"] = 1
-    normalized.setdefault("total_groups", normalized.get("num_examples", 0))
-    normalized.setdefault("total_puzzles", normalized.get("num_examples", 0))
-    normalized.setdefault("mean_puzzle_examples", 1.0)
-    return normalized
+def _validate_grid_metadata(metadata: dict[str, Any], split_dir: Path) -> None:
+    missing = [key for key in REQUIRED_METADATA_KEYS if key not in metadata]
+    if missing:
+        raise ValueError(f"Missing dataset metadata fields in {split_dir}: {', '.join(missing)}")

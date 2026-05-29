@@ -4,7 +4,7 @@ import jax
 from flax import nnx
 
 from lfrm.training.factory import GridReasoningModel
-from lfrm.training.steps import loss_and_metrics
+from lfrm.training.objectives import loss_and_metrics
 
 
 def build_train_step_runner(

@@ -177,7 +177,7 @@ def ensure_arc_source_files(
                     )
                     shutil.copyfile(downloaded, tmp_path)
                 except Exception as hub_error:
-                    print(f"[arc] huggingface_hub download failed ({hub_error}); falling back to {url}", flush=True)
+                    print(f"[arc] huggingface_hub download failed ({hub_error}); using {url}", flush=True)
                     urlretrieve(url, tmp_path)
                 tmp_path.replace(output_path)
             finally:
@@ -188,15 +188,7 @@ def ensure_arc_source_files(
 def _load_subset(input_file_prefix: str, subset: str) -> dict[str, dict]:
     challenges_path = _resolve_arc_file(input_file_prefix, subset, "challenges")
     puzzles = json.loads(challenges_path.read_text(encoding="utf-8"))
-    try:
-        solutions_path = _resolve_arc_file(input_file_prefix, subset, "solutions")
-    except FileNotFoundError:
-        print(f"{subset} solutions not found, filling with dummy")
-        for puzzle in puzzles.values():
-            for example in puzzle["test"]:
-                example.setdefault("output", [[0]])
-        return puzzles
-
+    solutions_path = _resolve_arc_file(input_file_prefix, subset, "solutions")
     solutions = json.loads(solutions_path.read_text(encoding="utf-8"))
     for puzzle_id, solution_grids in solutions.items():
         for idx, solution_grid in enumerate(solution_grids):
@@ -247,7 +239,10 @@ def _convert_single_puzzle(
 
     for dest in destinations:
         split_name, set_name = dest
-        results.setdefault(split_name, {}).setdefault(set_name, [])
+        if split_name not in results:
+            results[split_name] = {}
+        if set_name not in results[split_name]:
+            results[split_name][set_name] = []
         results[split_name][set_name].append([group_item[dest] for group_item in group])
 
 
@@ -382,6 +377,7 @@ def _write_split(
         "grid_height": ARC_MAX_GRID_SIZE,
         "grid_width": ARC_MAX_GRID_SIZE,
         "vocab_size": 12,
+        "input_vocab_size": 12,
         "pad_id": 0,
         "ignore_label_id": 0,
         "blank_identifier_id": 0,
