@@ -16,10 +16,10 @@ loss_type = "softmax"
 [model.bdr]
 
 [model.bdr.dynamics]
-commit_steps = 48
+commit_steps = 16
 h_cycles = 2
-l_cycles = 4
-l_layers = 2
+l_cycles = 6
+l_layers = 4
 step_loss_schedule = "uniform"
 update_rule = "proposal"
 draft_view = "probability"
@@ -79,5 +79,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "sudoku-bdr-proposal-h2-l4x2-c48-act-b768"
+name = "sudoku-bdr-proposal-h2-l6x4-c16-act-b768"
 mode = "online"
