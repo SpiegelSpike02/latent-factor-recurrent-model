@@ -25,11 +25,6 @@ update_rule = "proposal"
 draft_view = "probability"
 prediction_view = "probability"
 
-[model.bdr.objective]
-path_energy_weight = 0.0
-fixed_point_update_weight = 3e-4
-fixed_point_label_smoothing = 3e-3
-
 [model.bdr.hidden]
 hidden_state_dim = 512
 num_heads = 8

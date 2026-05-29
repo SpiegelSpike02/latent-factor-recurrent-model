@@ -45,17 +45,6 @@ GROUPED_NESTED_KEYS = {
             "update_step_size",
             "halt_exploration_prob",
         },
-        "objective": {
-            "path_energy_weight",
-            "fixed_point_update_weight",
-            "fixed_point_label_smoothing",
-            "wrong_attractor_rank_weight",
-            "wrong_attractor_direction_weight",
-            "wrong_attractor_nonzero_weight",
-            "wrong_attractor_rank_margin",
-            "wrong_attractor_update_floor",
-            "corrupted_recovery_weight",
-        },
         "hidden": {
             "hidden_state_dim",
             "num_heads",
@@ -170,17 +159,7 @@ ALLOWED_NESTED_KEYS = {
         "prediction_view",
         "update_step_size",
         "halt_exploration_prob",
-        "path_energy_weight",
-        "fixed_point_update_weight",
-        "fixed_point_label_smoothing",
-        "wrong_attractor_rank_weight",
-        "wrong_attractor_direction_weight",
-        "wrong_attractor_nonzero_weight",
-        "wrong_attractor_rank_margin",
-        "wrong_attractor_update_floor",
-        "corrupted_recovery_weight",
         "dynamics",
-        "objective",
         "hidden",
         "position",
     },
@@ -351,15 +330,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bdr-prediction-view", choices=("auto", "logits", "probability"), default="auto")
     parser.add_argument("--bdr-update-step-size", type=float, default=0.3)
     parser.add_argument("--bdr-halt-exploration-prob", type=float, default=0.1)
-    parser.add_argument("--bdr-path-energy-weight", type=float, default=1e-4)
-    parser.add_argument("--bdr-fixed-point-update-weight", type=float, default=0.0)
-    parser.add_argument("--bdr-fixed-point-label-smoothing", type=float, default=1e-3)
-    parser.add_argument("--bdr-wrong-attractor-rank-weight", type=float, default=0.0)
-    parser.add_argument("--bdr-wrong-attractor-direction-weight", type=float, default=0.0)
-    parser.add_argument("--bdr-wrong-attractor-nonzero-weight", type=float, default=0.0)
-    parser.add_argument("--bdr-wrong-attractor-rank-margin", type=float, default=1.0)
-    parser.add_argument("--bdr-wrong-attractor-update-floor", type=float, default=0.5)
-    parser.add_argument("--bdr-corrupted-recovery-weight", type=float, default=0.0)
     parser.add_argument("--urm-recurrent-steps", type=int, default=16)
     parser.add_argument("--urm-h-cycles", type=int, default=2)
     parser.add_argument("--urm-l-cycles", type=int, default=6)
@@ -506,15 +476,6 @@ def build_config(
             prediction_view=args.bdr_prediction_view,
             update_step_size=args.bdr_update_step_size,
             halt_exploration_prob=args.bdr_halt_exploration_prob,
-            path_energy_weight=args.bdr_path_energy_weight,
-            fixed_point_update_weight=args.bdr_fixed_point_update_weight,
-            fixed_point_label_smoothing=args.bdr_fixed_point_label_smoothing,
-            wrong_attractor_rank_weight=args.bdr_wrong_attractor_rank_weight,
-            wrong_attractor_direction_weight=args.bdr_wrong_attractor_direction_weight,
-            wrong_attractor_nonzero_weight=args.bdr_wrong_attractor_nonzero_weight,
-            wrong_attractor_rank_margin=args.bdr_wrong_attractor_rank_margin,
-            wrong_attractor_update_floor=args.bdr_wrong_attractor_update_floor,
-            corrupted_recovery_weight=args.bdr_corrupted_recovery_weight,
         ),
         urm=URMConfig(
             recurrent_steps=args.urm_recurrent_steps,

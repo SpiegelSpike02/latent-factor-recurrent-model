@@ -239,10 +239,9 @@ def log_train_metrics(
         )
     )
     train_summary = optional_summary_log("train", host_metrics, WANDB_HISTORY_EXCLUDED_SCALAR_METRICS)
-    if config.model.model_type != "bdr":
-        for metric_name, log_name in PER_STEP_SCALAR_SERIES:
-            if metric_name in host_metrics:
-                train_log.update(flatten_step_metrics(f"train/{log_name}", list(host_metrics[metric_name])))
+    for metric_name, log_name in PER_STEP_SCALAR_SERIES:
+        if metric_name in host_metrics:
+            train_log.update(flatten_step_metrics(f"train/{log_name}", list(host_metrics[metric_name])))
     if wandb_run is not None:
         wandb_run.log(train_log, step=step, commit=not is_eval_step)
         for key, value in train_summary.items():
@@ -404,7 +403,7 @@ def run_training(
 
     current_batch = prefetcher.next()
     use_carry = training_uses_carry(config)
-    console_model_label = "bdr" if config.model.model_type == "bdr" else config.model.model_type
+    console_model_label = config.model.model_type
     train_carry = place_tree(model.initial_carry(current_batch), data_sharding) if use_carry else None
     eval_steps = eval_update_steps(config)
     profile_active = False

@@ -393,11 +393,6 @@ class GridModelTests(unittest.TestCase):
                     commit_steps=1,
                     num_heads=4,
                     mlp_ratio=1,
-                    fixed_point_update_weight=0.0,
-                    wrong_attractor_rank_weight=0.0,
-                    wrong_attractor_direction_weight=0.0,
-                    wrong_attractor_nonzero_weight=0.0,
-                    corrupted_recovery_weight=0.0,
                 ),
             ),
             RuntimeConfig(compute_dtype="float32"),
@@ -570,11 +565,6 @@ class GridModelTests(unittest.TestCase):
                     num_heads=4,
                     mlp_ratio=1,
                     update_rule="proposal",
-                    fixed_point_update_weight=0.0,
-                    wrong_attractor_rank_weight=0.0,
-                    wrong_attractor_direction_weight=0.0,
-                    wrong_attractor_nonzero_weight=0.0,
-                    corrupted_recovery_weight=0.0,
                 ),
             ),
             optimizer=OptimizerConfig(learning_rate=1e-3, lr_warmup_steps=1),
@@ -623,11 +613,6 @@ class GridModelTests(unittest.TestCase):
                     num_heads=4,
                     mlp_ratio=1,
                     update_rule="free_velocity",
-                    fixed_point_update_weight=0.0,
-                    wrong_attractor_rank_weight=0.0,
-                    wrong_attractor_direction_weight=0.0,
-                    wrong_attractor_nonzero_weight=0.0,
-                    corrupted_recovery_weight=0.0,
                 ),
             ),
             optimizer=OptimizerConfig(learning_rate=1e-3, lr_warmup_steps=1),
@@ -676,11 +661,6 @@ class GridModelTests(unittest.TestCase):
                     num_heads=4,
                     mlp_ratio=1,
                     update_rule="energy_dist",
-                    fixed_point_update_weight=0.0,
-                    wrong_attractor_rank_weight=0.0,
-                    wrong_attractor_direction_weight=0.0,
-                    wrong_attractor_nonzero_weight=0.0,
-                    corrupted_recovery_weight=0.0,
                 ),
             ),
             optimizer=OptimizerConfig(learning_rate=1e-3, lr_warmup_steps=1),
@@ -713,111 +693,7 @@ class GridModelTests(unittest.TestCase):
         self.assertNotIn("energy_grad_rms", metrics)
         self.assertTrue(bool(jnp.isfinite(metrics["loss"])))
 
-    def test_bdr_energy_dist_rank_is_cell_level_margin(self) -> None:
-        model = BeliefDynamicsReasoner(
-            ModelConfig(
-                vocab_size=3,
-                model_type="bdr",
-                task=TaskConfig(type="arc"),
-                seq_len=2,
-                grid_height=1,
-                grid_width=2,
-                d_model=12,
-                bdr=BeliefDynamicsConfig(
-                    commit_steps=1,
-                    num_heads=3,
-                    mlp_ratio=1,
-                    update_rule="energy_dist",
-                    wrong_attractor_rank_margin=1.0,
-                ),
-            ),
-            RuntimeConfig(compute_dtype="float32"),
-            rngs=nnx.Rngs(319),
-        )
-        tokens = jnp.zeros((1, 2), dtype=jnp.int32)
-        targets = jnp.asarray([[0, 1]], dtype=jnp.int32)
-        loss_mask = jnp.ones((1, 2), dtype=jnp.float32)
-        z = model.initial_z(tokens)
-        hidden = jnp.zeros((1, 2, 12), dtype=jnp.float32)
-        base_embeddings = jnp.zeros((1, 2, 12), dtype=jnp.float32)
-        label_energies = jnp.asarray(
-            [[[0.0, 2.0, 3.0], [0.0, 0.0, 2.0]]],
-            dtype=jnp.float32,
-        )
-
-        original_label_energy = model._label_energies_from_read_state
-        original_update_state = model._update_read_state_for_state
-        model._label_energies_from_read_state = lambda read_state: label_energies
-        model._update_read_state_for_state = lambda *args, **kwargs: (args[2], args[2])
-        try:
-            terms = model._attractor_recovery_terms(
-                tokens,
-                targets,
-                loss_mask,
-                z,
-                hidden,
-                base_embeddings,
-                jnp.asarray(0, dtype=jnp.int32),
-                train=False,
-                dropout_key=jax.random.key(320),
-                wrong_only=False,
-            )
-        finally:
-            model._label_energies_from_read_state = original_label_energy
-            model._update_read_state_for_state = original_update_state
-
-        expected_cell_loss = (0.0 + 1.0) / 2.0
-        self.assertAlmostEqual(float(terms["rank_loss"]), expected_cell_loss, places=6)
-
-    def test_bdr_energy_prob_attractor_direction_uses_distribution_delta(self) -> None:
-        model = BeliefDynamicsReasoner(
-            ModelConfig(
-                vocab_size=5,
-                model_type="bdr",
-                task=TaskConfig(type="arc"),
-                seq_len=4,
-                grid_height=2,
-                grid_width=2,
-                d_model=16,
-                bdr=BeliefDynamicsConfig(
-                    commit_steps=1,
-                    num_heads=4,
-                    mlp_ratio=1,
-                    update_rule="energy_prob",
-                    update_step_size=0.5,
-                ),
-            ),
-            RuntimeConfig(compute_dtype="float32"),
-            rngs=nnx.Rngs(314),
-        )
-        tokens = jnp.zeros((1, 4), dtype=jnp.int32)
-        targets = jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32)
-        loss_mask = jnp.ones((1, 4), dtype=jnp.float32)
-        current_distribution = jnp.asarray(
-            [[[0.7, 0.1, 0.1, 0.05, 0.05]] * 4],
-            dtype=jnp.float32,
-        )
-        hidden = jnp.zeros((1, 4, 16), dtype=jnp.float32)
-        base_embeddings, _context = model.context_memory(tokens)
-
-        terms = model._attractor_recovery_terms(
-            tokens,
-            targets,
-            loss_mask,
-            current_distribution,
-            hidden,
-            base_embeddings,
-            jnp.asarray(0, dtype=jnp.int32),
-            train=False,
-            dropout_key=jax.random.key(315),
-            wrong_only=False,
-        )
-
-        self.assertTrue(bool(jnp.isfinite(terms["direction_loss"])))
-        self.assertGreaterEqual(float(terms["direction_cosine"]), -1.0)
-        self.assertLessEqual(float(terms["direction_cosine"]), 1.0)
-
-    def test_bdr_objectives_are_finite(self) -> None:
+    def test_bdr_eval_metrics_are_finite(self) -> None:
         model = BeliefDynamicsReasoner(
             ModelConfig(
                 vocab_size=9,
@@ -863,7 +739,6 @@ class GridModelTests(unittest.TestCase):
             "query_target_probability",
             "context_consistency",
             "conflicts",
-            "path_energy_loss",
         ):
             self.assertIn(key, metrics)
             self.assertTrue(bool(jnp.isfinite(metrics[key])))
@@ -1308,11 +1183,7 @@ class GridModelTests(unittest.TestCase):
                 "draft_view = \"probability\"\n"
                 "prediction_view = \"probability\"\n"
                 "update_step_size = 0.4\n"
-                "\n"
-                "[model.bdr.objective]\n"
-                "path_energy_weight = 0.0001\n"
-                "fixed_point_update_weight = 0.0002\n"
-                "fixed_point_label_smoothing = 0.002\n",
+                "\n",
                 encoding="utf-8",
             )
             loaded = load_toml_config(str(config_path))
@@ -1328,9 +1199,6 @@ class GridModelTests(unittest.TestCase):
             self.assertEqual(loaded["bdr_draft_view"], "probability")
             self.assertEqual(loaded["bdr_prediction_view"], "probability")
             self.assertEqual(loaded["bdr_update_step_size"], 0.4)
-            self.assertEqual(loaded["bdr_path_energy_weight"], 0.0001)
-            self.assertEqual(loaded["bdr_fixed_point_update_weight"], 0.0002)
-            self.assertEqual(loaded["bdr_fixed_point_label_smoothing"], 0.002)
 
             eval_config_path = Path(tmpdir) / "eval.toml"
             eval_config_path.write_text(

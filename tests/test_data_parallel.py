@@ -40,6 +40,7 @@ config = ExperimentConfig(
     model=ModelConfig(
         vocab_size=5,
         input_vocab_size=5,
+        num_puzzle_identifiers=2,
         model_type="bdr",
         seq_len=4,
         grid_height=2,
@@ -53,14 +54,14 @@ config = ExperimentConfig(
             num_heads=4,
             mlp_ratio=1,
             update_rule="proposal",
-            fixed_point_update_weight=0.0,
-            wrong_attractor_rank_weight=0.0,
-            wrong_attractor_direction_weight=0.0,
-            wrong_attractor_nonzero_weight=0.0,
-            corrupted_recovery_weight=0.0,
         ),
     ),
-    optimizer=OptimizerConfig(learning_rate=1e-4, weight_decay=0.0),
+    optimizer=OptimizerConfig(
+        learning_rate=1e-4,
+        puzzle_embed_learning_rate=1e-4,
+        weight_decay=0.0,
+        puzzle_embed_weight_decay=0.0,
+    ),
     train=TrainConfig(batch_size=4, train_mode="act"),
     eval=EvalConfig(batch_size=4),
     data=DataConfig(dataset_path="unused"),
@@ -82,7 +83,7 @@ batch = device_put_batch_sharded(
     {
         "inputs": rng.integers(0, 5, size=(4, 4), dtype=np.int32),
         "labels": rng.integers(1, 5, size=(4, 4), dtype=np.int32),
-        "puzzle_identifiers": np.zeros((4,), dtype=np.int32),
+        "puzzle_identifiers": np.asarray([0, 1, 0, 1], dtype=np.int32),
     },
     data_sharding,
 )
@@ -104,6 +105,7 @@ assert batch["inputs"].sharding.spec == jax.sharding.PartitionSpec("data")
 assert new_carry["z"].sharding.spec == jax.sharding.PartitionSpec("data", None, None)
 assert new_carry["halted"].sharding.spec == jax.sharding.PartitionSpec("data")
 assert metrics["loss"].sharding.spec == jax.sharding.PartitionSpec()
+assert "puzzle_embed_touched_rows" in metrics
 """
     env = os.environ.copy()
     env["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"

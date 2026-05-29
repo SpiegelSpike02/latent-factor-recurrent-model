@@ -126,7 +126,7 @@ def _uses_puzzle_embedding(config: ExperimentConfig) -> bool:
 
 def uses_sparse_puzzle_embedding(config: ExperimentConfig) -> bool:
     return (
-        config.model.model_type in ("trm", "urm")
+        config.model.model_type in ("trm", "urm", "bdr")
         and _uses_puzzle_embedding(config)
         and config.optimizer.puzzle_embed_learning_rate > 0.0
         and config.train.train_mode == "act"

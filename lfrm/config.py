@@ -50,15 +50,6 @@ class BeliefDynamicsConfig:
     draft_view: str = "auto"
     prediction_view: str = "auto"
     update_step_size: float = 0.3
-    path_energy_weight: float = 1e-4
-    fixed_point_update_weight: float = 0.0
-    fixed_point_label_smoothing: float = 1e-3
-    wrong_attractor_rank_weight: float = 0.0
-    wrong_attractor_direction_weight: float = 0.0
-    wrong_attractor_nonzero_weight: float = 0.0
-    wrong_attractor_rank_margin: float = 1.0
-    wrong_attractor_update_floor: float = 0.5
-    corrupted_recovery_weight: float = 0.0
 
 
 @dataclass(frozen=True)

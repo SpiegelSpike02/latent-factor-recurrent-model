@@ -191,29 +191,6 @@ def _per_step_bdr_branch_diagnostics(model: BeliefDynamicsReasoner, diagnostics:
     }
 
 
-def _bdr_attractor_metrics(model: BeliefDynamicsReasoner, losses: dict[str, jax.Array]) -> dict[str, jax.Array]:
-    metrics: dict[str, jax.Array] = {}
-    has_energy_rank = model.bdr.update_rule in ("energy_prob", "energy_dist")
-    if float(model.bdr.wrong_attractor_rank_weight) != 0.0 and has_energy_rank:
-        metrics["wrong_attractor_rank_loss"] = losses["wrong_attractor_rank_loss"]
-        metrics["wrong_attractor_energy_gap"] = losses["wrong_attractor_energy_gap"]
-        metrics["wrong_attractor_active_rate"] = losses["wrong_attractor_active_rate"]
-    if float(model.bdr.wrong_attractor_direction_weight) != 0.0:
-        metrics["wrong_attractor_direction_loss"] = losses["wrong_attractor_direction_loss"]
-        metrics["wrong_attractor_direction_cosine"] = losses["wrong_attractor_direction_cosine"]
-        metrics["wrong_attractor_active_rate"] = losses["wrong_attractor_active_rate"]
-    if float(model.bdr.wrong_attractor_nonzero_weight) != 0.0:
-        metrics["wrong_attractor_nonzero_loss"] = losses["wrong_attractor_nonzero_loss"]
-        metrics["wrong_attractor_active_rate"] = losses["wrong_attractor_active_rate"]
-    if float(model.bdr.corrupted_recovery_weight) != 0.0:
-        metrics["corrupted_recovery_loss"] = losses["corrupted_recovery_loss"]
-        metrics["corrupted_recovery_direction_cosine"] = losses["corrupted_recovery_direction_cosine"]
-        if has_energy_rank:
-            metrics["corrupted_recovery_rank_loss"] = losses["corrupted_recovery_rank_loss"]
-            metrics["corrupted_recovery_energy_gap"] = losses["corrupted_recovery_energy_gap"]
-    return metrics
-
-
 def _recurrent_step_loss_weights(model: GridReasoningModel, rollout_steps: int) -> jax.Array:
     if isinstance(model, BeliefDynamicsReasoner):
         return _bdr_step_loss_weights(model, rollout_steps)
@@ -421,12 +398,11 @@ def act_loss_and_metrics(
 ) -> tuple[jax.Array, tuple[dict[str, jax.Array], dict[str, jax.Array]]]:
     if dropout_key is None:
         dropout_key = jax.random.key(0)
-    step_key, fixed_point_key, attractor_key = jax.random.split(dropout_key, 3)
     new_carry, logits, diagnostics = model.forward_act_step(
         carry,
         batch,
         train=train,
-        dropout_key=step_key,
+        dropout_key=dropout_key,
         puzzle_embeddings=puzzle_embeddings,
     )
     inputs = new_carry["current_inputs"]
@@ -469,62 +445,10 @@ def act_loss_and_metrics(
     loss = lm_loss_value + halt_loss_weight * halt_loss
     bdr_metrics: dict[str, jax.Array] = {}
     if isinstance(model, BeliefDynamicsReasoner):
-        zero = jnp.asarray(0.0, dtype=jnp.float32)
-        puzzle_identifiers = new_carry.get("current_puzzle_identifiers")
-        path_energy_loss = diagnostics["path_energy"].astype(jnp.float32)
-        if float(model.bdr.fixed_point_update_weight) != 0.0:
-            fixed_point_update_loss = model.fixed_point_update_loss(
-                inputs,
-                targets,
-                loss_mask,
-                puzzle_identifiers=puzzle_identifiers,
-                train=train,
-                dropout_key=fixed_point_key,
-            )
-        else:
-            fixed_point_update_loss = zero
-        use_attractor_losses = (
-            float(model.bdr.wrong_attractor_rank_weight) != 0.0
-            or float(model.bdr.wrong_attractor_direction_weight) != 0.0
-            or float(model.bdr.wrong_attractor_nonzero_weight) != 0.0
-            or float(model.bdr.corrupted_recovery_weight) != 0.0
-        )
-        if use_attractor_losses:
-            attractor_losses = model.attractor_recovery_losses(
-                inputs,
-                targets,
-                loss_mask,
-                new_carry["z"],
-                new_carry["hidden"],
-                puzzle_identifiers=puzzle_identifiers,
-                train=train,
-                dropout_key=attractor_key,
-            )
-            attractor_metrics = _bdr_attractor_metrics(model, attractor_losses)
-        else:
-            attractor_losses = {
-                "wrong_attractor_rank_loss": zero,
-                "wrong_attractor_direction_loss": zero,
-                "wrong_attractor_nonzero_loss": zero,
-                "corrupted_recovery_loss": zero,
-            }
-            attractor_metrics = {}
-        loss = (
-            loss
-            + float(model.bdr.path_energy_weight) * path_energy_loss
-            + float(model.bdr.fixed_point_update_weight) * fixed_point_update_loss
-            + float(model.bdr.wrong_attractor_rank_weight) * attractor_losses["wrong_attractor_rank_loss"]
-            + float(model.bdr.wrong_attractor_direction_weight) * attractor_losses["wrong_attractor_direction_loss"]
-            + float(model.bdr.wrong_attractor_nonzero_weight) * attractor_losses["wrong_attractor_nonzero_loss"]
-            + float(model.bdr.corrupted_recovery_weight) * attractor_losses["corrupted_recovery_loss"]
-        )
         context_mask, query_mask = _bdr_region_masks(model, inputs, loss_mask)
         query_accuracy = _masked_cell_accuracy(predictions, targets, query_mask)
         target_probability_cells = token_target_probability(model, logits, targets)
         bdr_metrics = {
-            "path_energy_loss": path_energy_loss,
-            "fixed_point_update_loss": fixed_point_update_loss,
-            **attractor_metrics,
             "query_accuracy": query_accuracy,
             "query_target_probability": _masked_probability(target_probability_cells, query_mask),
             "distribution_tv_delta": diagnostics["distribution_tv_delta"],
@@ -728,7 +652,6 @@ def recurrent_eval_loss_and_metrics(
                 "query_target_probability": _masked_probability(final_target_probability_cells, query_mask),
                 "distribution_tv_delta": jnp.mean(model_diagnostics["distribution_tv_delta"]),
                 "path_energy": jnp.mean(model_diagnostics["path_energy"]),
-                "path_energy_loss": jnp.mean(model_diagnostics["path_energy"]),
                 **_mean_bdr_branch_diagnostics(model, model_diagnostics),
             }
         )
