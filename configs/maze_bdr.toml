@@ -11,17 +11,17 @@ grid_height = 30
 grid_width = 30
 d_model = 512
 dropout_rate = 0.0
-loss_type = "softmax"
+loss_type = "stablemax"
 
 [model.bdr]
 
 [model.bdr.dynamics]
-commit_steps = 48
+commit_steps = 16
 h_cycles = 2
-l_cycles = 4
-l_layers = 2
+l_cycles = 6
+l_layers = 4
 step_loss_schedule = "uniform"
-update_rule = "proposal"
+update_rule = "energy_grad"
 draft_view = "probability"
 prediction_view = "probability"
 
@@ -39,12 +39,14 @@ position_encoding = "rope2d"
 rope_theta = 10000.0
 
 [optimizer]
-optimizer_type = "adamw"
+optimizer_type = "adam_atan2"
 learning_rate = 1e-4
+puzzle_embed_learning_rate = 1e-4
 lr_min_ratio = 1.0
 beta1 = 0.9
 beta2 = 0.95
 weight_decay = 1.0
+puzzle_embed_weight_decay = 1.0
 lr_warmup_steps = 2000
 grad_clip_norm = 1.0
 
@@ -77,5 +79,5 @@ profile_enabled = false
 [wandb]
 enabled = true
 project = "latent-factor-recurrent-model"
-name = "maze-bdr-core-h2-l4x2-c48-act-b128-adamw"
+name = "maze-bdr-energy-grad-rope2d-h2-l6x4-c16-act-stablemax-b128"
 mode = "online"
